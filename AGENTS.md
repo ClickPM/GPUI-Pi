@@ -10,13 +10,14 @@
 pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面，官方 pi 独立二进制（`pi --mode rpc`）当内核。
 没有 Electron、没有 Chromium、没有 Next.js、没有内置 Node / Python。
 
-## 五条红线
+## 六条红线
 
 1. **不引入 web 技术栈** —— 不加 WebView（含 `gpui-wry`）、不嵌 HTML 页面。Mermaid 按立项文档 § 一 直出源码。
 2. **不动上游钉版本** —— `Cargo.lock`、`PINNED_PI_VERSION` 与 `vendor/upstream/pi-0.84.2/`（`.gpui-pi-source-pin` marker + `pins/pi-0.84.2.manifest` 全量基线）是钉死点，`cargo update` 或源码身份漂移会被 `scripts/check-pins.*` 判红。要改版本先改立项文档 § 二。
 3. **不跨轮次改动** —— 发现前面轮次的问题写进 `rounds/BACKLOG.md`，不当场顺手改。
 4. **不放宽验收** —— 连续 2 次 validation 不过，写 `rounds/round-NN/BLOCKED.md` 停下呼人，禁止改标准让自己通过。
 5. **不写 `~/.pi` 的破坏性操作** —— 数据目录与终端 pi、pi-web-desktop 共享。能只读就只读，必须写走「临时文件 + rename」。
+6. **不把共享目录链接进 worktree** —— 从创建 worktree 起，禁止在其中建立任何指向主 checkout、其他 worktree 或外部共享目录的 Junction、目录 symlink 或其他 reparse point，尤其禁止链接 `vendor/`、`target/`、`.venv/`、`.pi/`。每个 worktree 的本地目录必须独立准备；上游参考源码走该 worktree 自己的 fetch 脚本，临时只读参考可直接读外部绝对路径，但不得挂载进 worktree。执行 `git worktree remove` 前必须检查 reparse point；发现任何目录链接就立即停止并呼人，禁止假设删除 worktree 只会删除链接本身——Git for Windows 可能沿 Junction 递归删除共享目标内容。
 
 ## 每轮怎么跑
 
