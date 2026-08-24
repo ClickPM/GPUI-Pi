@@ -8,8 +8,9 @@ use std::{
 
 use pi_render::ConversationDocument;
 use pi_runtime::{
-    ControlOperation, ControlOutcome, ControlRequest, Dirty, RuntimeEffectKind, RuntimeId,
-    RuntimeLimits, RuntimeManager, SessionControls, SessionHandle, SessionSnapshot, ToolPreset,
+    ActorLimits, ComposerMode, ControlOperation, ControlOutcome, ControlRequest, Dirty, RpcIntent,
+    RuntimeEffectKind, RuntimeId, RuntimeLimits, RuntimeManager, SessionControls, SessionHandle,
+    SessionSnapshot, TerminalState, ToolPreset,
 };
 
 // 等待窗口必须覆盖 pi 冷启动（Node 进程 + host extension 物化 + 五次串行 metadata RPC）
@@ -391,5 +392,119 @@ fn runtime_manager_fresh_stop_and_resume_is_zero_token() {
     assert!(
         fs::read_dir(&cwd).unwrap().next().is_none(),
         "zero-token runtime metadata test wrote into the temporary cwd"
+    );
+}
+
+/// R22：用真实 pi 验证有界 Actor 与背压路径，全程零 token。
+///
+/// 只跑 `get_commands` / `get_state` 这类元数据 RPC 与优雅停止，不发任何 prompt，
+/// 因此不消耗模型 token；覆盖的是「换成固定线程 + 有界队列 + 有界 effect 缓存之后，
+/// 真实内核仍能正常启动、刷新元数据并留下权威终态」。
+#[test]
+#[ignore = "requires PI_RUNTIME_TEST_BINARY=official pi 0.84.2"]
+fn bounded_actor_and_effect_backpressure_hold_against_real_pi() {
+    let binary = configured_binary();
+    assert_pinned_version(&binary);
+    assert!(
+        env::var_os("PI_CODING_AGENT_SESSION_DIR").is_none(),
+        "unset PI_CODING_AGENT_SESSION_DIR before running this isolation test"
+    );
+
+    let temp = tempfile::tempdir().expect("failed to create isolated runtime test root");
+    let agent_dir = temp.path().join("agent");
+    let cwd = temp.path().join("project");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+
+    let actor = ActorLimits {
+        command_capacity: 4,
+        control_capacity: 2,
+        command_workers: 1,
+        control_workers: 1,
+    };
+    let manager = RuntimeManager::new(RuntimeLimits {
+        actor,
+        // 故意配一个越界的合帧窗口，验证它被收敛进 16–33ms 而不是被原样信任。
+        event_frame: Duration::from_millis(1),
+        ..RuntimeLimits::default()
+    });
+    let handle = manager
+        .start_fresh(
+            binary.clone(),
+            cwd.clone(),
+            empty_document("bounded-real-pi", &cwd),
+            ToolPreset::Inherit,
+            Some(agent_dir.clone()),
+        )
+        .unwrap_or_else(|error| panic!("bounded RuntimeManager start failed: {error}"));
+    let runtime_id = handle.runtime_id();
+    let _guard = StopOnDrop {
+        manager: &manager,
+        id: runtime_id,
+    };
+    let dirty = handle.subscribe_dirty();
+
+    assert_eq!(handle.actor_limits(), actor, "有界参数必须原样生效");
+    assert_eq!(
+        handle.event_frame(),
+        pi_runtime::EVENT_FRAME_MIN,
+        "越界合帧窗口必须被 clamp 进 16–33ms"
+    );
+    let expected_threads = actor.command_workers + actor.control_workers + 1;
+    assert_eq!(
+        handle.live_thread_count(),
+        expected_threads,
+        "线程预算固定为 worker + 事件 pump"
+    );
+
+    // ---- 启动元数据经普通通道完成（零 token 的 get_commands / get_state） ----
+    let (snapshot, controls) = wait_for_controls(&handle, &dirty, "bounded runtime");
+    assert_eq!(snapshot.runtime_id, runtime_id);
+    assert!(!controls.session_id.is_empty());
+    assert_eq!(snapshot.terminal, None, "运行中的会话不该有终态");
+    assert!(
+        snapshot.backpressure.buffered_bytes <= handle.effect_limits().max_bytes,
+        "effect 缓存越过字节上限：{} > {}",
+        snapshot.backpressure.buffered_bytes,
+        handle.effect_limits().max_bytes
+    );
+    assert_eq!(snapshot.backpressure.dropped_results, 0);
+
+    // ---- ack 回收：消费过的 effect 立刻从运行时缓存中释放 ----
+    let last = snapshot
+        .effects
+        .last()
+        .expect("metadata effects present")
+        .sequence;
+    handle.ack_effects(snapshot.epoch, last);
+    let acked = handle.snapshot();
+    assert_eq!(acked.backpressure.buffered_effects, 0);
+    assert_eq!(acked.backpressure.buffered_bytes, 0);
+
+    // ---- 再刷一次元数据：仍走同一批 worker，线程数不变 ----
+    handle.refresh_metadata();
+    let (refreshed, refreshed_controls) =
+        wait_for_controls(&handle, &dirty, "bounded runtime refresh");
+    assert_eq!(refreshed_controls.session_id, controls.session_id);
+    assert_eq!(
+        handle.live_thread_count(),
+        expected_threads,
+        "刷新元数据不得新建线程"
+    );
+    assert!(refreshed.backpressure.buffered_bytes <= handle.effect_limits().max_bytes);
+
+    // ---- 优雅停止留下权威终态（BACKLOG #12 的 R22 部分） ----
+    manager.stop_user(runtime_id);
+    let stopped = handle.snapshot();
+    assert_eq!(
+        stopped.terminal,
+        Some(TerminalState::Stopped),
+        "优雅停止必须是可观察终态"
+    );
+    assert!(
+        handle
+            .dispatch(RpcIntent::Prompt, None, ComposerMode::Steer)
+            .is_err(),
+        "停止后不再接受任何命令"
     );
 }

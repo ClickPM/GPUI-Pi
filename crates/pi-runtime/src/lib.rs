@@ -1,3 +1,12 @@
+mod actor;
+mod effects;
+
+pub use actor::{ActorLimits, spawned_thread_count};
+pub use effects::{BackpressureStats, EffectLimits};
+
+use actor::{Actor, Channel, JobKey, QueueError};
+use effects::EffectBuffer;
+
 use pi_render::{
     ConversationDocument, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase,
     LiveSessionReducer,
@@ -7,16 +16,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
-    thread,
     time::{Duration, Instant},
 };
 
 use pi_rpc::{
     AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
-    Command, CommandsData, CompactionResult, ExportPathData, ExtensionUiRequest,
+    Command, CommandsData, CompactionResult, EventStream, ExportPathData, ExtensionUiRequest,
     ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType, RpcEvent,
     RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel, ThinkingLevelsData,
     TreeData, WidgetPlacement,
@@ -27,7 +35,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// before the official RPC emits the prompt response. Keep this bounded, but do not apply the
 /// metadata/control timeout to interactive submissions.
 const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const PUMP_FRAME: Duration = Duration::from_millis(20);
+/// EventReducer 合帧窗口的允许区间（立项文档 § 七阶段 E：16–33ms）。
+///
+/// 下界保证 120Hz 显示器上不会一帧塞两批；上界保证最慢也有 ~30fps 的可见更新。
+pub const EVENT_FRAME_MIN: Duration = Duration::from_millis(16);
+pub const EVENT_FRAME_MAX: Duration = Duration::from_millis(33);
+/// 默认合帧窗口，约等于 50fps。
+pub const DEFAULT_EVENT_FRAME: Duration = Duration::from_millis(20);
+
+/// 把配置值收进允许区间；越界配置被 clamp 而不是被信任。
+pub fn clamp_event_frame(frame: Duration) -> Duration {
+    frame.clamp(EVENT_FRAME_MIN, EVENT_FRAME_MAX)
+}
+
 const MAX_EVENTS_PER_BATCH: usize = 512;
 const EXTENSION_TEXT_LIMIT: usize = 4096;
 const EXTENSION_EDITABLE_BYTES_LIMIT: usize = 1024 * 1024;
@@ -742,6 +762,10 @@ pub struct SessionSnapshot {
     pub follow_up_queue_len: usize,
     pub startup_diagnostic: Option<String>,
     pub effects: Arc<[RuntimeEffect]>,
+    /// 权威终态：`None` 表示仍在运行。不随 effect 背压丢失。
+    pub terminal: Option<TerminalState>,
+    /// 背压统计；任何非零淘汰计数都必须对用户可见。
+    pub backpressure: BackpressureStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,15 +786,61 @@ impl RuntimeId {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeLimits {
+    /// Maintenance job 的独立配额，不占用户会话运行槽。
     pub maintenance_slots: usize,
+    /// 单 Runtime 命令 Actor 的队列容量与 worker 数。
+    pub actor: ActorLimits,
+    /// 单 Session effect 缓存的固定上限。
+    pub effects: EffectLimits,
+    /// EventReducer 合帧窗口；越界值按 [`clamp_event_frame`] 收敛。
+    pub event_frame: Duration,
+    /// 单订阅事件积压字节上限，透传给 `pi-rpc`。
+    pub event_backlog_bytes: usize,
 }
 
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             maintenance_slots: 1,
+            actor: ActorLimits::default(),
+            effects: EffectLimits::default(),
+            event_frame: DEFAULT_EVENT_FRAME,
+            event_backlog_bytes: pi_rpc::DEFAULT_EVENT_BACKLOG_BYTES,
         }
     }
+}
+
+/// 运行时的有界参数快照，随 Runtime 创建时固化。
+#[derive(Debug, Clone, Copy)]
+struct RuntimeTuning {
+    actor: ActorLimits,
+    effects: EffectLimits,
+    event_frame: Duration,
+    event_backlog_bytes: usize,
+}
+
+impl RuntimeTuning {
+    fn from_limits(limits: &RuntimeLimits) -> Self {
+        // 有界参数在此一次性收敛：下游读到的 tuning 就是生效值，不必各自再 clamp。
+        Self {
+            actor: limits.actor.sanitized(),
+            effects: limits.effects.sanitized(),
+            event_frame: clamp_event_frame(limits.event_frame),
+            event_backlog_bytes: limits.event_backlog_bytes.max(1),
+        }
+    }
+}
+
+/// Runtime 的权威终态。
+///
+/// 终态**不依赖 effect 流**：即使 effect 因背压被淘汰，Snapshot 上的终态也必须仍然
+/// 正确，UI 才能在任何积压情况下知道会话已经结束。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalState {
+    /// 应用主动优雅停止（切换会话、退出）。
+    Stopped,
+    /// Runtime 失败：崩溃、重启失败、事件积压超限。
+    Failed { error: String },
 }
 
 #[derive(Clone)]
@@ -782,6 +852,7 @@ struct ManagerInner {
     next_runtime_id: AtomicU64,
     active_user: Mutex<Option<Arc<RuntimeEntry>>>,
     maintenance: MaintenanceGate,
+    tuning: RuntimeTuning,
 }
 
 struct MaintenanceGate {
@@ -825,7 +896,7 @@ struct RuntimeState {
     epoch: u64,
     revision: u64,
     next_effect_sequence: u64,
-    effects: VecDeque<RuntimeEffect>,
+    effects: EffectBuffer,
     reducer: LiveSessionReducer,
     startup_diagnostic: Option<String>,
     client: Option<Client>,
@@ -834,34 +905,75 @@ struct RuntimeState {
     activity_generation: u64,
     replacing: bool,
     stopped: bool,
+    terminal: Option<TerminalState>,
 }
 
 struct RuntimeEntry {
     id: RuntimeId,
     state: Mutex<RuntimeState>,
     subscribers: Mutex<Vec<Sender<Dirty>>>,
+    /// 固定线程的命令 Actor；`dispatch` 等只投递作业，绝不新建线程。
+    actor: Actor,
+    tuning: RuntimeTuning,
+    /// 存活的事件 pump 线程数（每个 epoch 至多一个）。
+    live_pumps: Arc<AtomicUsize>,
 }
 
 impl RuntimeEntry {
+    fn new_state(
+        history: ConversationDocument,
+        tuning: RuntimeTuning,
+        startup_diagnostic: Option<String>,
+        client: Option<Client>,
+        calibration_path: Arc<Mutex<Option<PathBuf>>>,
+        agent_dir: Option<PathBuf>,
+    ) -> RuntimeState {
+        RuntimeState {
+            epoch: 1,
+            revision: 1,
+            next_effect_sequence: 0,
+            effects: EffectBuffer::new(tuning.effects),
+            reducer: LiveSessionReducer::new(history),
+            startup_diagnostic,
+            client,
+            calibration_path,
+            agent_dir,
+            activity_generation: 0,
+            replacing: false,
+            stopped: false,
+            terminal: None,
+        }
+    }
+
     #[cfg(test)]
     fn test_entry(id: RuntimeId, history: ConversationDocument) -> Arc<Self> {
+        Self::test_entry_with(
+            id,
+            history,
+            RuntimeTuning::from_limits(&RuntimeLimits::default()),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_entry_with(
+        id: RuntimeId,
+        history: ConversationDocument,
+        tuning: RuntimeTuning,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
-            state: Mutex::new(RuntimeState {
-                epoch: 1,
-                revision: 1,
-                next_effect_sequence: 0,
-                effects: VecDeque::new(),
-                reducer: LiveSessionReducer::new(history),
-                startup_diagnostic: None,
-                client: None,
-                calibration_path: Arc::new(Mutex::new(None)),
-                agent_dir: None,
-                activity_generation: 0,
-                replacing: false,
-                stopped: false,
-            }),
+            state: Mutex::new(Self::new_state(
+                history,
+                tuning,
+                None,
+                None,
+                Arc::new(Mutex::new(None)),
+                None,
+            )),
             subscribers: Mutex::new(Vec::new()),
+            actor: Actor::new(id.get(), tuning.actor),
+            tuning,
+            live_pumps: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -876,22 +988,57 @@ impl RuntimeEntry {
             steering_queue_len: state.reducer.steering_queue().len(),
             follow_up_queue_len: state.reducer.follow_up_queue().len(),
             startup_diagnostic: state.startup_diagnostic.clone(),
-            effects: state.effects.iter().cloned().collect::<Vec<_>>().into(),
+            effects: state.effects.snapshot().into(),
+            terminal: state.terminal.clone(),
+            backpressure: BackpressureStats {
+                queued_commands: self.actor.queued(Channel::Command),
+                queued_controls: self.actor.queued(Channel::Control),
+                ..state.effects.stats()
+            },
         }
     }
 
     fn publish(&self, state: &mut RuntimeState, kind: RuntimeEffectKind) {
         state.next_effect_sequence = state.next_effect_sequence.wrapping_add(1);
-        let epoch = state.epoch;
-        let sequence = state.next_effect_sequence;
-        state.effects.push_back(RuntimeEffect {
-            sequence,
-            epoch,
+        let effect = RuntimeEffect {
+            sequence: state.next_effect_sequence,
+            epoch: state.epoch,
             kind,
-        });
-        // R21 的一次性结果仍只存在于 effect 流；在 R22 建立“可靠终态 +
-        // latest-only 流式状态”前，不能用截断伪造有界背压而静默丢结果。
+        };
+        // 有界缓存按语义分级回收：终态另存 `state.terminal`，不依赖 effect 流。
+        state.effects.push(effect);
         self.mark_dirty(state);
+    }
+
+    /// 把作业投递给 Actor，并在队列拒绝时留下可见计数。
+    fn enqueue<F>(
+        &self,
+        state: &mut RuntimeState,
+        channel: Channel,
+        key: Option<JobKey>,
+        job: F,
+    ) -> Result<(), QueueError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        match self.actor.push(channel, key, job) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match key {
+                    // 内部维护作业（元数据刷新 / 落盘校准）失败不打扰用户，只记账。
+                    Some(_) => state.effects.record_dropped_job(),
+                    None => state.effects.record_rejected_command(),
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// 记录权威终态。首个终态优先，避免后续噪声覆盖真正的失败原因。
+    fn set_terminal(&self, state: &mut RuntimeState, terminal: TerminalState) {
+        if state.terminal.is_none() {
+            state.terminal = Some(terminal);
+        }
     }
 
     fn mark_dirty(&self, state: &mut RuntimeState) {
@@ -907,6 +1054,13 @@ impl RuntimeEntry {
             .retain(|subscriber| subscriber.send(dirty).is_ok());
     }
 
+    /// 本 Runtime 当前存活的常驻线程数（Actor worker + 事件 pump）。
+    ///
+    /// 它是固定预算，不随 dispatch / follow-up 次数增长 —— R22 的核心不变量。
+    fn live_threads(&self) -> usize {
+        self.actor.live_workers() + self.live_pumps.load(Ordering::Acquire)
+    }
+
     fn client_for_epoch(&self, epoch: u64) -> Result<Client, String> {
         let state = self.state.lock().unwrap();
         if state.epoch != epoch || state.stopped {
@@ -916,6 +1070,17 @@ impl RuntimeEntry {
             .client
             .clone()
             .ok_or_else(|| "runtime 已停止".to_owned())
+    }
+}
+
+impl Drop for RuntimeEntry {
+    fn drop(&mut self) {
+        // 兜底关闭 worker。注意这**不是**完整保证：引用链是
+        // `RuntimeEntry -> Actor -> Queue -> 排队作业 -> Arc<RuntimeEntry>`，
+        // 只要队列里还有作业，强引用就不会归零、本 Drop 也不会执行。真正的保证来自
+        // 所有终止路径（`stop_user` / `start_user` 替换 / `fail_runtime` /
+        // `publish_tool_restart_failure`）显式调用 `actor.close()`。
+        self.actor.close();
     }
 }
 
@@ -929,6 +1094,26 @@ impl SessionHandle {
         self.entry.id
     }
 
+    /// 本 Runtime 当前存活的常驻线程数（Actor worker + 事件 pump）。
+    pub fn live_thread_count(&self) -> usize {
+        self.entry.live_threads()
+    }
+
+    /// 本 Runtime 固化后的命令队列参数（已收敛为生效值）。
+    pub fn actor_limits(&self) -> ActorLimits {
+        self.entry.actor.limits()
+    }
+
+    /// 本 Runtime 固化后的 effect 缓存上限（已收敛为生效值）。
+    pub fn effect_limits(&self) -> EffectLimits {
+        self.entry.tuning.effects
+    }
+
+    /// 本 Runtime 的合帧窗口（已 clamp 进 16–33ms）。
+    pub fn event_frame(&self) -> Duration {
+        self.entry.tuning.event_frame
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         self.entry.snapshot()
     }
@@ -940,29 +1125,47 @@ impl SessionHandle {
     }
 
     pub fn refresh_metadata(&self) {
-        let snapshot = self.snapshot();
-        let epoch = snapshot.epoch;
         let entry = self.entry.clone();
-        let Ok(client) = entry.client_for_epoch(epoch) else {
+        let mut state = entry.state.lock().unwrap();
+        if state.stopped {
+            return;
+        }
+        let epoch = state.epoch;
+        let Some(client) = state.client.clone() else {
             return;
         };
-        let agent_dir = entry.state.lock().unwrap().agent_dir.clone();
-        thread::Builder::new()
-            .name(format!("pi-runtime-metadata-{}-{epoch}", entry.id.get()))
-            .spawn(move || {
+        let agent_dir = state.agent_dir.clone();
+        let job_entry = entry.clone();
+        let _ = entry.enqueue(
+            &mut state,
+            Channel::Command,
+            Some(JobKey::Metadata),
+            move || {
                 let commands = load_commands(&client);
-                publish_if_current(&entry, epoch, RuntimeEffectKind::CommandsLoaded(commands));
+                publish_if_current(
+                    &job_entry,
+                    epoch,
+                    RuntimeEffectKind::CommandsLoaded(commands),
+                );
                 let controls = load_controls(&client, agent_dir.as_deref());
-                let mut state = entry.state.lock().unwrap();
+                let mut state = job_entry.state.lock().unwrap();
                 if state.epoch != epoch || state.stopped {
                     return;
                 }
                 if let Ok(controls) = &controls {
                     apply_controls_identity(&mut state, controls);
                 }
-                entry.publish(&mut state, RuntimeEffectKind::ControlsLoaded(controls));
-            })
-            .expect("failed to spawn runtime metadata thread");
+                job_entry.publish(&mut state, RuntimeEffectKind::ControlsLoaded(controls));
+            },
+        );
+    }
+
+    /// 回收 UI 已消费的 effect。
+    ///
+    /// UI 每帧应用完 Snapshot 后必须调用，否则缓存只能靠背压淘汰来保持有界。
+    pub fn ack_effects(&self, epoch: u64, sequence: u64) {
+        let mut state = self.entry.state.lock().unwrap();
+        state.effects.ack(epoch, sequence);
     }
 
     pub fn dispatch(
@@ -981,33 +1184,30 @@ impl SessionHandle {
         mode: ComposerMode,
         timeout: Duration,
     ) -> Result<(), String> {
-        let epoch;
-        let client;
-        let pending_activity_generation;
-        {
-            let mut state = self.entry.state.lock().unwrap();
-            if state.stopped {
-                return Err("runtime 已停止".to_owned());
-            }
-            epoch = state.epoch;
-            pending_activity_generation = (intent != RpcIntent::Abort
-                && state.reducer.phase() != LivePhase::Running)
-                .then_some(state.activity_generation);
-            match intent {
-                RpcIntent::Abort => state.reducer.set_stopping(),
-                _ => state.reducer.set_running(),
-            }
-            client = state
-                .client
-                .clone()
-                .ok_or_else(|| "runtime 已停止".to_owned())?;
-            self.entry.mark_dirty(&mut state);
-        }
+        // 提交可能带上百 KB 的 base64 图片，命令构造放在锁外，避免拖住 UI 的 Snapshot 读取。
         let command = dispatch_command(intent, submission.as_ref(), mode);
+        let mut state = self.entry.state.lock().unwrap();
+        if state.stopped {
+            return Err("runtime 已停止".to_owned());
+        }
+        let epoch = state.epoch;
+        let pending_activity_generation = (intent != RpcIntent::Abort
+            && state.reducer.phase() != LivePhase::Running)
+            .then_some(state.activity_generation);
+        let client = state
+            .client
+            .clone()
+            .ok_or_else(|| "runtime 已停止".to_owned())?;
         let entry = self.entry.clone();
-        thread::Builder::new()
-            .name(format!("pi-runtime-request-{}-{epoch}", entry.id.get()))
-            .spawn(move || {
+        // Abort 走控制通道：普通通道被长时间交互提交占满时，用户仍然必须能停止。
+        let channel = if intent == RpcIntent::Abort {
+            Channel::Control
+        } else {
+            Channel::Command
+        };
+        // 先投递、成功后才改 reducer —— 队列满时不得在 UI 上留下 Running 假象。
+        self.entry
+            .enqueue(&mut state, channel, None, move || {
                 let result = match client.request(command, timeout) {
                     Ok(response) if response.success => Ok(()),
                     Ok(response) => Err((
@@ -1039,7 +1239,12 @@ impl SessionHandle {
                     },
                 );
             })
-            .expect("failed to spawn runtime request thread");
+            .map_err(QueueError::message)?;
+        match intent {
+            RpcIntent::Abort => state.reducer.set_stopping(),
+            _ => state.reducer.set_running(),
+        }
+        self.entry.mark_dirty(&mut state);
         Ok(())
     }
 
@@ -1048,14 +1253,19 @@ impl SessionHandle {
         operation: ControlOperation,
         request: ControlRequest,
     ) -> Result<(), String> {
-        let snapshot = self.snapshot();
-        let epoch = snapshot.epoch;
-        let client = self.entry.client_for_epoch(epoch)?;
-        let agent_dir = self.entry.state.lock().unwrap().agent_dir.clone();
+        let mut state = self.entry.state.lock().unwrap();
+        if state.stopped {
+            return Err("runtime 已停止".to_owned());
+        }
+        let epoch = state.epoch;
+        let client = state
+            .client
+            .clone()
+            .ok_or_else(|| "runtime 已停止".to_owned())?;
+        let agent_dir = state.agent_dir.clone();
         let entry = self.entry.clone();
-        thread::Builder::new()
-            .name(format!("pi-runtime-control-{}-{epoch}", entry.id.get()))
-            .spawn(move || {
+        self.entry
+            .enqueue(&mut state, Channel::Control, None, move || {
                 let result = execute_control(&client, request, agent_dir.as_deref());
                 let mut state = entry.state.lock().unwrap();
                 if state.epoch != epoch || state.stopped {
@@ -1069,7 +1279,7 @@ impl SessionHandle {
                     RuntimeEffectKind::ControlFinished { operation, result },
                 );
             })
-            .expect("failed to spawn runtime control thread");
+            .map_err(QueueError::message)?;
         Ok(())
     }
 
@@ -1092,27 +1302,20 @@ impl SessionHandle {
         history: ConversationDocument,
         preset: ToolPreset,
     ) -> Result<(), String> {
-        let old_epoch;
-        let old_client;
-        {
-            let mut state = self.entry.state.lock().unwrap();
-            if state.stopped {
-                return Err("runtime 已停止".to_owned());
-            }
-            old_epoch = state.epoch;
-            state.replacing = true;
-            old_client = state
-                .client
-                .take()
-                .ok_or_else(|| "runtime 已停止".to_owned())?;
+        let mut state = self.entry.state.lock().unwrap();
+        if state.stopped {
+            return Err("runtime 已停止".to_owned());
         }
+        let old_epoch = state.epoch;
+        // 先把作业投递出去，成功后才摘掉旧 client —— 队列满绝不能留下没有 client 的僵死 Runtime。
+        let old_client = state
+            .client
+            .clone()
+            .ok_or_else(|| "runtime 已停止".to_owned())?;
         let entry = self.entry.clone();
-        thread::Builder::new()
-            .name(format!(
-                "pi-runtime-tool-restart-{}-{old_epoch}",
-                entry.id.get()
-            ))
-            .spawn(move || {
+        let queued = self
+            .entry
+            .enqueue(&mut state, Channel::Control, None, move || {
                 let shutdown = old_client.shutdown().map_err(|error| error.to_string());
                 if let Err(error) = shutdown {
                     publish_tool_restart_failure(&entry, old_epoch, preset, error);
@@ -1127,7 +1330,7 @@ impl SessionHandle {
                         agent_dir.as_os_str().to_owned(),
                     ));
                 }
-                clamp_manager_config(&mut config);
+                clamp_manager_config(&mut config, entry.tuning);
                 let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
                 let client = match Client::spawn(config) {
                     Ok(client) => client,
@@ -1164,8 +1367,11 @@ impl SessionHandle {
                 }
                 spawn_event_pump(entry.clone(), new_epoch, calibration_path, events);
                 SessionHandle { entry }.refresh_metadata();
-            })
-            .expect("failed to spawn runtime restart thread");
+            });
+        queued.map_err(QueueError::message)?;
+        // 入队成功后才进入替换态；此前的所有 early return 都保持调用前状态不变。
+        state.replacing = true;
+        state.client = None;
         Ok(())
     }
 }
@@ -1177,6 +1383,7 @@ impl RuntimeManager {
                 next_runtime_id: AtomicU64::new(0),
                 active_user: Mutex::new(None),
                 maintenance: MaintenanceGate::new(limits.maintenance_slots),
+                tuning: RuntimeTuning::from_limits(&limits),
             }),
         }
     }
@@ -1229,27 +1436,25 @@ impl RuntimeManager {
                 agent_dir.as_os_str().to_owned(),
             ));
         }
-        clamp_manager_config(&mut config);
+        let tuning = self.inner.tuning;
+        clamp_manager_config(&mut config, tuning);
         let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
         let client = Client::spawn(config).map_err(|error| error.to_string())?;
         let events = client.subscribe();
         let entry = Arc::new(RuntimeEntry {
             id,
-            state: Mutex::new(RuntimeState {
-                epoch: 1,
-                revision: 1,
-                next_effect_sequence: 0,
-                effects: VecDeque::new(),
-                reducer: LiveSessionReducer::new(history),
-                startup_diagnostic: diagnostic,
-                client: Some(client),
-                calibration_path: calibration_path.clone(),
+            state: Mutex::new(RuntimeEntry::new_state(
+                history,
+                tuning,
+                diagnostic,
+                Some(client),
+                calibration_path.clone(),
                 agent_dir,
-                activity_generation: 0,
-                replacing: false,
-                stopped: false,
-            }),
+            )),
             subscribers: Mutex::new(Vec::new()),
+            actor: Actor::new(id.get(), tuning.actor),
+            tuning,
+            live_pumps: Arc::new(AtomicUsize::new(0)),
         });
         let old = self
             .inner
@@ -1285,7 +1490,7 @@ impl RuntimeManager {
         request: HistoricalHtmlExportRequest,
     ) -> Result<HistoricalHtmlExport, String> {
         let _permit = self.inner.maintenance.acquire();
-        export_historical_html_impl(request)
+        export_historical_html_impl(request, self.inner.tuning)
     }
 }
 
@@ -1293,15 +1498,21 @@ fn shutdown_entry(entry: &RuntimeEntry) {
     let client = {
         let mut state = entry.state.lock().unwrap();
         state.stopped = true;
+        // BACKLOG #12（指派给 R22）：优雅停止此前不产生任何可观察终态，观察者只能等超时。
+        entry.set_terminal(&mut state, TerminalState::Stopped);
+        entry.publish(&mut state, RuntimeEffectKind::Stopped(None));
         state.client.take()
     };
+    // 先关队列再关进程：worker 可能正阻塞在一次长请求上，关队列让它跑完当前作业后退出。
+    entry.actor.close();
     if let Some(client) = client {
         let _ = client.shutdown();
     }
 }
 
-fn clamp_manager_config(config: &mut ClientConfig) {
+fn clamp_manager_config(config: &mut ClientConfig, tuning: RuntimeTuning) {
     config.max_restarts = 0;
+    config.event_backlog_bytes = tuning.event_backlog_bytes;
 }
 
 fn publish_if_current(entry: &RuntimeEntry, epoch: u64, kind: RuntimeEffectKind) {
@@ -1328,6 +1539,12 @@ fn publish_tool_restart_failure(
     state
         .reducer
         .set_error(format!("工具预设重启失败：{error}"));
+    entry.set_terminal(
+        &mut state,
+        TerminalState::Failed {
+            error: error.clone(),
+        },
+    );
     entry.publish(
         &mut state,
         RuntimeEffectKind::ToolRestartFinished {
@@ -1335,6 +1552,8 @@ fn publish_tool_restart_failure(
             result: Err(error),
         },
     );
+    drop(state);
+    entry.actor.close();
 }
 
 fn fail_runtime(entry: &RuntimeEntry, epoch: u64, error: String) {
@@ -1346,9 +1565,16 @@ fn fail_runtime(entry: &RuntimeEntry, epoch: u64, error: String) {
         state.stopped = true;
         let client = state.client.take();
         state.reducer.set_error(error.clone());
+        entry.set_terminal(
+            &mut state,
+            TerminalState::Failed {
+                error: error.clone(),
+            },
+        );
         entry.publish(&mut state, RuntimeEffectKind::Stopped(Some(error)));
         client
     };
+    entry.actor.close();
     // Client::shutdown 可能等待 supervisor/stdout 线程退出；必须在 RuntimeState 锁外执行，
     // 否则 UI 拉取 Snapshot 会被进程清理时延连带阻塞。
     if let Some(client) = client {
@@ -1746,6 +1972,7 @@ pub struct HistoricalHtmlExportRequest {
 
 fn export_historical_html_impl(
     request: HistoricalHtmlExportRequest,
+    tuning: RuntimeTuning,
 ) -> Result<HistoricalHtmlExport, String> {
     let HistoricalHtmlExportRequest {
         binary,
@@ -1763,7 +1990,7 @@ fn export_historical_html_impl(
         "--no-context-files".into(),
         "--offline".into(),
     ];
-    clamp_manager_config(&mut config);
+    clamp_manager_config(&mut config, tuning);
     let client = Client::spawn(config).map_err(|error| error.to_string())?;
     let result = client
         .request_data::<ExportPathData>(
@@ -1790,23 +2017,26 @@ fn spawn_event_pump(
     entry: Arc<RuntimeEntry>,
     epoch: u64,
     calibration_path: Arc<Mutex<Option<PathBuf>>>,
-    events: Receiver<ClientEvent>,
+    events: EventStream,
 ) {
-    thread::Builder::new()
-        .name(format!("pi-runtime-event-pump-{}-{epoch}", entry.id.get()))
-        .spawn(move || {
+    let frame = entry.tuning.event_frame;
+    let live_pumps = Arc::clone(&entry.live_pumps);
+    live_pumps.fetch_add(1, Ordering::AcqRel);
+    actor::spawn_named(
+        format!("pi-runtime-event-pump-{}-{epoch}", entry.id.get()),
+        move || {
             let mut activity_generation = 0_u64;
             loop {
                 let first = match events.recv() {
                     Ok(event) => event,
                     Err(_) => {
                         fail_runtime(&entry, epoch, "会话已崩溃，请重新启动".to_owned());
-                        return;
+                        break;
                     }
                 };
                 let mut projected = ProjectedPumpFrame::default();
                 project_pump_event(first, &mut projected, &mut activity_generation);
-                let deadline = Instant::now() + PUMP_FRAME;
+                let deadline = Instant::now() + frame;
                 let mut disconnected = false;
                 while projected.batch.len() < MAX_EVENTS_PER_BATCH {
                     let now = Instant::now();
@@ -1826,11 +2056,11 @@ fn spawn_event_pump(
                 }
                 if let Some(error) = projected.terminal_failure {
                     fail_runtime(&entry, epoch, error);
-                    return;
+                    break;
                 }
                 let mut state = entry.state.lock().unwrap();
                 if state.epoch != epoch || state.stopped {
-                    return;
+                    break;
                 }
                 if projected.extension_reset {
                     entry.publish(&mut state, RuntimeEffectKind::ExtensionUiReset);
@@ -1865,28 +2095,40 @@ fn spawn_event_pump(
                 if projected.settled
                     && let Some(session_path) = calibration_path.lock().unwrap().clone()
                 {
-                    spawn_calibration(entry.clone(), epoch, activity_generation, session_path);
+                    enqueue_calibration(&entry, epoch, activity_generation, session_path);
                 }
                 if disconnected {
                     fail_runtime(&entry, epoch, "会话已崩溃，请重新启动".to_owned());
-                    return;
+                    break;
                 }
             }
-        })
-        .expect("failed to spawn runtime event pump");
+            live_pumps.fetch_sub(1, Ordering::AcqRel);
+        },
+    );
 }
 
-fn spawn_calibration(
-    entry: Arc<RuntimeEntry>,
+/// 把落盘校准投递给 Actor。
+///
+/// 校准是纯粹的「取最新」刷新：排队多份旧校准没有意义，因此用 [`JobKey::Calibration`]
+/// 在队列内合并；队列满时跳过并计数，下一次 settled 会重新触发。
+fn enqueue_calibration(
+    entry: &Arc<RuntimeEntry>,
     epoch: u64,
     calibration: u64,
     session_path: PathBuf,
 ) {
-    thread::Builder::new()
-        .name(format!("pi-runtime-calibration-{}-{epoch}", entry.id.get()))
-        .spawn(move || {
+    let mut state = entry.state.lock().unwrap();
+    if state.epoch != epoch || state.stopped {
+        return;
+    }
+    let job_entry = entry.clone();
+    let _ = entry.enqueue(
+        &mut state,
+        Channel::Command,
+        Some(JobKey::Calibration),
+        move || {
             let result = pi_render::render_path(session_path).map_err(|error| error.to_string());
-            let mut state = entry.state.lock().unwrap();
+            let mut state = job_entry.state.lock().unwrap();
             if state.epoch != epoch || state.stopped {
                 return;
             }
@@ -1897,17 +2139,17 @@ fn spawn_calibration(
             match result {
                 Ok(document) => {
                     state.reducer.calibrate(document);
-                    entry.mark_dirty(&mut state);
+                    job_entry.mark_dirty(&mut state);
                 }
-                Err(error) => entry.publish(
+                Err(error) => job_entry.publish(
                     &mut state,
                     RuntimeEffectKind::Diagnostic(format!(
                         "会话落盘校准失败（activity {calibration}）：{error}"
                     )),
                 ),
             }
-        })
-        .expect("failed to spawn runtime calibration thread");
+        },
+    );
 }
 
 #[derive(Default)]
@@ -2004,6 +2246,16 @@ fn project_pump_event(
         }
         ClientEvent::Lifecycle(pi_rpc::LifecycleEvent::RestartFailed { error }) => {
             projected.terminal_failure = Some(format!("会话已崩溃，请重新启动：{error}"));
+        }
+        ClientEvent::Lifecycle(pi_rpc::LifecycleEvent::EventBacklogOverflow {
+            queued_bytes,
+            limit,
+        }) => {
+            // 事件积压超限意味着后续事件流已经不完整；与其带着窟窿继续渲染，
+            // 不如按会话失败明确终止，让用户重启会话。
+            projected.terminal_failure = Some(format!(
+                "事件积压超过上限（{queued_bytes} / {limit} 字节），会话已停止，请重新启动"
+            ));
         }
         event => {
             if let Some(event) = project_event(event) {
@@ -2176,6 +2428,11 @@ fn project_update(event: AssistantMessageEvent) -> LiveAssistantUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    fn default_tuning() -> RuntimeTuning {
+        RuntimeTuning::from_limits(&RuntimeLimits::default())
+    }
 
     fn fake_binary() -> PathBuf {
         std::env::current_exe()
@@ -2999,7 +3256,7 @@ mod tests {
     fn manager_config_always_disables_rpc_auto_restart() {
         let mut config = ClientConfig::new("pi.exe");
         config.max_restarts = 99;
-        clamp_manager_config(&mut config);
+        clamp_manager_config(&mut config, default_tuning());
         assert_eq!(config.max_restarts, 0);
     }
 
@@ -3033,6 +3290,786 @@ mod tests {
         assert_eq!(
             project_event(ClientEvent::Rpc(Box::new(RpcEvent::AgentSettled))),
             Some(LiveEvent::AgentSettled)
+        );
+    }
+
+    // ---------- R22：有界 Actor 与事件背压 ----------
+
+    fn tuning_with(effects: EffectLimits) -> RuntimeTuning {
+        RuntimeTuning::from_limits(&RuntimeLimits {
+            effects,
+            ..RuntimeLimits::default()
+        })
+    }
+
+    fn bounded_entry(id: u64, effects: EffectLimits) -> Arc<RuntimeEntry> {
+        RuntimeEntry::test_entry_with(
+            RuntimeId(id),
+            test_document("bounded"),
+            tuning_with(effects),
+        )
+    }
+
+    fn publish_now(entry: &Arc<RuntimeEntry>, kind: RuntimeEffectKind) {
+        let mut state = entry.state.lock().unwrap();
+        entry.publish(&mut state, kind);
+    }
+
+    fn events_effect(
+        follow_tail: bool,
+        settled: bool,
+        runtime_events: Vec<SessionRuntimeEvent>,
+    ) -> RuntimeEffectKind {
+        RuntimeEffectKind::Events {
+            follow_tail,
+            settled,
+            runtime_events,
+        }
+    }
+
+    fn fat_submission(bytes: usize) -> ComposerSubmission {
+        ComposerSubmission {
+            message: "x".repeat(bytes),
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn event_frame_is_clamped_into_the_documented_window() {
+        assert!(EVENT_FRAME_MIN <= DEFAULT_EVENT_FRAME && DEFAULT_EVENT_FRAME <= EVENT_FRAME_MAX);
+        assert_eq!(clamp_event_frame(Duration::from_millis(1)), EVENT_FRAME_MIN);
+        assert_eq!(clamp_event_frame(Duration::from_secs(1)), EVENT_FRAME_MAX);
+        assert_eq!(clamp_event_frame(DEFAULT_EVENT_FRAME), DEFAULT_EVENT_FRAME);
+        // 越界配置必须在 tuning 固化时就被收敛，而不是留给各个消费点自己 clamp。
+        let tuning = RuntimeTuning::from_limits(&RuntimeLimits {
+            event_frame: Duration::from_secs(5),
+            ..RuntimeLimits::default()
+        });
+        assert_eq!(tuning.event_frame, EVENT_FRAME_MAX);
+    }
+
+    #[test]
+    fn default_command_queue_capacity_matches_the_design_document() {
+        assert_eq!(ActorLimits::default().command_capacity, 32);
+        assert!(ActorLimits::default().control_capacity >= 1);
+    }
+
+    #[test]
+    fn latest_only_keys_supersede_older_values_without_touching_reliable_results() {
+        let entry = bounded_entry(50, EffectLimits::default());
+        publish_now(
+            &entry,
+            RuntimeEffectKind::CommandsLoaded(Err("first".into())),
+        );
+        publish_now(
+            &entry,
+            RuntimeEffectKind::ControlFinished {
+                operation: ControlOperation::Compact,
+                result: Err("one-shot".into()),
+            },
+        );
+        publish_now(
+            &entry,
+            RuntimeEffectKind::CommandsLoaded(Err("second".into())),
+        );
+        publish_now(
+            &entry,
+            RuntimeEffectKind::CommandsLoaded(Err("third".into())),
+        );
+
+        let snapshot = entry.snapshot();
+        let commands = snapshot
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.kind, RuntimeEffectKind::CommandsLoaded(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1, "同 key 只保留最新一条");
+        assert!(matches!(
+            &commands[0].kind,
+            RuntimeEffectKind::CommandsLoaded(Err(message)) if message == "third"
+        ));
+        assert!(
+            snapshot
+                .effects
+                .iter()
+                .any(|effect| matches!(&effect.kind, RuntimeEffectKind::ControlFinished { .. })),
+            "一次性结果不得被 latest-only 合并顺带丢掉"
+        );
+        assert!(snapshot.backpressure.coalesced >= 2);
+    }
+
+    #[test]
+    fn adjacent_event_frames_merge_and_keep_latest_runtime_event_per_family() {
+        let entry = bounded_entry(51, EffectLimits::default());
+        publish_now(
+            &entry,
+            events_effect(
+                false,
+                false,
+                vec![
+                    SessionRuntimeEvent::CompactionStarted,
+                    SessionRuntimeEvent::RetryStarted {
+                        attempt: 1,
+                        max_attempts: 3,
+                        delay_ms: 10,
+                        error: "first".into(),
+                    },
+                ],
+            ),
+        );
+        publish_now(
+            &entry,
+            events_effect(
+                true,
+                false,
+                vec![SessionRuntimeEvent::RetryStarted {
+                    attempt: 2,
+                    max_attempts: 3,
+                    delay_ms: 10,
+                    error: "second".into(),
+                }],
+            ),
+        );
+        publish_now(
+            &entry,
+            events_effect(
+                false,
+                true,
+                vec![SessionRuntimeEvent::RetryEnded {
+                    success: true,
+                    attempt: 2,
+                    error: None,
+                }],
+            ),
+        );
+
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 1, "相邻帧必须合并成一条");
+        let RuntimeEffectKind::Events {
+            follow_tail,
+            settled,
+            runtime_events,
+        } = &snapshot.effects[0].kind
+        else {
+            panic!("expected merged Events effect");
+        };
+        assert!(*follow_tail, "follow_tail 取并集");
+        assert!(*settled, "settled 取并集");
+        assert_eq!(
+            runtime_events,
+            &vec![
+                SessionRuntimeEvent::CompactionStarted,
+                SessionRuntimeEvent::RetryEnded {
+                    success: true,
+                    attempt: 2,
+                    error: None,
+                },
+            ],
+            "每个事件族只保留最新一条，族之间顺序不变"
+        );
+        // 合并后序号跟随最新一次发布，UI 的 cursor 才能继续单调推进。
+        assert_eq!(snapshot.effects[0].sequence, 3);
+    }
+
+    #[test]
+    fn extension_ui_batches_merge_by_id_but_never_reorder_across_a_reset() {
+        let entry = bounded_entry(52, EffectLimits::default());
+        let request = |title: &str| ExtensionUiRequest::SetTitle {
+            title: title.to_owned(),
+        };
+        publish_now(
+            &entry,
+            RuntimeEffectKind::ExtensionUiBatch {
+                requests: vec![("a".into(), request("first"))],
+            },
+        );
+        publish_now(
+            &entry,
+            RuntimeEffectKind::ExtensionUiBatch {
+                requests: vec![("a".into(), request("second"))],
+            },
+        );
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 1);
+        let RuntimeEffectKind::ExtensionUiBatch { requests } = &snapshot.effects[0].kind else {
+            panic!("expected batch");
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, request("second"), "同 id 取最新");
+
+        // reset 是顺序敏感的屏障：它之前的请求不能被之后的批次合并回来。
+        publish_now(&entry, RuntimeEffectKind::ExtensionUiReset);
+        publish_now(
+            &entry,
+            RuntimeEffectKind::ExtensionUiBatch {
+                requests: vec![("b".into(), request("after-reset"))],
+            },
+        );
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 3);
+        assert!(matches!(
+            snapshot.effects[1].kind,
+            RuntimeEffectKind::ExtensionUiReset
+        ));
+        let RuntimeEffectKind::ExtensionUiBatch { requests } = &snapshot.effects[2].kind else {
+            panic!("expected batch after reset");
+        };
+        assert_eq!(
+            requests.len(),
+            1,
+            "reset 之后的批次不得吸收 reset 之前的请求"
+        );
+        assert_eq!(requests[0].0, "b");
+    }
+
+    #[test]
+    fn byte_ceiling_strips_reconstructable_payloads_before_dropping_results() {
+        let limits = EffectLimits {
+            max_bytes: 64 * 1024,
+            max_effects: 512,
+            max_diagnostics: 4,
+        };
+        let entry = bounded_entry(53, limits);
+        for index in 0..8 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::RequestFinished {
+                    intent: RpcIntent::Prompt,
+                    submission: Some(fat_submission(32 * 1024)),
+                    pending_activity_generation: None,
+                    result: Err((RequestFailureKind::Rejected, format!("rejected-{index}"))),
+                },
+            );
+        }
+        let snapshot = entry.snapshot();
+        assert!(
+            snapshot.backpressure.buffered_bytes <= limits.max_bytes,
+            "字节上限是硬上限：{} > {}",
+            snapshot.backpressure.buffered_bytes,
+            limits.max_bytes
+        );
+        assert!(snapshot.backpressure.stripped_submissions > 0);
+        assert_eq!(
+            snapshot.backpressure.dropped_results, 0,
+            "剥离负载已经够用时不得淘汰一次性结果"
+        );
+        assert_eq!(snapshot.effects.len(), 8, "8 条结果全部保留");
+        for (index, effect) in snapshot.effects.iter().enumerate() {
+            let RuntimeEffectKind::RequestFinished { result, .. } = &effect.kind else {
+                panic!("expected request result");
+            };
+            assert_eq!(
+                result.as_ref().unwrap_err().1,
+                format!("rejected-{index}"),
+                "错误结果本身必须完整保留"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_and_counted() {
+        let limits = EffectLimits {
+            max_bytes: 4 * 1024 * 1024,
+            max_effects: 512,
+            max_diagnostics: 4,
+        };
+        let entry = bounded_entry(54, limits);
+        for index in 0..20 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::Diagnostic(format!("diagnostic-{index}")),
+            );
+        }
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 4, "诊断保留条数固定");
+        assert_eq!(snapshot.backpressure.dropped_diagnostics, 16);
+        assert!(matches!(
+            &snapshot.effects[3].kind,
+            RuntimeEffectKind::Diagnostic(message) if message == "diagnostic-19"
+        ));
+    }
+
+    #[test]
+    fn authoritative_terminal_state_survives_effect_eviction() {
+        let limits = EffectLimits {
+            max_bytes: 64 * 1024,
+            max_effects: 8,
+            max_diagnostics: 2,
+        };
+        let entry = bounded_entry(55, limits);
+        fail_runtime(&entry, 1, "会话已崩溃".to_owned());
+        assert_eq!(
+            entry.snapshot().terminal,
+            Some(TerminalState::Failed {
+                error: "会话已崩溃".to_owned()
+            })
+        );
+
+        // 把缓存灌到条数上限之外，逼出对可靠条目的淘汰。
+        for index in 0..64 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::ControlFinished {
+                    operation: ControlOperation::Compact,
+                    result: Err(format!("later-{index}")),
+                },
+            );
+        }
+        let snapshot = entry.snapshot();
+        assert!(snapshot.effects.len() <= limits.max_effects);
+        assert!(
+            snapshot.backpressure.dropped_results > 0,
+            "触发淘汰时必须留下可见计数"
+        );
+        assert_eq!(
+            snapshot.terminal,
+            Some(TerminalState::Failed {
+                error: "会话已崩溃".to_owned()
+            }),
+            "权威终态不依赖 effect 流，任何背压下都必须仍然可读"
+        );
+    }
+
+    #[test]
+    fn ack_reclaims_consumed_effects() {
+        let entry = bounded_entry(56, EffectLimits::default());
+        for index in 0..10 {
+            publish_now(&entry, RuntimeEffectKind::Diagnostic(format!("d-{index}")));
+        }
+        let snapshot = entry.snapshot();
+        assert!(snapshot.backpressure.buffered_effects > 0);
+        let last = snapshot.effects.last().unwrap().sequence;
+
+        let handle = SessionHandle {
+            entry: entry.clone(),
+        };
+        handle.ack_effects(snapshot.epoch, last);
+        let after = entry.snapshot();
+        assert_eq!(after.backpressure.buffered_effects, 0);
+        assert_eq!(after.backpressure.buffered_bytes, 0);
+        assert!(after.effects.is_empty());
+    }
+
+    /// 只看 reducer 相位，不读 Snapshot、不 ack —— 用来模拟「UI 完全停止消费」。
+    fn wait_for_idle_without_consuming(handle: &SessionHandle, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let phase = handle.entry.state.lock().unwrap().reducer.phase();
+            if phase == LivePhase::Idle {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for idle runtime"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn document_contains_markdown(document: &ConversationDocument, needle: &str) -> bool {
+        document.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, pi_render::Block::Markdown(markdown) if markdown.source.contains(needle))
+            })
+        })
+    }
+
+    fn submission(message: &str) -> Option<ComposerSubmission> {
+        Some(ComposerSubmission {
+            message: message.to_owned(),
+            images: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn command_queue_is_bounded_while_the_control_channel_stays_available() {
+        let actor = ActorLimits {
+            command_capacity: 4,
+            control_capacity: 4,
+            command_workers: 1,
+            control_workers: 1,
+        };
+        let manager = RuntimeManager::new(RuntimeLimits {
+            actor,
+            ..RuntimeLimits::default()
+        });
+        let handle = manager
+            .start_fresh(
+                fake_binary(),
+                std::env::temp_dir(),
+                test_document("bounded-queue"),
+                ToolPreset::Inherit,
+                None,
+            )
+            .unwrap();
+
+        // fake child 对未知 prompt 会长时间沉睡，worker 与队列都被真实占住。
+        // 启动时的元数据作业也在同一条通道上，所以「第几次被拒」不是确定值：
+        // 一直投递到出现拒绝为止，并记录**被拒那一次**之前的快照。
+        let mut rejected = None;
+        for index in 0..256 {
+            let before = handle.snapshot();
+            let dispatched = handle.dispatch(
+                RpcIntent::Prompt,
+                submission(&format!("hang-{index}")),
+                ComposerMode::Steer,
+            );
+            if let Err(error) = dispatched {
+                rejected = Some((before, error));
+                break;
+            }
+        }
+        let (before, rejection) = rejected.expect("有界队列必须在有限次投递后拒绝");
+        assert!(
+            rejection.contains("命令队列已满"),
+            "拒绝原因必须对用户可读：{rejection}"
+        );
+
+        // 被拒绝的投递不得改动 reducer —— 否则 UI 会停在假的 Running 上。
+        let after = handle.snapshot();
+        assert_eq!(before.phase, after.phase, "队列满不得改变会话相位");
+        assert_eq!(
+            before.backpressure.rejected_commands + 1,
+            after.backpressure.rejected_commands,
+            "每次拒绝都必须留下可见计数"
+        );
+        assert!(after.backpressure.queued_commands <= actor.command_capacity);
+
+        // 控制通道与普通通道分离：普通队列饱和时停止请求仍然被受理。
+        handle
+            .dispatch(RpcIntent::Abort, None, ComposerMode::Steer)
+            .expect("控制通道必须在普通通道饱和时仍可投递");
+
+        // 线程预算固定：worker + 事件 pump，与投递次数无关。
+        assert_eq!(
+            handle.live_thread_count(),
+            actor.command_workers + actor.control_workers + 1
+        );
+        manager.stop_user(handle.runtime_id());
+    }
+
+    #[test]
+    fn paused_ui_still_resumes_with_a_complete_final_snapshot() {
+        let (manager, handle) = runtime_handle();
+        // 等启动元数据就绪，但**不 ack**：验收要求「UI 暂停消费后恢复仍得到完整最终
+        // Snapshot」，其中就包括此前没来得及消费的最新 controls。
+        wait_for_snapshot(&handle, Duration::from_secs(5), |snapshot| {
+            snapshot
+                .effects
+                .iter()
+                .any(|effect| matches!(effect.kind, RuntimeEffectKind::ControlsLoaded(Ok(_))))
+        });
+
+        handle
+            .dispatch(RpcIntent::Prompt, submission("stream"), ComposerMode::Steer)
+            .unwrap();
+        // 整个流式过程中完全不读 Snapshot、不 ack，模拟 UI 卡死。
+        wait_for_idle_without_consuming(&handle, Duration::from_secs(30));
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.phase, LivePhase::Idle);
+        assert!(
+            document_contains_markdown(&snapshot.document, "authoritative"),
+            "恢复消费后必须拿到权威终版正文，而不是被背压截断的中间态"
+        );
+        assert!(
+            snapshot.backpressure.buffered_bytes <= handle.effect_limits().max_bytes,
+            "effect 缓存必须始终在字节上限内：{} > {}",
+            snapshot.backpressure.buffered_bytes,
+            handle.effect_limits().max_bytes
+        );
+        assert!(
+            snapshot.backpressure.coalesced > 0,
+            "1500 条流式更新必须被合帧，而不是逐条堆进 effect 流"
+        );
+        assert_eq!(
+            snapshot.backpressure.dropped_results, 0,
+            "一次性结果不得因为 UI 停摆而被丢弃"
+        );
+        assert!(
+            snapshot.effects.iter().any(|effect| matches!(
+                &effect.kind,
+                RuntimeEffectKind::RequestFinished { result: Ok(()), .. }
+            )),
+            "提交结果必须仍然可读"
+        );
+        assert!(
+            snapshot
+                .effects
+                .iter()
+                .any(|effect| matches!(effect.kind, RuntimeEffectKind::ControlsLoaded(Ok(_)))),
+            "暂停期间未消费的最新 controls 必须仍在最终 Snapshot 中"
+        );
+        assert!(
+            snapshot
+                .effects
+                .iter()
+                .any(|effect| matches!(effect.kind, RuntimeEffectKind::CommandsLoaded(Ok(_)))),
+            "暂停期间未消费的 slash 命令列表同理"
+        );
+        assert_eq!(snapshot.terminal, None, "正常结束的会话没有终态");
+        manager.stop_user(handle.runtime_id());
+    }
+
+    #[test]
+    fn graceful_stop_is_observable_as_a_terminal_state() {
+        let (manager, handle) = runtime_handle();
+        assert_eq!(handle.snapshot().terminal, None);
+
+        manager.stop_user(handle.runtime_id());
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.terminal,
+            Some(TerminalState::Stopped),
+            "优雅停止必须留下可观察终态，观察者不该只能靠超时判断"
+        );
+        assert!(
+            snapshot
+                .effects
+                .iter()
+                .any(|effect| matches!(effect.kind, RuntimeEffectKind::Stopped(None))),
+            "优雅停止同时发布无错误的终态 effect"
+        );
+        // 队列关闭后不再接受任何投递。
+        assert!(
+            handle
+                .dispatch(
+                    RpcIntent::Prompt,
+                    submission("after-stop"),
+                    ComposerMode::Steer
+                )
+                .is_err()
+        );
+    }
+
+    // ---------- R22 代码审查整改的回归测试 ----------
+
+    /// H1 回归：合并路径此前直接 `return`，跳过 `enforce_limits()`，
+    /// 字节/条数硬上限在「连续只含扩展请求的帧」这条路上完全不生效。
+    #[test]
+    fn merged_entries_are_still_subject_to_the_byte_ceiling() {
+        let limits = EffectLimits {
+            max_bytes: 64 * 1024,
+            max_effects: 512,
+            max_diagnostics: 4,
+        };
+        let entry = bounded_entry(60, limits);
+        // 每帧一个**新 id** 的对话请求：既不能按语义 key 折叠，也不能按 id 折叠，
+        // 只能真实堆进同一条 ExtensionUiBatch —— 正是当年绕过上限的那条路径。
+        for index in 0..64 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::ExtensionUiBatch {
+                    requests: vec![(
+                        format!("dialog-{index}"),
+                        ExtensionUiRequest::Confirm {
+                            title: "T".repeat(2048),
+                            message: "M".repeat(2048),
+                            timeout: None,
+                        },
+                    )],
+                },
+            );
+        }
+        let snapshot = entry.snapshot();
+        assert!(
+            snapshot.backpressure.buffered_bytes <= limits.max_bytes,
+            "合并后的条目必须同样受字节上限约束：{} > {}",
+            snapshot.backpressure.buffered_bytes,
+            limits.max_bytes
+        );
+    }
+
+    /// H1 次要点回归：pi 每次调用都生成新 id，只按 id 去重会让同一个 statusKey
+    /// 无限堆积。跨帧合并必须和 pump 内单帧合并用同一套语义 key。
+    #[test]
+    fn merged_extension_batches_fold_status_and_widget_keys_not_just_ids() {
+        let entry = bounded_entry(61, EffectLimits::default());
+        for index in 0..50 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::ExtensionUiBatch {
+                    requests: vec![(
+                        format!("req-{index}"),
+                        ExtensionUiRequest::SetStatus {
+                            status_key: "build".into(),
+                            status_text: Some(format!("step {index}")),
+                        },
+                    )],
+                },
+            );
+        }
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 1);
+        let RuntimeEffectKind::ExtensionUiBatch { requests } = &snapshot.effects[0].kind else {
+            panic!("expected batch");
+        };
+        assert_eq!(requests.len(), 1, "同一个 statusKey 必须折叠成一条");
+        assert_eq!(
+            requests[0].1,
+            ExtensionUiRequest::SetStatus {
+                status_key: "build".into(),
+                status_text: Some("step 49".into()),
+            },
+            "折叠后保留最新的值"
+        );
+    }
+
+    /// M2 回归：已经交付给 UI 的队尾条目不得再被合并。
+    ///
+    /// 否则抬序号会让 UI 把旧内容重复应用一遍（错误横幅永远退不掉），
+    /// 不抬序号则新内容永远越不过 cursor。
+    #[test]
+    fn delivered_entries_are_never_merged_into() {
+        let entry = bounded_entry(62, EffectLimits::default());
+        publish_now(
+            &entry,
+            events_effect(
+                false,
+                false,
+                vec![SessionRuntimeEvent::CompactionEnded {
+                    error: Some("boom".into()),
+                }],
+            ),
+        );
+        // UI 拉取快照 = 这条已经交付。
+        let delivered = entry.snapshot();
+        assert_eq!(delivered.effects.len(), 1);
+        let first_sequence = delivered.effects[0].sequence;
+
+        // 交付之后到来的新帧必须另起一条，而不是并进已交付的那条。
+        publish_now(&entry, events_effect(true, true, Vec::new()));
+        let after = entry.snapshot();
+        assert_eq!(after.effects.len(), 2, "已交付条目不得被合并");
+        assert_eq!(
+            after.effects[0].sequence, first_sequence,
+            "已交付条目序号不得被改写"
+        );
+        assert!(after.effects[1].sequence > first_sequence);
+        let RuntimeEffectKind::Events { runtime_events, .. } = &after.effects[1].kind else {
+            panic!("expected events");
+        };
+        assert!(
+            runtime_events.is_empty(),
+            "新条目不得携带 UI 已经应用过的运行时事件"
+        );
+
+        // 未交付条目之间仍然合并（UI 停摆时的正常路径）：连续 publish 而中间不取快照，
+        // 因为取快照本身就会把交付水位推到队尾。
+        let before_stall = after.effects.len();
+        for _ in 0..10 {
+            publish_now(&entry, events_effect(false, false, Vec::new()));
+        }
+        assert_eq!(
+            entry.snapshot().effects.len(),
+            before_stall + 1,
+            "UI 停摆期间的连续帧必须合并成一条"
+        );
+    }
+
+    /// M2 回归：ack 必须能真正回收已消费条目，稳态下缓存回到空。
+    #[test]
+    fn ack_reclaims_the_tail_even_while_new_frames_keep_arriving() {
+        let entry = bounded_entry(63, EffectLimits::default());
+        let handle = SessionHandle {
+            entry: entry.clone(),
+        };
+        for _ in 0..20 {
+            publish_now(&entry, events_effect(false, false, Vec::new()));
+            let snapshot = entry.snapshot();
+            let cursor = snapshot.effects.last().unwrap().sequence;
+            handle.ack_effects(snapshot.epoch, cursor);
+            assert_eq!(
+                entry.snapshot().backpressure.buffered_effects,
+                0,
+                "每帧 ack 之后缓存必须回到空"
+            );
+        }
+    }
+
+    /// N13 补测：`ControlsLoaded` 与 `CommandsLoaded` 共用跨条目淘汰分支，
+    /// 但此前只有 `CommandsLoaded` 有直接断言。
+    #[test]
+    fn controls_loaded_keeps_only_the_latest_value() {
+        let entry = bounded_entry(64, EffectLimits::default());
+        for index in 0..5 {
+            publish_now(
+                &entry,
+                RuntimeEffectKind::ControlsLoaded(Err(format!("controls-{index}"))),
+            );
+        }
+        let snapshot = entry.snapshot();
+        let controls = snapshot
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.kind, RuntimeEffectKind::ControlsLoaded(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(controls.len(), 1);
+        assert!(matches!(
+            &controls[0].kind,
+            RuntimeEffectKind::ControlsLoaded(Err(message)) if message == "controls-4"
+        ));
+        assert_eq!(snapshot.backpressure.coalesced, 4, "每淘汰一条旧值计一次");
+    }
+
+    /// L5 回归：合帧丢弃的运行时事件必须计数，不能无声消失。
+    #[test]
+    fn dropped_runtime_events_are_counted() {
+        let entry = bounded_entry(65, EffectLimits::default());
+        publish_now(
+            &entry,
+            events_effect(
+                false,
+                false,
+                vec![SessionRuntimeEvent::RetryEnded {
+                    success: false,
+                    attempt: 1,
+                    error: Some("first".into()),
+                }],
+            ),
+        );
+        publish_now(
+            &entry,
+            events_effect(
+                false,
+                false,
+                vec![SessionRuntimeEvent::RetryStarted {
+                    attempt: 2,
+                    max_attempts: 3,
+                    delay_ms: 10,
+                    error: "second".into(),
+                }],
+            ),
+        );
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.effects.len(), 1);
+        assert_eq!(
+            snapshot.backpressure.dropped_runtime_events, 1,
+            "同族取最新丢掉的那条必须计数"
+        );
+    }
+
+    /// L8 回归：控制通道被拒的文案必须点明是控制队列，别让用户以为是 32 的命令队列。
+    #[test]
+    fn queue_full_message_names_the_channel() {
+        let command = actor::QueueError::Full {
+            channel: actor::Channel::Command,
+            capacity: 32,
+        }
+        .message();
+        assert!(
+            command.contains("命令队列") && command.contains("32"),
+            "{command}"
+        );
+        let control = actor::QueueError::Full {
+            channel: actor::Channel::Control,
+            capacity: 8,
+        }
+        .message();
+        assert!(
+            control.contains("控制队列") && control.contains("8"),
+            "{control}"
         );
     }
 }

@@ -49,6 +49,8 @@ pub struct ChatPanel {
     active_epoch: u64,
     applied_revision: u64,
     effect_cursor: u64,
+    /// 上一次已上报的运行时背压计数，用于只在新增时提示。
+    backpressure: pi_runtime::BackpressureStats,
     session: SessionUiState,
     composer: gpui::Entity<TextareaState>,
     drafts: pi_data::DraftStore,
@@ -157,6 +159,23 @@ pub struct SessionUiState {
     rpc_success: Option<String>,
     rpc_error: Option<String>,
     host_extension_degradation: Option<String>,
+    /// 背压弱提示的最短驻留截止时间。
+    ///
+    /// 只按「本帧有无新增计数」显隐会让一次性计数只活一帧：在 16–33ms 的合帧节奏下
+    /// 既看不清，还会让它下方的 composer 每帧上下跳一行。给一个固定的可读窗口。
+    backpressure_note_until: Option<std::time::Instant>,
+    /// 背压降级的弱提示。
+    ///
+    /// 单独一格而不是复用 `host_extension_degradation`：后者承载的是「整个会话持续成立」
+    /// 的降级事实（如宿主扩展未加载），而背压计数描述的是**瞬时**事件，两者生命周期
+    /// 不同。混在一起会让瞬时提示永久驻留，并把高价值的启动诊断永久顶掉。
+    backpressure_note: Option<String>,
+    /// 当前 `rpc_error` 是否是「具体、可据以行动的失败原因」。
+    ///
+    /// 为真时背压提示只能追加、不能替换。它不按帧重置——因为要保护的错误既可能来自
+    /// effect（`apply_snapshot` 期间），也可能来自用户操作路径（提交被拒、停止失败），
+    /// 后者根本不经过 `apply_snapshot`，按帧重置会让它在下一帧被背压提示整条顶掉。
+    rpc_error_protected: bool,
     extension_ui: ExtensionUiState,
     extension_dialog_open: Option<String>,
     extension_dialog_needs_close: bool,
@@ -196,6 +215,9 @@ impl SessionUiState {
             rpc_success: None,
             rpc_error: None,
             host_extension_degradation: None,
+            backpressure_note: None,
+            backpressure_note_until: None,
+            rpc_error_protected: false,
             extension_ui: ExtensionUiState::default(),
             extension_dialog_open: None,
             extension_dialog_needs_close: false,
@@ -349,6 +371,7 @@ impl ChatPanel {
             active_epoch: 0,
             applied_revision: 0,
             effect_cursor: 0,
+            backpressure: pi_runtime::BackpressureStats::default(),
             session: SessionUiState::new(list_state),
             composer,
             drafts: pi_data::DraftStore::default(),
@@ -452,11 +475,14 @@ impl ChatPanel {
     fn begin_active_generation(&mut self) -> u64 {
         self.active_generation = self.active_generation.wrapping_add(1);
         self.host_extension_degradation = None;
+        self.backpressure_note = None;
+        self.backpressure_note_until = None;
         self.active_generation
     }
 
     fn clear_rpc_error(&mut self) {
         self.rpc_error = None;
+        self.rpc_error_protected = false;
     }
 
     fn set_host_extension_degradation(&mut self, diagnostic: Option<&str>) {
@@ -483,6 +509,8 @@ impl ChatPanel {
         self.rpc_success = None;
         self.rpc_error = None;
         self.host_extension_degradation = None;
+        self.backpressure_note = None;
+        self.backpressure_note_until = None;
         self.fresh_session = false;
         self.draft_key = Some(selection.id.clone());
         self.composer_cwd = Some(selection.cwd.clone());
@@ -614,6 +642,8 @@ impl ChatPanel {
         self.rpc_success = None;
         self.rpc_error = None;
         self.host_extension_degradation = None;
+        self.backpressure_note = None;
+        self.backpressure_note_until = None;
         self.fresh_session = true;
         self.tail_attached = true;
         self.follow_requested = false;
@@ -682,6 +712,12 @@ impl ChatPanel {
         self.active_epoch = snapshot.epoch;
         self.applied_revision = 0;
         self.effect_cursor = 0;
+        // 背压计数是每 Runtime 累加的，换 Runtime 必须一起归零，否则旧计数会压住新提示。
+        // 提示本身也在这里一并清掉：让「归零基线」和「清空提示」待在同一个函数里，
+        // 避免以后新增调用点时漏清而重现提示驻留。
+        self.backpressure = pi_runtime::BackpressureStats::default();
+        self.backpressure_note = None;
+        self.backpressure_note_until = None;
         self.set_host_extension_degradation(snapshot.startup_diagnostic.as_deref());
         self.extension_response_sender = Some(Arc::new(
             crate::live_session::HandleExtensionResponseSender::new(active.clone(), snapshot.epoch),
@@ -761,6 +797,12 @@ impl ChatPanel {
             self.effect_cursor = self.effect_cursor.max(effect.sequence);
             settled |= self.apply_runtime_effect(effect, cx);
         }
+        // R22：回收已消费 effect，让运行时缓存在稳态下保持接近空，
+        // 而不是靠背压淘汰来维持有界。
+        if let Some(active) = self.active.as_ref() {
+            active.ack_effects(snapshot.epoch, self.effect_cursor);
+        }
+        self.report_backpressure(snapshot.backpressure);
         let document = snapshot.document;
         self.sync_list_document(&document, settled);
         self.status = ChatStatus::Ready(document);
@@ -768,6 +810,85 @@ impl ChatPanel {
             return false;
         }
         false
+    }
+
+    /// 把运行时的背压淘汰暴露给用户。
+    ///
+    /// 只在计数**新增**时提示一次：这些计数是单调累加的，每帧重复报会刷屏。
+    /// 把运行时的背压淘汰暴露给用户。
+    ///
+    /// 只在计数**新增**时提示一次：这些计数是单调累加的，每帧重复报会刷屏。
+    fn report_backpressure(&mut self, stats: pi_runtime::BackpressureStats) {
+        /// 弱提示的最短可读驻留时间。
+        const NOTE_MIN_DISPLAY: std::time::Duration = std::time::Duration::from_secs(5);
+        /// 追加背压说明时用来判重的关键词，避免同一条错误被反复追加而无限变长。
+        const ALERT_MARK: &str = "事件积压过多";
+
+        let previous = self.backpressure;
+        self.backpressure = stats;
+        let grew = |current: u64, before: u64| current.saturating_sub(before);
+        let dropped_results = grew(stats.dropped_results, previous.dropped_results);
+        let dropped_coalescable = grew(stats.dropped_coalescable, previous.dropped_coalescable);
+        let dropped_runtime_events = grew(
+            stats.dropped_runtime_events,
+            previous.dropped_runtime_events,
+        );
+        let dropped_diagnostics = grew(stats.dropped_diagnostics, previous.dropped_diagnostics);
+        let dropped_jobs = grew(stats.dropped_jobs, previous.dropped_jobs);
+
+        // 真正丢了用户结果才占错误位。
+        let alert = if dropped_results > 0 {
+            Some(format!(
+                "{ALERT_MARK}，{dropped_results} 条操作结果未能送达界面；界面状态可能不完整，建议重新载入会话"
+            ))
+        } else if dropped_coalescable > 0 {
+            Some(format!(
+                "{ALERT_MARK}，{dropped_coalescable} 条界面更新已被合并丢弃"
+            ))
+        } else {
+            None
+        };
+        if let Some(alert) = alert {
+            self.rpc_success = None;
+            self.rpc_error = match self.rpc_error.take() {
+                // 已有具体失败原因时只追加，不替换；已经追加过就不再重复，防止无限变长。
+                Some(existing) if self.rpc_error_protected => {
+                    if existing.contains(ALERT_MARK) {
+                        Some(existing)
+                    } else {
+                        Some(format!("{existing}；{alert}"))
+                    }
+                }
+                _ => Some(alert),
+            };
+        }
+
+        // 以下都是「自愈型」降级：下一次 settle 或控制操作会重新拉取，只进弱提示位。
+        // 它描述的是瞬时事件，必须自行退场；但退场要给一个可读窗口，否则在 16–33ms 的
+        // 合帧节奏下只活一帧，既看不清又让下方的 composer 逐帧跳动。
+        let mut notes = Vec::new();
+        if dropped_runtime_events > 0 {
+            notes.push(format!("{dropped_runtime_events} 条过程状态被合帧取最新"));
+        }
+        if dropped_diagnostics > 0 {
+            notes.push(format!("{dropped_diagnostics} 条积压诊断被丢弃"));
+        }
+        if dropped_jobs > 0 {
+            notes.push(format!("{dropped_jobs} 次元数据刷新因队列繁忙被跳过"));
+        }
+        let now = std::time::Instant::now();
+        if notes.is_empty() {
+            if self
+                .backpressure_note_until
+                .is_some_and(|until| now >= until)
+            {
+                self.backpressure_note = None;
+                self.backpressure_note_until = None;
+            }
+        } else {
+            self.backpressure_note = Some(notes.join("；"));
+            self.backpressure_note_until = Some(now + NOTE_MIN_DISPLAY);
+        }
     }
 
     fn apply_runtime_effect(&mut self, effect: RuntimeEffect, cx: &mut Context<Self>) -> bool {
@@ -789,6 +910,7 @@ impl ChatPanel {
                     if let Some(response) = self.extension_ui.apply(id.clone(), request) {
                         self.pending_extension_responses.push(response);
                     } else if duplicate {
+                        self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("重复 Extension UI 请求 {id} 已忽略"));
                     }
                 }
@@ -811,6 +933,7 @@ impl ChatPanel {
                     }
                     Err((kind, error)) => {
                         self.rpc_success = None;
+                        let mut restored_draft = false;
                         if should_restore_submission(kind)
                             && let (Some(key), Some(submission)) =
                                 (self.draft_key.clone(), submission)
@@ -828,16 +951,25 @@ impl ChatPanel {
                                 .into_iter()
                                 .filter_map(attachment_from_draft)
                                 .collect();
+                            restored_draft = true;
                         }
+                        self.rpc_error_protected = true;
                         self.rpc_error = Some(match kind {
-                            RequestFailureKind::Rejected => {
+                            // R22 起 `submission` 可能因 effect 缓存的字节上限被剥离，
+                            // 此时草稿并没有真的恢复；文案必须跟着实际可见状态走，
+                            // 否则横幅说「已恢复」而输入框和附件条都是空的。
+                            RequestFailureKind::Rejected if restored_draft => {
                                 format!("pi 明确拒绝提交，已恢复草稿：{error}")
+                            }
+                            RequestFailureKind::Rejected => {
+                                format!("pi 明确拒绝提交（草稿因积压未能保留）：{error}")
                             }
                             RequestFailureKind::Ambiguous => {
                                 format!("提交结果不明确，为避免重复 turn 未自动恢复：{error}")
                             }
                         });
                         if intent == RpcIntent::Abort {
+                            self.rpc_error_protected = true;
                             self.rpc_error = Some(format!("停止失败：{error}"));
                         }
                     }
@@ -850,7 +982,10 @@ impl ChatPanel {
                         self.slash_commands = commands;
                         self.refresh_popup_without_input();
                     }
-                    Err(error) => self.rpc_error = Some(format!("加载 slash 命令失败：{error}")),
+                    Err(error) => {
+                        self.rpc_error_protected = true;
+                        self.rpc_error = Some(format!("加载 slash 命令失败：{error}"));
+                    }
                 }
                 false
             }
@@ -869,7 +1004,10 @@ impl ChatPanel {
                         }
                         self.apply_controls(controls);
                     }
-                    Err(error) => self.rpc_error = Some(format!("加载会话控制失败：{error}")),
+                    Err(error) => {
+                        self.rpc_error_protected = true;
+                        self.rpc_error = Some(format!("加载会话控制失败：{error}"));
+                    }
                 }
                 false
             }
@@ -879,6 +1017,7 @@ impl ChatPanel {
                     Ok(outcome) => self.apply_control_outcome(operation, outcome, cx),
                     Err(error) => {
                         self.compacting = false;
+                        self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("会话操作失败：{error}"));
                         if let Some(active) = self.active.as_ref() {
                             active.refresh_metadata();
@@ -917,6 +1056,7 @@ impl ChatPanel {
                 self.pending_extension_responses.clear();
                 self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
                 if let Some(error) = error {
+                    self.rpc_error_protected = true;
                     self.rpc_error = Some(error);
                 }
                 self.control_operation = None;
@@ -1421,6 +1561,7 @@ impl ChatPanel {
                     self.compacting = false;
                     if let Some(error) = error {
                         self.rpc_success = None;
+                        self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("Compaction 失败：{error}"));
                     }
                 }
@@ -1441,6 +1582,7 @@ impl ChatPanel {
                     self.retry_status = None;
                     if let Some(error) = error {
                         self.rpc_success = None;
+                        self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("Auto-retry 结束：{error}"));
                     }
                 }
@@ -2032,7 +2174,17 @@ impl ChatPanel {
             LivePhase::Idle | LivePhase::Error => RpcIntent::Prompt,
         };
         let submission = build_submission(message, &self.attachments);
-        let _ = active.dispatch(intent, Some(submission), self.composer_mode);
+        // R22：命令队列有界，投递可能被拒。此时必须保留草稿与附件供用户重试，
+        // 不能像成功路径那样清空输入框。
+        if let Err(error) = active.dispatch(intent, Some(submission), self.composer_mode) {
+            self.rpc_success = None;
+            self.rpc_error = Some(error);
+            self.rpc_error_protected = true;
+            // 浮层必须一并收起：否则它会继续遮挡 composer，和刚弹出的错误横幅抢注意力。
+            self.popup = None;
+            cx.notify();
+            return;
+        }
         input.update(cx, |input, cx| input.set_value("", window, cx));
         self.attachments.clear();
         self.popup = None;
@@ -2163,7 +2315,10 @@ impl ChatPanel {
         if let Some(active) = self.active.clone()
             && active.snapshot().phase == LivePhase::Running
         {
-            let _ = active.dispatch(RpcIntent::Abort, None, self.composer_mode);
+            if let Err(error) = active.dispatch(RpcIntent::Abort, None, self.composer_mode) {
+                self.rpc_error = Some(format!("停止失败：{error}"));
+                self.rpc_error_protected = true;
+            }
             cx.notify();
         }
     }
@@ -2895,6 +3050,17 @@ impl Render for ChatPanel {
                             )
                         },
                     )
+                    .when_some(self.backpressure_note.clone(), |view, note| {
+                        view.child(
+                            div()
+                                .debug_selector(|| "backpressure-note".into())
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child(note),
+                        )
+                    })
                     .when_some(self.rpc_error.clone(), |view, error| {
                         view.child(
                             div()
@@ -5944,5 +6110,136 @@ mod tests {
             title: "title".to_owned(),
         };
         assert_eq!(event.path.file_name().unwrap(), "id.jsonl");
+    }
+
+    // ---------- R22 视觉审查整改：可见状态的机械验证 ----------
+    //
+    // 本轮走 CODE_ONLY 兜底、没有截图，这几条是新增可见状态的唯一机械证据。
+    // 覆盖边界：都直接调用 `report_backpressure`，因此**未覆盖** `rpc_error_protected`
+    // 在 9 处 effect 写入点上的赋值是否齐全，也未覆盖用户操作路径的端到端行为
+    // （`submit` / `abort` 需要一个会拒绝 dispatch 的 `SessionHandle`，而 app 测试
+    // 二进制里没有可用的 pi 子进程 fixture）。
+
+    fn backpressure_stats(
+        dropped_results: u64,
+        dropped_jobs: u64,
+    ) -> pi_runtime::BackpressureStats {
+        pi_runtime::BackpressureStats {
+            dropped_results,
+            dropped_jobs,
+            ..pi_runtime::BackpressureStats::default()
+        }
+    }
+
+    #[gpui::test]
+    fn backpressure_note_has_its_own_slot_and_expires_on_its_own(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        panel.update(cx, |panel, cx| {
+            // 持续成立的启动降级先占住它自己的槽位。
+            panel.set_host_extension_degradation(Some("项目命令环境扩展未加载：denied"));
+            panel.report_backpressure(backpressure_stats(0, 2));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(
+            visual.debug_bounds("backpressure-note").is_some(),
+            "背压弱提示必须有自己的一行"
+        );
+        assert!(
+            visual.debug_bounds("host-extension-degradation").is_some(),
+            "瞬时背压提示不得顶掉整会话成立的启动降级诊断"
+        );
+
+        panel.update(cx, |panel, cx| {
+            // 可读窗口内即使没有新增计数也不能立刻消失，否则只活一帧、还会让下方抖动。
+            panel.report_backpressure(backpressure_stats(0, 2));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(
+            visual.debug_bounds("backpressure-note").is_some(),
+            "最短驻留窗口内必须保持可见"
+        );
+
+        panel.update(cx, |panel, cx| {
+            // 把驻留窗口拨到已过期，再报一帧无新增计数：此时必须自行退场。
+            panel.backpressure_note_until = Some(std::time::Instant::now());
+            panel.report_backpressure(backpressure_stats(0, 2));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(
+            visual.debug_bounds("backpressure-note").is_none(),
+            "过了可读窗口就必须退场，不能驻留到会话切换"
+        );
+        assert!(
+            visual.debug_bounds("host-extension-degradation").is_some(),
+            "启动降级诊断不受背压提示退场影响"
+        );
+    }
+
+    #[gpui::test]
+    fn backpressure_alert_appends_to_a_protected_error_exactly_once(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        panel.update(cx, |panel, cx| {
+            // 模拟用户操作路径写入的具体失败原因（提交被拒 / 停止失败走的就是这条路），
+            // 它不经过 apply_snapshot，正是上一轮审查指出的「保护范围之外」的场景。
+            panel.rpc_error = Some("命令队列已满（上限 32），请等待当前请求完成后重试".to_owned());
+            panel.rpc_error_protected = true;
+            panel.report_backpressure(backpressure_stats(3, 0));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        let error = panel.read_with(cx, |panel, _| panel.rpc_error.clone().unwrap());
+        assert!(
+            error.contains("命令队列已满"),
+            "具体失败原因不得被顶掉：{error}"
+        );
+        assert!(error.contains("3 条操作结果未能送达界面"), "{error}");
+        assert!(visual.debug_bounds("live-error").is_some());
+
+        let appended_once = error.clone();
+        panel.update(cx, |panel, cx| {
+            // 再来一批淘汰：已经追加过就不再重复追加，否则横幅会越长越离谱。
+            panel.report_backpressure(backpressure_stats(9, 0));
+            cx.notify();
+        });
+        let error = panel.read_with(cx, |panel, _| panel.rpc_error.clone().unwrap());
+        assert_eq!(error, appended_once, "同一条错误只追加一次背压说明");
+    }
+
+    #[gpui::test]
+    fn error_banner_and_attachment_strip_coexist_without_overlap_at_1280x820(
+        cx: &mut TestAppContext,
+    ) {
+        // 覆盖边界（如实标注）：本用例**不驱动真实提交路径**，只锁「错误横幅在场时
+        // 附件条与 composer 各行不重叠」这一布局性质——既有的附件布局用例跑在
+        // 1000×1000 且没有横幅在场。被拒后「保留草稿」「收起浮层」的行为本身
+        // 需要一个会拒绝 dispatch 的 SessionHandle，app 测试二进制内无此 fixture，
+        // 因此未被机械覆盖。
+        let (mut visual, panel) = render_status_with_panel_sized(
+            cx,
+            ChatStatus::Ready(document("hi")),
+            size(px(1280.), px(820.)),
+        );
+        panel.update(cx, |panel, cx| {
+            let png = vec![0x89_u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x66];
+            let draft = pi_data::image_from_bytes(png).unwrap();
+            panel.attachments = vec![attachment_from_draft(draft).unwrap()];
+            panel.rpc_success = None;
+            panel.rpc_error = Some("命令队列已满（上限 32），请等待当前请求完成后重试".to_owned());
+            panel.rpc_error_protected = true;
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(
+            visual.debug_bounds("live-error").is_some(),
+            "错误横幅必须出现"
+        );
+        assert!(
+            visual.debug_bounds("composer-attachments").is_some(),
+            "附件条必须与错误横幅共存"
+        );
+        assert_attachment_composer_rows_do_not_overlap(&mut visual, true);
     }
 }
