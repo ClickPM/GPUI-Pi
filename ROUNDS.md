@@ -26,7 +26,7 @@
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 | **R19** | Windows 应用图标（独立维护） | Windows | ✅ 已完成 | [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) | 2026-08-19 |
 | **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ 已完成 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | 2026-08-22 |
-| **R21** | 权威设计同步 + 单会话 Runtime 集中化 + 会话态收敛 | Windows | 📐 方案评审中，未实现 | — | — |
+| **R21** | 权威设计同步 + 单会话 Runtime 集中化 + 会话态收敛 | Windows | ✅ 已完成（BLOCKED 已解除：fresh 不落盘是钉死 pi 权威契约，resume 接缝走 `--session` 空文件分支零 token 验证，见 [`rounds/round-21/BLOCKED.md`](rounds/round-21/BLOCKED.md)） | [#31](https://github.com/cking000bigdemon/GPUI-Pi/pull/31) | 2026-08-24 |
 | **R22** | 单 Runtime 有界 Actor 与事件背压 | Windows | ⬜ | — | — |
 | **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ⬜ | — | — |
 | **R24** | 有界多用户 Session UI 接线 | Windows | ⬜ | — | — |
@@ -43,6 +43,6 @@
 | **M2** | R4–R8 | **可日用** | 到此为止也是稳定终态 |
 | **M3** | R10–R15 | 功能追平 | — |
 | **M4** | R16–R18 | 交付 | 附录 A 不全绿不发版 |
-| **M5** | R21–R27 | 有界多会话 + 内存治理 + 内建子代理 | R22 背压不过不得开放 R24；R25 整树清理不过不得启用 mutating 子代理 |
+| **M5** | R21–R27 | 有界多会话 + 内存治理 + 内建子代理 | **已选口径 B，M5 先于 M4 收口**；R22 背压不过不得开放 R24；R25 整树清理不过不得启用 mutating 子代理 |
 
-> **M4 尚未收口（R17 / R18 仍为 ⬜），M4 与 M5 的先后是待决事项** —— 见 [`docs/立项文档.md`](docs/立项文档.md) § 七 阶段 E 的待决条款：口径 A 先封 v1 再开 M5（默认建议），口径 B 先做 M5 但附录 A 基线须在 R24 后重建。**未选定前不得开工 R21。**
+> **项目所有者于 2026-08-23 选定口径 B**：先实施阶段 E（R21–R27），M4 顺延到 M5 之后；附录 A 验收基线须在 R24 多会话接线完成后重新建立，不得沿用改造前记录。

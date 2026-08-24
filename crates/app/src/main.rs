@@ -59,9 +59,10 @@ fn main() {
                 ..TitleBar::window_options()
             };
 
+            let runtime_manager = pi_runtime::RuntimeManager::new(Default::default());
             cx.spawn(async move |cx| {
                 let window = cx.open_window(options, |window, cx| {
-                    let workspace = cx.new(|cx| Workspace::new(window, cx));
+                    let workspace = cx.new(|cx| Workspace::new(runtime_manager, window, cx));
                     cx.new(|cx| Root::new(workspace, window, cx))
                 })?;
 

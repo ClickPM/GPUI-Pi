@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-use futures::{StreamExt as _, channel::mpsc::UnboundedReceiver};
+use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     Anchor, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, Context, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, FollowMode, Image, ImageFormat, InteractiveElement as _,
@@ -30,9 +30,10 @@ use pi_render::{ConversationDocument, ConversationItem, LivePhase};
 
 use crate::{
     live_session::{
-        ActiveSession, ComposerMode, ComposerSubmission, ControlOperation, ControlOutcome,
-        ControlRequest, ExtensionUiState, PumpMessage, RequestFailureKind, RpcIntent,
-        SessionControls, SessionRuntimeEvent, ToolPreset, official_binary,
+        ComposerMode, ComposerSubmission, ControlOperation, ControlOutcome, ControlRequest,
+        ExtensionUiState, RequestFailureKind, RpcIntent, RuntimeEffect, RuntimeEffectKind,
+        RuntimeManager, SessionControls, SessionHandle, SessionRuntimeEvent, SessionSnapshot,
+        ToolPreset, official_binary,
     },
     session_sidebar::SessionSelected,
 };
@@ -42,58 +43,25 @@ pub struct SessionsChanged;
 
 pub struct ChatPanel {
     focus_handle: FocusHandle,
-    status: ChatStatus,
-    load_generation: u64,
+    runtime_manager: RuntimeManager,
     active_generation: u64,
-    active: Option<ActiveSession>,
+    active: Option<SessionHandle>,
+    active_epoch: u64,
+    applied_revision: u64,
+    effect_cursor: u64,
+    session: SessionUiState,
     composer: gpui::Entity<TextareaState>,
-    composer_mode: ComposerMode,
-    draft_key: Option<String>,
     drafts: pi_data::DraftStore,
-    attachments: Vec<ComposerAttachment>,
-    slash_commands: Vec<pi_rpc::RpcSlashCommand>,
-    controls: Option<SessionControls>,
     model_names: Arc<std::collections::HashMap<String, String>>,
-    tool_preset: ToolPreset,
-    control_operation: Option<ControlOperation>,
-    branch_tree: Option<pi_data::SessionBranchTree>,
-    branch_preview_leaf: Option<String>,
-    branch_preview_document: Option<Arc<ConversationDocument>>,
-    retry_status: Option<RetryStatus>,
-    compacting: bool,
     popup: Option<ComposerPopup>,
     popup_index: usize,
     file_index: Option<pi_data::FileIndex>,
-    composer_cwd: Option<PathBuf>,
-    pending_draft_restore: bool,
-    list_state: ListState,
-    list_items: Vec<ListItemSnapshot>,
-    tail_attached: bool,
-    follow_requested: bool,
-    minimap_visible: bool,
     workspace_bounds: Option<Bounds<Pixels>>,
     message_pane_bounds: Option<Bounds<Pixels>>,
-    expanded_tools: HashSet<String>,
-    expanded_processes: HashSet<String>,
-    rpc_success: Option<String>,
-    rpc_error: Option<String>,
-    host_extension_degradation: Option<String>,
-    activity_generation: u64,
-    calibration_generation: u64,
-    extension_ui: ExtensionUiState,
     extension_widgets_above_scroll: ScrollHandle,
     extension_widgets_below_scroll: ScrollHandle,
-    extension_dialog_open: Option<String>,
-    // gpui 的 track_focus 每个 handle 只保留本帧最后注册节点；body/footer 必须分开。
     extension_dialog_body_focus: Option<FocusHandle>,
     extension_dialog_footer_focus: Option<FocusHandle>,
-    extension_dialog_needs_close: bool,
-    pending_extension_responses: Vec<pi_rpc::ExtensionUiResponse>,
-    extension_response_sender:
-        Option<std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>>,
-    window_title: String,
-    next_extension_element_id: u64,
-    fresh_session: bool,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
 }
@@ -160,6 +128,98 @@ pub enum ChatStatus {
     Loading { title: String },
     Ready(Arc<ConversationDocument>),
     Error { title: String, message: String },
+}
+
+pub struct SessionUiState {
+    status: ChatStatus,
+    load_generation: u64,
+    composer_mode: ComposerMode,
+    draft_key: Option<String>,
+    attachments: Vec<ComposerAttachment>,
+    slash_commands: Vec<pi_rpc::RpcSlashCommand>,
+    controls: Option<SessionControls>,
+    tool_preset: ToolPreset,
+    control_operation: Option<ControlOperation>,
+    branch_tree: Option<pi_data::SessionBranchTree>,
+    branch_preview_leaf: Option<String>,
+    branch_preview_document: Option<Arc<ConversationDocument>>,
+    retry_status: Option<RetryStatus>,
+    compacting: bool,
+    composer_cwd: Option<PathBuf>,
+    pending_draft_restore: bool,
+    list_state: ListState,
+    list_items: Vec<ListItemSnapshot>,
+    tail_attached: bool,
+    follow_requested: bool,
+    minimap_visible: bool,
+    expanded_tools: HashSet<String>,
+    expanded_processes: HashSet<String>,
+    rpc_success: Option<String>,
+    rpc_error: Option<String>,
+    host_extension_degradation: Option<String>,
+    extension_ui: ExtensionUiState,
+    extension_dialog_open: Option<String>,
+    extension_dialog_needs_close: bool,
+    pending_extension_responses: Vec<pi_rpc::ExtensionUiResponse>,
+    extension_response_sender: Option<Arc<dyn crate::live_session::ExtensionResponseSender>>,
+    window_title: String,
+    next_extension_element_id: u64,
+    fresh_session: bool,
+}
+
+impl SessionUiState {
+    fn new(list_state: ListState) -> Self {
+        Self {
+            status: ChatStatus::Empty,
+            load_generation: 0,
+            composer_mode: ComposerMode::Steer,
+            draft_key: None,
+            attachments: Vec::new(),
+            slash_commands: Vec::new(),
+            controls: None,
+            tool_preset: ToolPreset::Inherit,
+            control_operation: None,
+            branch_tree: None,
+            branch_preview_leaf: None,
+            branch_preview_document: None,
+            retry_status: None,
+            compacting: false,
+            composer_cwd: None,
+            pending_draft_restore: false,
+            list_state,
+            list_items: Vec::new(),
+            tail_attached: true,
+            follow_requested: false,
+            minimap_visible: true,
+            expanded_tools: HashSet::new(),
+            expanded_processes: HashSet::new(),
+            rpc_success: None,
+            rpc_error: None,
+            host_extension_degradation: None,
+            extension_ui: ExtensionUiState::default(),
+            extension_dialog_open: None,
+            extension_dialog_needs_close: false,
+            pending_extension_responses: Vec::new(),
+            extension_response_sender: None,
+            window_title: "GPUI-Pi".to_owned(),
+            next_extension_element_id: 0,
+            fresh_session: false,
+        }
+    }
+}
+
+impl std::ops::Deref for ChatPanel {
+    type Target = SessionUiState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for ChatPanel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +297,11 @@ impl LayoutProbe {
 const COMPOSER_MAX_ROWS: usize = 8;
 
 impl ChatPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime_manager: RuntimeManager,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, COMPOSER_MAX_ROWS)
@@ -279,56 +343,25 @@ impl ChatPanel {
         });
         Self {
             focus_handle: cx.focus_handle(),
-            status: ChatStatus::Empty,
-            load_generation: 0,
+            runtime_manager,
             active_generation: 0,
             active: None,
+            active_epoch: 0,
+            applied_revision: 0,
+            effect_cursor: 0,
+            session: SessionUiState::new(list_state),
             composer,
-            composer_mode: ComposerMode::Steer,
-            draft_key: None,
             drafts: pi_data::DraftStore::default(),
-            attachments: Vec::new(),
-            slash_commands: Vec::new(),
-            controls: None,
             model_names: Arc::new(std::collections::HashMap::new()),
-            tool_preset: ToolPreset::Inherit,
-            control_operation: None,
-            branch_tree: None,
-            branch_preview_leaf: None,
-            branch_preview_document: None,
-            retry_status: None,
-            compacting: false,
             popup: None,
             popup_index: 0,
             file_index: None,
-            composer_cwd: None,
-            pending_draft_restore: false,
-            list_state,
-            list_items: Vec::new(),
-            tail_attached: true,
-            follow_requested: false,
-            minimap_visible: true,
             workspace_bounds: None,
             message_pane_bounds: None,
-            expanded_tools: HashSet::new(),
-            expanded_processes: HashSet::new(),
-            rpc_success: None,
-            rpc_error: None,
-            host_extension_degradation: None,
-            activity_generation: 0,
-            calibration_generation: 0,
-            extension_ui: ExtensionUiState::default(),
             extension_widgets_above_scroll: ScrollHandle::default(),
             extension_widgets_below_scroll: ScrollHandle::default(),
-            extension_dialog_open: None,
             extension_dialog_body_focus: None,
             extension_dialog_footer_focus: None,
-            extension_dialog_needs_close: false,
-            pending_extension_responses: Vec::new(),
-            extension_response_sender: None,
-            window_title: "GPUI-Pi".to_owned(),
-            next_extension_element_id: 0,
-            fresh_session: false,
             _composer_subscription: subscription,
             probe: None,
         }
@@ -419,8 +452,6 @@ impl ChatPanel {
     fn begin_active_generation(&mut self) -> u64 {
         self.active_generation = self.active_generation.wrapping_add(1);
         self.host_extension_degradation = None;
-        self.activity_generation = 0;
-        self.calibration_generation = 0;
         self.active_generation
     }
 
@@ -444,7 +475,7 @@ impl ChatPanel {
         self.begin_active_generation();
         let generation = self.load_generation;
         if let Some(active) = self.active.take() {
-            active.shutdown();
+            self.runtime_manager.stop_user(active.runtime_id());
         }
         self.status = ChatStatus::Loading {
             title: selection.title.clone(),
@@ -470,8 +501,6 @@ impl ChatPanel {
         self.popup_index = 0;
         self.prepare_draft_restore();
         self.start_file_index(generation, selection.cwd.clone(), cx);
-        self.activity_generation = 0;
-        self.calibration_generation = 0;
         self.tail_attached = true;
         self.follow_requested = false;
         self.minimap_visible = true;
@@ -535,18 +564,19 @@ impl ChatPanel {
             minimap: Arc::from([]),
             diagnostics: Arc::from([]),
         };
-        let (active, receiver) = ActiveSession::spawn_fresh(
-            generation,
+        let active = self.runtime_manager.start_fresh(
             official_binary(),
             cwd.clone(),
             document.clone(),
             ToolPreset::Inherit,
+            pi_data::agent_dir(),
         )?;
+        let receiver = active.subscribe_dirty();
 
         self.save_current_draft(cx);
         self.reset_extension_ui(window, cx);
         if let Some(old) = self.active.take() {
-            old.shutdown();
+            self.runtime_manager.stop_user(old.runtime_id());
         }
         let reset = reset_session_scoped_state(
             self.load_generation,
@@ -557,21 +587,15 @@ impl ChatPanel {
         self.load_generation = reset.load_generation;
         let load_generation = self.load_generation;
         self.active_generation = generation;
-        self.activity_generation = 0;
-        self.calibration_generation = 0;
         self.status = ChatStatus::Ready(Arc::new(document.clone()));
         self.sync_list_document(&document, true);
         self.list_state.reset(0);
         self.list_items.clear();
-        self.active = Some(active);
-        self.extension_response_sender = self.active.as_ref().map(|active| {
-            Arc::new(crate::live_session::ClientExtensionResponseSender::new(
-                active.client(),
-            )) as Arc<dyn crate::live_session::ExtensionResponseSender>
-        });
+        self.install_active(active);
+        self.spawn_dirty_pump(receiver, window.window_handle(), cx);
         self.draft_key = Some(format!("fresh-{generation}"));
-        self.drafts
-            .clear(self.draft_key.as_deref().unwrap_or_default());
+        let draft_key = self.draft_key.clone().unwrap_or_default();
+        self.drafts.clear(&draft_key);
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_cwd = Some(cwd.clone());
@@ -595,7 +619,6 @@ impl ChatPanel {
         self.follow_requested = false;
         self.expanded_tools.clear();
         self.expanded_processes.clear();
-        self.spawn_pump(receiver, window.window_handle(), cx);
         cx.notify();
         Ok(())
     }
@@ -628,26 +651,23 @@ impl ChatPanel {
             return;
         };
         let history = history.clone();
-        let generation = self.begin_active_generation();
+        self.begin_active_generation();
         let session_path = history.source_path.clone();
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
-        let result = ActiveSession::spawn(
-            generation,
+        match self.runtime_manager.start_session(
             official_binary(),
             session_path,
             cwd,
             (*history).clone(),
             self.tool_preset,
-        );
-        match result {
-            Ok((active, receiver)) => {
-                self.extension_response_sender = Some(std::sync::Arc::new(
-                    crate::live_session::ClientExtensionResponseSender::new(active.client()),
-                ));
-                self.active = Some(active);
+            pi_data::agent_dir(),
+        ) {
+            Ok(active) => {
+                let receiver = active.subscribe_dirty();
+                self.install_active(active);
                 self.rpc_success = None;
                 self.rpc_error = None;
-                self.spawn_pump(receiver, window.window_handle(), cx);
+                self.spawn_dirty_pump(receiver, window.window_handle(), cx);
             }
             Err(error) => {
                 self.rpc_success = None;
@@ -657,19 +677,42 @@ impl ChatPanel {
         cx.notify();
     }
 
-    fn spawn_pump(
+    fn install_active(&mut self, active: SessionHandle) {
+        let snapshot = active.snapshot();
+        self.active_epoch = snapshot.epoch;
+        self.applied_revision = 0;
+        self.effect_cursor = 0;
+        self.set_host_extension_degradation(snapshot.startup_diagnostic.as_deref());
+        self.extension_response_sender = Some(Arc::new(
+            crate::live_session::HandleExtensionResponseSender::new(active.clone(), snapshot.epoch),
+        ));
+        self.active = Some(active);
+    }
+
+    fn spawn_dirty_pump(
         &self,
-        mut receiver: UnboundedReceiver<PumpMessage>,
+        receiver: std::sync::mpsc::Receiver<pi_runtime::Dirty>,
         window_handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::Builder::new()
+            .name("pi-runtime-dirty-bridge".into())
+            .spawn(move || {
+                while let Ok(dirty) = receiver.recv() {
+                    if tx.unbounded_send(dirty).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn runtime dirty bridge");
         cx.spawn(async move |panel, cx| {
-            while let Some(message) = receiver.next().await {
+            while rx.next().await.is_some() {
                 let should_stop = window_handle
                     .update(cx, |_, window, cx| {
                         panel
                             .update(cx, |panel, cx| {
-                                let should_stop = panel.handle_pump(message, cx);
+                                let should_stop = panel.pull_runtime_snapshot(cx);
                                 panel.process_extension_ui(window, cx);
                                 cx.notify();
                                 should_stop
@@ -685,95 +728,62 @@ impl ChatPanel {
         .detach();
     }
 
-    fn handle_pump(&mut self, message: PumpMessage, cx: &mut Context<Self>) -> bool {
-        let generation = match &message {
-            PumpMessage::Events { generation, .. }
-            | PumpMessage::ExtensionUiBatch { generation, .. }
-            | PumpMessage::ExtensionUiReset { generation }
-            | PumpMessage::RequestFinished { generation, .. }
-            | PumpMessage::CommandsLoaded { generation, .. }
-            | PumpMessage::ControlsLoaded { generation, .. }
-            | PumpMessage::ControlFinished { generation, .. }
-            | PumpMessage::ToolRestartFinished { generation, .. }
-            | PumpMessage::Calibrated { generation, .. }
-            | PumpMessage::Diagnostic { generation, .. }
-            | PumpMessage::Stopped { generation, .. } => *generation,
-        };
-        if generation != self.active_generation {
-            if let PumpMessage::ToolRestartFinished {
-                result: Ok(active), ..
-            } = message
-            {
-                active.shutdown();
-            }
-            return false;
-        }
-        if let PumpMessage::Diagnostic { message, .. } = message {
-            self.host_extension_degradation = Some(message);
-            return false;
-        }
-        if let PumpMessage::ToolRestartFinished { preset, result, .. } = message {
-            // 旧 client 正在退出，不能把旧 dialog 的 cancelled 写给即将安装的新 client。
-            self.pending_extension_responses.clear();
-            self.extension_ui.reset();
-            self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
-            self.control_operation = None;
-            match result {
-                Ok(active) => {
-                    self.set_host_extension_degradation(active.startup_diagnostic());
-                    self.extension_response_sender = Some(std::sync::Arc::new(
-                        crate::live_session::ClientExtensionResponseSender::new(active.client()),
-                    ));
-                    self.active = Some(*active);
-                    self.tool_preset = preset;
-                    self.rpc_success = None;
-                    self.rpc_error = None;
-                    if let Some(active) = self.active.as_ref() {
-                        active.refresh_metadata();
-                    }
-                }
-                Err(error) => {
-                    self.active = None;
-
-                    self.extension_response_sender = None;
-                    self.rpc_success = None;
-                    self.rpc_error = Some(format!("工具预设重启失败；请重新启动活会话：{error}"));
-                }
-            }
-            return false;
-        }
-        if matches!(&message, PumpMessage::Stopped { .. }) {
-            self.extension_response_sender = None;
-            self.pending_extension_responses.clear();
-        }
-        if let PumpMessage::Stopped { error, .. } = &message
-            && self.active.is_none()
-        {
-            if let Some(error) = error {
-                self.rpc_success = None;
-                self.rpc_error = Some(error.clone());
-            }
-            if self.control_operation == Some(ControlOperation::Tools) {
-                return false;
-            }
-            self.control_operation = None;
+    fn pull_runtime_snapshot(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(active) = self.active.clone() else {
             return true;
-        }
-        let runtime_events = match &message {
-            PumpMessage::Events { runtime_events, .. } => Some(runtime_events.clone()),
-            _ => None,
         };
-        if let Some(runtime_events) = runtime_events {
-            self.apply_runtime_events(runtime_events);
-        }
-        let Some(active) = self.active.as_mut() else {
-            return false;
-        };
-        if generation != active.generation() {
+        let snapshot = active.snapshot();
+        if snapshot.runtime_id != active.runtime_id() || snapshot.revision <= self.applied_revision
+        {
             return false;
         }
-        match message {
-            PumpMessage::ExtensionUiBatch { requests, .. } => {
+        let epoch_changed = snapshot.epoch != self.active_epoch;
+        if epoch_changed {
+            self.active_epoch = snapshot.epoch;
+            self.effect_cursor = 0;
+            self.extension_response_sender = Some(Arc::new(
+                crate::live_session::HandleExtensionResponseSender::new(active, snapshot.epoch),
+            ));
+        }
+        self.applied_revision = snapshot.revision;
+        self.apply_snapshot(snapshot, cx)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: SessionSnapshot, cx: &mut Context<Self>) -> bool {
+        let effects = snapshot
+            .effects
+            .iter()
+            .filter(|effect| effect.epoch == snapshot.epoch && effect.sequence > self.effect_cursor)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut settled = false;
+        for effect in effects {
+            self.effect_cursor = self.effect_cursor.max(effect.sequence);
+            settled |= self.apply_runtime_effect(effect, cx);
+        }
+        let document = snapshot.document;
+        self.sync_list_document(&document, settled);
+        self.status = ChatStatus::Ready(document);
+        if self.active_epoch != snapshot.epoch {
+            return false;
+        }
+        false
+    }
+
+    fn apply_runtime_effect(&mut self, effect: RuntimeEffect, cx: &mut Context<Self>) -> bool {
+        match effect.kind {
+            RuntimeEffectKind::Events {
+                follow_tail,
+                settled,
+                runtime_events,
+            } => {
+                if follow_tail && self.tail_attached {
+                    self.follow_requested = true;
+                }
+                self.apply_runtime_events(runtime_events);
+                settled
+            }
+            RuntimeEffectKind::ExtensionUiBatch { requests } => {
                 for (id, request) in requests {
                     let duplicate = self.extension_ui.is_dialog_pending(&id);
                     if let Some(response) = self.extension_ui.apply(id.clone(), request) {
@@ -782,170 +792,138 @@ impl ChatPanel {
                         self.rpc_error = Some(format!("重复 Extension UI 请求 {id} 已忽略"));
                     }
                 }
+                false
             }
-            PumpMessage::ExtensionUiReset { .. } => {
+            RuntimeEffectKind::ExtensionUiReset => {
                 self.clear_extension_ui_for_lifecycle();
+                false
             }
-            PumpMessage::Events { events, .. } => {
-                if !events.is_empty() {
-                    self.rpc_success = None;
-                }
-                if events
-                    .iter()
-                    .any(|event| matches!(event, pi_render::LiveEvent::AgentStart))
-                {
-                    self.activity_generation = self.activity_generation.wrapping_add(1);
-                }
-                let outcome = active.reducer_mut().apply_batch(events);
-                if outcome.follow_tail && self.tail_attached {
-                    // 一个 batch 对应最多一次滚动请求，不随 token 数增长。
-                    self.follow_requested = true;
-                }
-                let document = Arc::new(active.document());
-                self.sync_list_document(&document, outcome.settled);
-                self.status = ChatStatus::Ready(document);
-            }
-            PumpMessage::RequestFinished {
+            RuntimeEffectKind::RequestFinished {
                 intent,
                 submission,
-                pending_activity_generation,
                 result,
                 ..
-            } => match result {
-                Ok(()) => {
-                    self.rpc_success = None;
-                    self.clear_rpc_error();
-                }
-                Err((kind, error)) => {
-                    self.rpc_success = None;
-                    if intent == RpcIntent::Abort {
-                        active.reducer_mut().restore_running_if_stopping();
-                    } else if should_restore_idle_phase(
-                        pending_activity_generation,
-                        self.activity_generation,
-                        active.phase(),
-                    ) {
-                        active.reducer_mut().restore_phase(LivePhase::Idle);
-                    }
-                    if should_restore_submission(kind)
-                        && let (Some(key), Some(submission)) =
-                            (self.draft_key.as_deref(), submission)
-                    {
-                        let restored = self.drafts.restore_submission(
-                            key,
-                            pi_data::ComposerDraft {
-                                text: submission.message,
-                                images: submission.images,
-                            },
-                        );
-                        self.pending_draft_restore = true;
-                        self.attachments = restored
-                            .images
-                            .into_iter()
-                            .filter_map(attachment_from_draft)
-                            .collect();
-                    }
-                    self.rpc_error = Some(match kind {
-                        RequestFailureKind::Rejected => {
-                            format!("pi 明确拒绝提交，已恢复草稿：{error}")
-                        }
-                        RequestFailureKind::Ambiguous => {
-                            format!("提交结果不明确，为避免重复 turn 未自动恢复：{error}")
-                        }
-                    });
-                }
-            },
-            PumpMessage::CommandsLoaded { result, .. } => match result {
-                Ok(commands) => {
-                    self.slash_commands = commands;
-                    self.refresh_popup_without_input();
-                }
-                Err(error) => {
-                    self.rpc_success = None;
-                    self.rpc_error = Some(format!("加载 slash 命令失败：{error}"));
-                }
-            },
-            PumpMessage::ControlsLoaded { result, .. } => match result {
-                Ok(controls) => {
-                    if self.fresh_session {
-                        if let Some(old_key) = self.draft_key.clone() {
-                            migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
-                        }
-                        self.draft_key = Some(controls.session_id.clone());
-                    }
-                    if let Some(path) = controls.session_file.clone() {
-                        active.set_session_identity(controls.session_id.clone(), path);
-                        if self.fresh_session {
-                            self.fresh_session = false;
-                            self.status = ChatStatus::Ready(Arc::new(active.document()));
-                            cx.emit(SessionsChanged);
-                        }
-                    }
-                    self.apply_controls(controls)
-                }
-                Err(error) => {
-                    self.rpc_success = None;
-                    self.rpc_error = Some(format!("加载会话控制失败：{error}"));
-                }
-            },
-            PumpMessage::ControlFinished {
-                operation, result, ..
             } => {
+                match result {
+                    Ok(()) => {
+                        self.rpc_success = None;
+                        self.clear_rpc_error();
+                    }
+                    Err((kind, error)) => {
+                        self.rpc_success = None;
+                        if should_restore_submission(kind)
+                            && let (Some(key), Some(submission)) =
+                                (self.draft_key.clone(), submission)
+                        {
+                            let restored = self.drafts.restore_submission(
+                                &key,
+                                pi_data::ComposerDraft {
+                                    text: submission.message,
+                                    images: submission.images,
+                                },
+                            );
+                            self.pending_draft_restore = true;
+                            self.attachments = restored
+                                .images
+                                .into_iter()
+                                .filter_map(attachment_from_draft)
+                                .collect();
+                        }
+                        self.rpc_error = Some(match kind {
+                            RequestFailureKind::Rejected => {
+                                format!("pi 明确拒绝提交，已恢复草稿：{error}")
+                            }
+                            RequestFailureKind::Ambiguous => {
+                                format!("提交结果不明确，为避免重复 turn 未自动恢复：{error}")
+                            }
+                        });
+                        if intent == RpcIntent::Abort {
+                            self.rpc_error = Some(format!("停止失败：{error}"));
+                        }
+                    }
+                }
+                false
+            }
+            RuntimeEffectKind::CommandsLoaded(result) => {
+                match result {
+                    Ok(commands) => {
+                        self.slash_commands = commands;
+                        self.refresh_popup_without_input();
+                    }
+                    Err(error) => self.rpc_error = Some(format!("加载 slash 命令失败：{error}")),
+                }
+                false
+            }
+            RuntimeEffectKind::ControlsLoaded(result) => {
+                match result {
+                    Ok(controls) => {
+                        if self.fresh_session {
+                            if let Some(old_key) = self.draft_key.clone() {
+                                migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
+                            }
+                            self.draft_key = Some(controls.session_id.clone());
+                            if controls.session_file.is_some() {
+                                self.fresh_session = false;
+                                cx.emit(SessionsChanged);
+                            }
+                        }
+                        self.apply_controls(controls);
+                    }
+                    Err(error) => self.rpc_error = Some(format!("加载会话控制失败：{error}")),
+                }
+                false
+            }
+            RuntimeEffectKind::ControlFinished { operation, result } => {
                 self.control_operation = None;
                 match result {
                     Ok(outcome) => self.apply_control_outcome(operation, outcome, cx),
                     Err(error) => {
                         self.compacting = false;
-                        self.rpc_success = None;
                         self.rpc_error = Some(format!("会话操作失败：{error}"));
-                        active.refresh_metadata();
+                        if let Some(active) = self.active.as_ref() {
+                            active.refresh_metadata();
+                        }
                     }
                 }
+                false
             }
-            PumpMessage::ToolRestartFinished { .. } => {}
-            PumpMessage::Diagnostic { .. } => {}
-            PumpMessage::Calibrated {
-                calibration,
-                result,
-                ..
-            } => {
-                if calibration < self.calibration_generation {
-                    return false;
-                }
-                self.calibration_generation = calibration;
-                // 校准线程属于发起它的 settled 状态；若其间已有新 run 开始，
-                // 旧文件快照不能覆盖正在流式的草稿。
-                if active.phase() != LivePhase::Idle || self.activity_generation != calibration {
-                    return false;
-                }
+            RuntimeEffectKind::ToolRestartFinished { preset, result } => {
+                self.pending_extension_responses.clear();
+                self.extension_ui.reset();
+                self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
+                self.control_operation = None;
                 match result {
-                    Ok(document) => {
-                        active.calibrate(document);
-                        let document = Arc::new(active.document());
-                        self.sync_list_document(&document, true);
-                        self.status = ChatStatus::Ready(document);
+                    Ok(()) => {
+                        self.tool_preset = preset;
+                        self.rpc_success = None;
+                        self.rpc_error = None;
                     }
                     Err(error) => {
                         self.rpc_success = None;
-                        self.rpc_error = Some(format!("会话落盘校准失败：{error}"));
+                        self.rpc_error =
+                            Some(format!("工具预设重启失败；请重新启动活会话：{error}"));
+                        self.active = None;
                     }
                 }
+                false
             }
-            PumpMessage::Stopped { error, .. } => {
+            RuntimeEffectKind::Diagnostic(message) => {
+                self.host_extension_degradation = Some(message);
+                false
+            }
+            RuntimeEffectKind::Stopped(error) => {
                 self.extension_ui.reset();
                 self.extension_response_sender = None;
                 self.pending_extension_responses.clear();
                 self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
                 if let Some(error) = error {
-                    self.rpc_success = None;
                     self.rpc_error = Some(error);
                 }
-                self.active = None;
                 self.control_operation = None;
-                return true;
+                self.active = None;
+                true
             }
         }
-        false
     }
 
     pub(crate) fn process_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -998,10 +976,10 @@ impl ChatPanel {
             };
             window.push_notification(notification, cx);
         }
-        let title = self.extension_ui.title().unwrap_or("GPUI-Pi");
+        let title = self.extension_ui.title().unwrap_or("GPUI-Pi").to_owned();
         if title != self.window_title {
-            self.window_title = title.to_owned();
-            window.set_window_title(title);
+            self.window_title = title.clone();
+            window.set_window_title(&title);
         }
         if let Some(text) = self.extension_ui.take_editor_text() {
             self.composer
@@ -1549,11 +1527,8 @@ impl ChatPanel {
     fn apply_session_rebind(&mut self, controls: SessionControls) {
         if let Some(path) = controls.session_file.clone() {
             self.draft_key = Some(controls.session_id.clone());
-            if let Ok(document) = pi_render::render_path(&path)
-                && let Some(active) = self.active.as_mut()
-            {
-                active.calibrate(document);
-                let document = Arc::new(active.document());
+            if let Ok(document) = pi_render::render_path(&path) {
+                let document = Arc::new(document);
                 self.sync_list_document(&document, true);
                 self.status = ChatStatus::Ready(document);
             }
@@ -1597,16 +1572,16 @@ impl ChatPanel {
         if self.control_operation.is_some() {
             return;
         }
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.clone() else {
             return;
         };
-        if active.phase() != LivePhase::Idle {
+        if active.snapshot().phase != LivePhase::Idle {
             return;
         }
         self.control_operation = Some(ControlOperation::Model);
         self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(
+        let _ = active.request_control(
             ControlOperation::Model,
             ControlRequest::SetModel { provider, model_id },
         );
@@ -1618,7 +1593,7 @@ impl ChatPanel {
             && self
                 .active
                 .as_ref()
-                .is_some_and(|active| active.phase() == LivePhase::Idle)
+                .is_some_and(|active| active.snapshot().phase == LivePhase::Idle)
     }
 
     fn cycle_model(&mut self, cx: &mut Context<Self>) {
@@ -1627,12 +1602,12 @@ impl ChatPanel {
         }
         let active = self
             .active
-            .as_ref()
+            .clone()
             .expect("can_cycle_model requires an active session");
         self.control_operation = Some(ControlOperation::Model);
         self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(ControlOperation::Model, ControlRequest::CycleModel);
+        let _ = active.request_control(ControlOperation::Model, ControlRequest::CycleModel);
         cx.notify();
     }
 
@@ -1640,16 +1615,16 @@ impl ChatPanel {
         if self.control_operation.is_some() {
             return;
         }
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.clone() else {
             return;
         };
-        if active.phase() != LivePhase::Idle {
+        if active.snapshot().phase != LivePhase::Idle {
             return;
         }
         self.control_operation = Some(ControlOperation::Thinking);
         self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(
+        let _ = active.request_control(
             ControlOperation::Thinking,
             ControlRequest::SetThinking(level),
         );
@@ -1667,7 +1642,7 @@ impl ChatPanel {
             cx.notify();
             return;
         };
-        if active.phase() != LivePhase::Idle {
+        if active.snapshot().phase != LivePhase::Idle {
             self.active = Some(active);
             return;
         }
@@ -1685,9 +1660,9 @@ impl ChatPanel {
         self.control_operation = Some(ControlOperation::Tools);
         self.rpc_success = None;
         self.rpc_error = None;
-        let generation = self.begin_active_generation();
-        active.restart_with_tools(
-            generation,
+        self.begin_active_generation();
+        self.active = Some(active.clone());
+        let _ = active.restart_with_tools(
             official_binary(),
             session_path,
             cwd,
@@ -1706,19 +1681,19 @@ impl ChatPanel {
         if self.control_operation.is_some() {
             return;
         }
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.clone() else {
             self.rpc_success = None;
             self.rpc_error = Some("请先启动活会话".to_owned());
             cx.notify();
             return;
         };
-        if active.phase() != LivePhase::Idle && operation != ControlOperation::AbortRetry {
+        if active.snapshot().phase != LivePhase::Idle && operation != ControlOperation::AbortRetry {
             return;
         }
         self.control_operation = Some(operation);
         self.rpc_success = None;
         self.rpc_error = None;
-        active.request_control(operation, request);
+        let _ = active.request_control(operation, request);
         cx.notify();
     }
 
@@ -2039,12 +2014,12 @@ impl ChatPanel {
         if message.is_empty() && self.attachments.is_empty() {
             return;
         }
-        let Some(active) = self.active.as_mut() else {
+        let Some(active) = self.active.clone() else {
             self.rpc_error = Some("请先启动活会话".to_owned());
             cx.notify();
             return;
         };
-        let intent = match active.phase() {
+        let intent = match active.snapshot().phase {
             LivePhase::Stopping => {
                 self.rpc_error = Some("正在停止，暂不能发送消息".to_owned());
                 cx.notify();
@@ -2057,17 +2032,12 @@ impl ChatPanel {
             LivePhase::Idle | LivePhase::Error => RpcIntent::Prompt,
         };
         let submission = build_submission(message, &self.attachments);
-        active.dispatch(
-            intent,
-            Some(submission),
-            self.composer_mode,
-            self.activity_generation,
-        );
+        let _ = active.dispatch(intent, Some(submission), self.composer_mode);
         input.update(cx, |input, cx| input.set_value("", window, cx));
         self.attachments.clear();
         self.popup = None;
-        if let Some(key) = self.draft_key.as_deref() {
-            self.drafts.clear(key);
+        if let Some(key) = self.draft_key.clone() {
+            self.drafts.clear(&key);
         }
         cx.notify();
     }
@@ -2190,15 +2160,10 @@ impl ChatPanel {
     }
 
     fn abort(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(active) = self.active.as_mut()
-            && active.phase() == LivePhase::Running
+        if let Some(active) = self.active.clone()
+            && active.snapshot().phase == LivePhase::Running
         {
-            active.dispatch(
-                RpcIntent::Abort,
-                None,
-                self.composer_mode,
-                self.activity_generation,
-            );
+            let _ = active.dispatch(RpcIntent::Abort, None, self.composer_mode);
             cx.notify();
         }
     }
@@ -2434,14 +2399,6 @@ impl ChatPanel {
     }
 }
 
-impl Drop for ChatPanel {
-    fn drop(&mut self) {
-        if let Some(active) = self.active.take() {
-            active.shutdown();
-        }
-    }
-}
-
 impl EventEmitter<PanelEvent> for ChatPanel {}
 impl EventEmitter<crate::main_panel::OpenFileRequest> for ChatPanel {}
 impl EventEmitter<SessionsChanged> for ChatPanel {}
@@ -2602,7 +2559,7 @@ impl Render for ChatPanel {
             .workspace_bounds
             .zip(self.message_pane_bounds)
             .map(|(workspace, pane)| (pane.origin.x - workspace.origin.x, pane.size.width));
-        let phase = self.active.as_ref().map(|active| active.phase());
+        let phase = self.active.as_ref().map(|active| active.snapshot().phase);
         let running = matches!(phase, Some(LivePhase::Running));
         let stopping = matches!(phase, Some(LivePhase::Stopping));
         let live_started = self.active.is_some();
@@ -2619,8 +2576,9 @@ impl Render for ChatPanel {
         let popup = self.render_composer_popup(cx);
         let attachments = self.render_attachments(cx);
         let queue_summary = self.active.as_ref().and_then(|active| {
-            let steering = active.reducer().steering_queue().len();
-            let follow_up = active.reducer().follow_up_queue().len();
+            let snapshot = active.snapshot();
+            let steering = snapshot.steering_queue_len;
+            let follow_up = snapshot.follow_up_queue_len;
             (steering + follow_up > 0)
                 .then(|| format!("队列：steer {steering} · follow-up {follow_up}"))
         });
@@ -3489,18 +3447,6 @@ const fn should_restore_submission(kind: RequestFailureKind) -> bool {
     matches!(kind, RequestFailureKind::Rejected)
 }
 
-const fn should_restore_idle_phase(
-    pending_activity_generation: Option<u64>,
-    current_activity_generation: u64,
-    phase: LivePhase,
-) -> bool {
-    matches!(
-        (pending_activity_generation, phase),
-        (Some(start_generation), LivePhase::Running)
-            if start_generation == current_activity_generation
-    )
-}
-
 fn build_submission(message: String, attachments: &[ComposerAttachment]) -> ComposerSubmission {
     ComposerSubmission {
         message,
@@ -4137,7 +4083,11 @@ mod tests {
         let result = captured.clone();
         let handle = cx.open_window(window_size, move |window, cx| {
             let panel = cx.new(|cx| {
-                let mut panel = ChatPanel::new(window, cx);
+                let mut panel = ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                );
                 if let ChatStatus::Ready(document) = &status {
                     panel.sync_list_document(document, true);
                 }
@@ -5080,7 +5030,11 @@ mod tests {
         let result = captured.clone();
         let handle = cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
             let panel = cx.new(|cx| {
-                let mut panel = ChatPanel::new(window, cx);
+                let mut panel = ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                );
                 let document = rich_document();
                 panel.sync_list_document(&document, true);
                 panel.status = ChatStatus::Ready(document);
@@ -5371,114 +5325,6 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    fn host_extension_degradation_is_generation_scoped_and_survives_successes(
-        cx: &mut TestAppContext,
-    ) {
-        let (mut visual, panel) =
-            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
-        panel.update(cx, |panel, cx| {
-            panel.active_generation = 4;
-            panel.host_extension_degradation = None;
-
-            assert!(!panel.handle_pump(
-                PumpMessage::Diagnostic {
-                    generation: 4,
-                    message: "项目命令环境扩展未加载：denied".to_owned(),
-                },
-                cx,
-            ));
-            assert_eq!(
-                panel.host_extension_degradation.as_deref(),
-                Some("项目命令环境扩展未加载：denied")
-            );
-
-            panel.rpc_error = Some("temporary".to_owned());
-            panel.clear_rpc_error();
-            assert!(panel.rpc_error.is_none());
-            assert_eq!(
-                panel.host_extension_degradation.as_deref(),
-                Some("项目命令环境扩展未加载：denied")
-            );
-
-            assert!(!panel.handle_pump(
-                PumpMessage::Diagnostic {
-                    generation: 3,
-                    message: "stale".to_owned(),
-                },
-                cx,
-            ));
-            assert_eq!(
-                panel.host_extension_degradation.as_deref(),
-                Some("项目命令环境扩展未加载：denied")
-            );
-
-            assert_eq!(panel.begin_active_generation(), 5);
-            assert!(panel.host_extension_degradation.is_none());
-
-            panel.set_host_extension_degradation(Some("still degraded"));
-            assert_eq!(
-                panel.host_extension_degradation.as_deref(),
-                Some("still degraded")
-            );
-            panel.set_host_extension_degradation(None);
-            assert!(panel.host_extension_degradation.is_none());
-        });
-
-        panel.update(cx, |panel, cx| {
-            panel.set_host_extension_degradation(Some("项目命令环境扩展未加载：denied"));
-            cx.notify();
-        });
-        draw_frames(&mut visual, 2);
-        assert!(visual.debug_bounds("host-extension-degradation").is_some());
-
-        panel.update(cx, |panel, cx| {
-            panel.set_host_extension_degradation(None);
-            cx.notify();
-        });
-        draw_frames(&mut visual, 2);
-        assert!(visual.debug_bounds("host-extension-degradation").is_none());
-    }
-
-    #[gpui::test]
-    fn exported_html_uses_success_feedback_not_error_feedback(cx: &mut TestAppContext) {
-        let (mut visual, panel) =
-            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
-        panel.update(cx, |panel, cx| {
-            panel.rpc_error = Some("stale error".to_owned());
-            panel.apply_control_outcome(
-                ControlOperation::ExportHtml,
-                ControlOutcome::Exported(pi_rpc::ExportPathData {
-                    path: "C:/tmp/session.html".to_owned(),
-                }),
-                cx,
-            );
-            assert!(panel.rpc_error.is_none());
-            assert_eq!(
-                panel.rpc_success.as_deref(),
-                Some("HTML 已导出：C:/tmp/session.html")
-            );
-        });
-        draw_frames(&mut visual, 2);
-        assert!(visual.debug_bounds("live-success").is_some());
-        assert!(visual.debug_bounds("live-error").is_none());
-    }
-
-    #[gpui::test]
-    fn error_feedback_suppresses_stale_success_feedback(cx: &mut TestAppContext) {
-        let (mut visual, panel) =
-            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
-        panel.update(cx, |panel, cx| {
-            panel.rpc_success = Some("HTML 已导出：C:/tmp/session.html".to_owned());
-            panel.rpc_error = Some("later failure".to_owned());
-            cx.notify();
-        });
-        draw_frames(&mut visual, 2);
-        panel.update(cx, |panel, _| assert!(panel.rpc_success.is_none()));
-        assert!(visual.debug_bounds("live-success").is_none());
-        assert!(visual.debug_bounds("live-error").is_some());
-    }
-
     #[test]
     fn branch_navigator_uses_component_size_scales() {
         let source = include_str!("panels.rs");
@@ -5492,30 +5338,50 @@ mod tests {
     }
 
     #[gpui::test]
-    fn tool_restart_failure_is_recoverable_and_stale_failures_are_ignored(cx: &mut TestAppContext) {
+    fn host_extension_degradation_is_generation_scoped_and_survives_successes(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, cx| {
+            panel.active_generation = 4;
+            panel.set_host_extension_degradation(Some("项目命令环境扩展未加载：denied"));
+            panel.rpc_error = Some("temporary".to_owned());
+            panel.clear_rpc_error();
+            assert!(panel.rpc_error.is_none());
+            assert_eq!(
+                panel.host_extension_degradation.as_deref(),
+                Some("项目命令环境扩展未加载：denied")
+            );
+            assert_eq!(panel.begin_active_generation(), 5);
+            assert!(panel.host_extension_degradation.is_none());
+            panel.set_host_extension_degradation(Some("still degraded"));
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("host-extension-degradation").is_some());
+        panel.update(cx, |panel, cx| {
+            panel.set_host_extension_degradation(None);
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("host-extension-degradation").is_none());
+    }
+
+    #[gpui::test]
+    fn tool_restart_failure_clears_busy_state_without_dropping_handle(cx: &mut TestAppContext) {
         let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
         panel.update(cx, |panel, cx| {
-            panel.active_generation = 7;
-            panel.activity_generation = 9;
-            panel.calibration_generation = 9;
             panel.control_operation = Some(ControlOperation::Tools);
             panel.rpc_error = None;
-            assert!(!panel.handle_pump(
-                PumpMessage::ToolRestartFinished {
-                    generation: 6,
-                    preset: ToolPreset::ReadOnly,
-                    result: Err("stale".to_owned()),
-                },
-                cx,
-            ));
-            assert_eq!(panel.control_operation, Some(ControlOperation::Tools));
-            assert!(panel.rpc_error.is_none());
-
-            assert!(!panel.handle_pump(
-                PumpMessage::ToolRestartFinished {
-                    generation: 7,
-                    preset: ToolPreset::ReadOnly,
-                    result: Err("spawn failed".to_owned()),
+            assert!(!panel.apply_runtime_effect(
+                RuntimeEffect {
+                    sequence: 1,
+                    epoch: 2,
+                    kind: RuntimeEffectKind::ToolRestartFinished {
+                        preset: ToolPreset::ReadOnly,
+                        result: Err("spawn failed".to_owned()),
+                    },
                 },
                 cx,
             ));
@@ -5524,13 +5390,10 @@ mod tests {
             assert!(panel.rpc_error.as_deref().is_some_and(|error| {
                 error.contains("重新启动活会话") && error.contains("spawn failed")
             }));
-            assert_eq!(panel.activity_generation, 9);
-            assert_eq!(panel.calibration_generation, 9);
         });
     }
 
     #[gpui::test]
-
     fn lifecycle_extension_reset_discards_pending_cancelled_responses(cx: &mut TestAppContext) {
         let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
         panel.update(cx, |panel, _| {
@@ -5900,7 +5763,13 @@ mod tests {
         let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
         let result = captured.clone();
         cx.open_window(size(gpui::px(520.), gpui::px(480.)), move |window, cx| {
-            let panel = cx.new(|cx| ChatPanel::new(window, cx));
+            let panel = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             *result.borrow_mut() = Some(panel.clone());
             Root::new(panel, window, cx)
         });
@@ -6064,14 +5933,6 @@ mod tests {
         assert!(!session_controls_enabled(Some(LivePhase::Idle), true));
         assert!(!abort_retry_disabled(false));
         assert!(abort_retry_disabled(true));
-    }
-
-    #[test]
-    fn failed_submission_only_restores_idle_before_agent_start() {
-        assert!(should_restore_idle_phase(Some(7), 7, LivePhase::Running));
-        assert!(!should_restore_idle_phase(Some(7), 8, LivePhase::Running));
-        assert!(!should_restore_idle_phase(None, 7, LivePhase::Running));
-        assert!(!should_restore_idle_phase(Some(7), 7, LivePhase::Idle));
     }
 
     #[test]

@@ -857,7 +857,13 @@ mod tests {
         let test_sender = sender.clone();
         let handle = cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
             let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
-            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            let chat = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             chat.update(cx, |chat, _| {
                 chat.set_extension_response_sender_for_test(test_sender.clone());
             });
@@ -1019,7 +1025,13 @@ mod tests {
         let output = captured.clone();
         let handle = cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
             let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
-            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            let chat = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             let panel = cx.new(|cx| MainPanel::new(chat, &explorer, window, cx));
             panel.update(cx, |panel, cx| {
                 let patch = (0..80)
@@ -1079,7 +1091,13 @@ mod tests {
         let output = captured.clone();
         cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
             let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
-            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            let chat = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             let panel = cx.new(|cx| MainPanel::new(chat, &explorer, window, cx));
             *output.borrow_mut() = Some(panel.clone());
             gpui_component::Root::new(panel, window, cx)
@@ -1124,7 +1142,13 @@ mod tests {
         let output = captured.clone();
         let window = cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
             let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
-            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            let chat = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             let panel = cx.new(|cx| MainPanel::new(chat, &explorer, window, cx));
             *output.borrow_mut() = Some(panel.clone());
             gpui_component::Root::new(panel, window, cx)
@@ -1183,7 +1207,13 @@ mod tests {
         let output = captured.clone();
         cx.open_window(gpui::size(px(800.), px(560.)), move |window, cx| {
             let explorer = cx.new(|cx| crate::file_explorer::FileExplorerPanel::new(window, cx));
-            let chat = cx.new(|cx| ChatPanel::new(window, cx));
+            let chat = cx.new(|cx| {
+                ChatPanel::new(
+                    pi_runtime::RuntimeManager::new(Default::default()),
+                    window,
+                    cx,
+                )
+            });
             let panel = cx.new(|cx| MainPanel::new(chat, &explorer, window, cx));
             *output.borrow_mut() = Some(panel.clone());
             gpui_component::Root::new(panel, window, cx)

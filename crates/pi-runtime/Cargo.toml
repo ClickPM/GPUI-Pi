@@ -1,0 +1,23 @@
+[package]
+name = "pi-runtime"
+description = "GPUI-Pi 应用级有界 RuntimeManager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pi-data.workspace = true
+pi-render.workspace = true
+pi-rpc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "runtime_fake_child"
+path = "../pi-rpc/tests/fixtures/fake_child.rs"
+test = false
+bench = false

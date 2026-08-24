@@ -110,6 +110,20 @@ fn main() {
         }
         if command == "prompt" {
             let message = value["message"].as_str().unwrap_or_default();
+            if message == "complete" {
+                writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"type":"agent_end","messages":[],"willRetry":false})
+                )
+                .unwrap();
+                writeln!(stdout, "{}", json!({"type":"agent_settled"})).unwrap();
+                let response = json!({"id":id,"type":"response","command":command,"success":true});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
             if message == "stream" {
                 writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();
                 writeln!(
@@ -182,6 +196,16 @@ fn main() {
                 writeln!(stdout, "{response}").unwrap();
                 stdout.flush().unwrap();
                 continue;
+            }
+            if message == "reject" {
+                let response = json!({"id":id,"type":"response","command":command,"success":false,"error":"injected rejection"});
+                writeln!(stdout, "{response}").unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+            if message == "crash" {
+                stdout.flush().unwrap();
+                std::process::exit(23);
             }
             if message == "queue" {
                 writeln!(stdout, "{}", json!({"type":"agent_start"})).unwrap();

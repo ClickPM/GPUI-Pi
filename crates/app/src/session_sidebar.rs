@@ -24,7 +24,7 @@ use pi_data::{
     export_session_jsonl, list_sessions, rename_session,
 };
 
-use crate::live_session::export_historical_html;
+use crate::live_session::{HistoricalHtmlExportRequest, RuntimeManager, official_binary};
 use crate::panels::LayoutProbe;
 use crate::trust_prompt::prompt_project_trust;
 
@@ -84,11 +84,16 @@ pub struct SessionSidebar {
     project_scrolls: HashMap<String, ScrollHandle>,
     pending_reveal_project: Option<String>,
     probe: Option<LayoutProbe>,
+    runtime_manager: RuntimeManager,
 }
 
 impl SessionSidebar {
     #[cfg(not(test))]
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime_manager: RuntimeManager,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话名称"));
         let agent_dir = pi_data::agent_dir();
         let sessions_root = agent_dir.as_ref().map(|dir| dir.join("sessions"));
@@ -120,6 +125,7 @@ impl SessionSidebar {
             project_scrolls: HashMap::new(),
             pending_reveal_project: None,
             probe: None,
+            runtime_manager,
         };
         sidebar.refresh(window, cx);
         sidebar
@@ -154,6 +160,7 @@ impl SessionSidebar {
             project_scrolls: HashMap::new(),
             pending_reveal_project: None,
             probe: None,
+            runtime_manager: RuntimeManager::new(Default::default()),
         }
     }
 
@@ -644,15 +651,20 @@ impl SessionSidebar {
         let file_name = format!("pi-session-{}.html", summary.id);
         let receiver = cx.prompt_for_new_path(&start, Some(&file_name));
         let executor = cx.background_executor().clone();
+        let runtime_manager = self.runtime_manager.clone();
         cx.notify();
         cx.spawn_in(window, async move |sidebar, cx| {
             let destination = receiver.await.ok().into_iter().flatten().flatten().next();
             let result = if let Some(destination) = destination {
+                let request = HistoricalHtmlExportRequest {
+                    binary: official_binary(),
+                    cwd: summary.cwd.clone(),
+                    session_path: summary.path.clone(),
+                    output_path: destination,
+                };
                 Some(
                     executor
-                        .spawn(async move {
-                            export_historical_html(summary.path.clone(), destination)
-                        })
+                        .spawn(async move { runtime_manager.export_historical_html(request) })
                         .await,
                 )
             } else {
@@ -1544,6 +1556,7 @@ mod tests {
             project_scrolls: HashMap::new(),
             pending_reveal_project: None,
             probe: None,
+            runtime_manager: RuntimeManager::new(Default::default()),
         }
     }
 
