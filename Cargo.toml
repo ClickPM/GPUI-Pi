@@ -6,6 +6,7 @@ members = [
     "crates/pi-rpc",
     "crates/pi-data",
     "crates/pi-render",
+    "crates/pi-runtime",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ rust-version = "1.97"
 pi-rpc = { path = "crates/pi-rpc" }
 pi-data = { path = "crates/pi-data" }
 pi-render = { path = "crates/pi-render" }
+pi-runtime = { path = "crates/pi-runtime" }
 gpui-pi-ui = { path = "crates/ui" }
 
 # ── 上游 UI 栈 ───────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 ﻿# T1 静态验收（validate.sh 的 Windows 版）—— 每一轮 /loop 迭代结束都必须全绿。
 #
 #   .\scripts\validate.ps1          全量
-#   .\scripts\validate.ps1 -Logic   只跑三个纯逻辑 crate
+#   .\scripts\validate.ps1 -Logic   只跑四个纯逻辑 crate
 param([switch]$Logic)
 
 $ErrorActionPreference = "Stop"
@@ -21,8 +21,8 @@ function Step($n, $name, $block) {
 
 try {
     if ($Logic) {
-        $scope = @("-p", "pi-rpc", "-p", "pi-data", "-p", "pi-render")
-        Write-Host "### 范围：仅纯逻辑 crate（pi-rpc / pi-data / pi-render）"
+        $scope = @("-p", "pi-rpc", "-p", "pi-data", "-p", "pi-render", "-p", "pi-runtime")
+        Write-Host "### 范围：仅纯逻辑 crate（pi-rpc / pi-data / pi-render / pi-runtime）"
     } else {
         $scope = @("--workspace")
         Write-Host "### 范围：全工作区（含 gpui / gpui-component 编译）"

@@ -2478,6 +2478,7 @@ dependencies = [
  "pi-data",
  "pi-render",
  "pi-rpc",
+ "pi-runtime",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -4796,6 +4797,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "pi-runtime"
+version = "0.1.0"
+dependencies = [
+ "pi-data",
+ "pi-render",
+ "pi-rpc",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -118,7 +118,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 ## Post-v1 有界运行时（R21–R27）
 
-- 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。**阶段 E 与 R17/R18 的先后属待决事项，未按 § 七 阶段 E 的待决条款选定前不得开工 R21。**
+- 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。项目所有者已于 2026-08-23 选择**口径 B**：先实施阶段 E，M4 顺延到 M5 之后，附录 A 验收基线须在 R24 后重建。
 - 实施顺序固定为：R21 集中化 → R22 Actor/背压 → R23 Scheduler/Park → R24 多会话 UI → R25 Windows Job Object/内存 → R26 只读子代理 → R27 mutating writer/worktree 隔离。**R22 背压未通过前禁止开放多会话**。
 - `RuntimeManager` 是应用级共享服务，跨窗口、Workspace、用户 Session、内建子代理和 maintenance job 共用总预算；禁止在 `ChatPanel` 或单个窗口内各建一套 Manager。
 - app 生产代码创建用户 Session、内建子代理或 maintenance `pi --mode rpc`（包括历史 HTML 导出）必须经过 `RuntimeManager`；`pi-rpc` 自身隔离测试可直接创建 `Client`。Provider 登录等一次性非 RPC CLI 不计入 Session Runtime。Maintenance job 走独立小配额，**不占用户会话运行槽**。

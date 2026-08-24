@@ -45,8 +45,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(window, cx, None)
+    pub fn new(
+        runtime_manager: pi_runtime::RuntimeManager,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(runtime_manager, window, cx, None)
     }
 
     #[cfg(test)]
@@ -55,10 +59,16 @@ impl Workspace {
         cx: &mut Context<Self>,
         probe: LayoutProbe,
     ) -> Self {
-        Self::build(window, cx, Some(probe))
+        Self::build(
+            pi_runtime::RuntimeManager::new(Default::default()),
+            window,
+            cx,
+            Some(probe),
+        )
     }
 
     fn build(
+        runtime_manager: pi_runtime::RuntimeManager,
         window: &mut Window,
         cx: &mut Context<Self>,
         #[cfg(test)] probe: Option<LayoutProbe>,
@@ -72,7 +82,7 @@ impl Workspace {
             #[cfg(test)]
             let panel = SessionSidebar::new_empty(window, cx);
             #[cfg(not(test))]
-            let panel = SessionSidebar::new(window, cx);
+            let panel = SessionSidebar::new(runtime_manager.clone(), window, cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
                 return panel.with_probe(probe);
@@ -80,7 +90,7 @@ impl Workspace {
             panel
         });
         let chat = cx.new(|cx| {
-            let panel = ChatPanel::new(window, cx);
+            let panel = ChatPanel::new(runtime_manager.clone(), window, cx);
             #[cfg(test)]
             if let Some(probe) = probe.clone() {
                 return panel.with_probe(probe);
