@@ -8,7 +8,7 @@ use std::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
@@ -28,6 +28,23 @@ const REBIND_CALIBRATION_ATTEMPTS: usize = 3;
 const REBIND_CALIBRATION_TIMEOUT: Duration = Duration::from_secs(2);
 const REBIND_CALIBRATION_DELAY: Duration = Duration::from_millis(20);
 
+/// 单个订阅者允许积压的事件字节上限。
+///
+/// R22：stdout reader 与 supervisor 永远不因下游满而阻塞，所以订阅积压是这条链路上
+/// 唯一可能无界增长的位置。超限时既不静默丢事件（会损坏 assistant 正文），也不阻塞
+/// 生产者，而是发终态 `EventBacklogOverflow` 后断开该订阅，由上层按会话失败处理。
+///
+/// 额度按**单帧上限的倍数**表达，而不是拍一个绝对值：单条帧最大就是
+/// [`crate::jsonl::DEFAULT_MAX_FRAME_LEN`]，额度必须显著大于它，否则一两条超大帧
+/// （例如一张大图的工具结果）就能在消费者只是短暂卡顿时误触发 fail-stop。
+/// 4 倍：既能容下连续几条超大帧，又把 fail-stop 前的内存天花板压在 64MiB。
+pub const EVENT_BACKLOG_FRAME_MULTIPLE: usize = 4;
+pub const DEFAULT_EVENT_BACKLOG_BYTES: usize =
+    crate::jsonl::DEFAULT_MAX_FRAME_LEN * EVENT_BACKLOG_FRAME_MULTIPLE;
+
+/// 非 stdout 来源事件的固定记账开销（字段、枚举与 Box 分配的粗略上界）。
+const EVENT_OVERHEAD_BYTES: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub binary: PathBuf,
@@ -41,6 +58,8 @@ pub struct ClientConfig {
     pub restart_delay: Duration,
     pub shutdown_grace_period: Duration,
     pub max_frame_len: usize,
+    /// 每个订阅者的事件积压字节上限，见 [`DEFAULT_EVENT_BACKLOG_BYTES`]。
+    pub event_backlog_bytes: usize,
 }
 
 impl ClientConfig {
@@ -56,6 +75,7 @@ impl ClientConfig {
             restart_delay: Duration::from_millis(100),
             shutdown_grace_period: Duration::from_secs(2),
             max_frame_len: crate::jsonl::DEFAULT_MAX_FRAME_LEN,
+            event_backlog_bytes: DEFAULT_EVENT_BACKLOG_BYTES,
         }
     }
 }
@@ -84,6 +104,14 @@ pub enum LifecycleEvent {
     },
     Stderr {
         line: String,
+    },
+    /// 订阅者积压超过 [`ClientConfig::event_backlog_bytes`]：该订阅已被断开。
+    ///
+    /// 这是本订阅流的最后一个事件。发出它而不是丢弃中间事件，是因为丢事件会静默
+    /// 破坏 assistant 正文与工具结果的完整性；上层必须按会话失败处理。
+    EventBacklogOverflow {
+        queued_bytes: usize,
+        limit: usize,
     },
 }
 
@@ -126,14 +154,62 @@ struct PendingRequest {
     tx: Sender<Result<RpcResponse, ClientError>>,
 }
 
+/// 队列内的事件连同它的记账字节数一起传递，接收端才能在 recv 时准确归还额度。
+struct QueuedEvent {
+    bytes: usize,
+    event: ClientEvent,
+}
+
+struct Subscriber {
+    tx: Sender<QueuedEvent>,
+    queued_bytes: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// 有界事件订阅流。
+///
+/// 队列本身仍是非阻塞的 mpsc —— 生产者永远不会因为消费者慢而阻塞，stdout reader 与
+/// supervisor 因此在任何背压路径下都能继续 drain 子进程；有界性由字节额度保证。
+pub struct EventStream {
+    rx: Receiver<QueuedEvent>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl EventStream {
+    fn settle(&self, queued: QueuedEvent) -> ClientEvent {
+        self.queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+        queued.event
+    }
+
+    pub fn recv(&self) -> Result<ClientEvent, mpsc::RecvError> {
+        self.rx.recv().map(|queued| self.settle(queued))
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ClientEvent, RecvTimeoutError> {
+        self.rx
+            .recv_timeout(timeout)
+            .map(|queued| self.settle(queued))
+    }
+
+    pub fn try_recv(&self) -> Result<ClientEvent, mpsc::TryRecvError> {
+        self.rx.try_recv().map(|queued| self.settle(queued))
+    }
+
+    /// 当前尚未被消费的事件字节数，用于观测背压水位。
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
+    }
+}
+
 struct Shared {
     writer: Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<String, PendingRequest>>,
-    subscribers: Mutex<Vec<Sender<ClientEvent>>>,
+    subscribers: Mutex<Vec<Subscriber>>,
     shutdown: AtomicBool,
     next_id: AtomicU64,
     pid: AtomicU64,
     resume_session: Mutex<Option<PathBuf>>,
+    event_backlog_bytes: usize,
 }
 
 /// 可 clone 的同步客户端。每个 blocking request 只阻塞调用线程；stdout/stderr/监督各自独立线程。
@@ -154,6 +230,7 @@ impl Client {
             next_id: AtomicU64::new(0),
             pid: AtomicU64::new(0),
             resume_session: Mutex::new(initial_session),
+            event_backlog_bytes: config.event_backlog_bytes.max(1),
         });
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         let thread_shared = Arc::clone(&shared);
@@ -180,10 +257,18 @@ impl Client {
 
     /// 订阅事件流。stdout reader 与 reducer pump 分线程消费，慢 UI 不会让订阅在 burst
     /// 中被静默永久断开；上层必须持续 drain 并按帧合并事件。
-    pub fn subscribe(&self) -> Receiver<ClientEvent> {
+    ///
+    /// R22：订阅有字节额度（[`ClientConfig::event_backlog_bytes`]）。超限只会终止本订阅，
+    /// 不会阻塞广播线程，因此 pi 的 stdout 始终能继续被 drain。
+    pub fn subscribe(&self) -> EventStream {
         let (tx, rx) = mpsc::channel();
-        self.shared.subscribers.lock().unwrap().push(tx);
-        rx
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        self.shared.subscribers.lock().unwrap().push(Subscriber {
+            tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+            limit: self.shared.event_backlog_bytes,
+        });
+        EventStream { rx, queued_bytes }
     }
 
     /// 当前活跃进程退出后，监督器用于自动恢复的会话文件。
@@ -619,7 +704,11 @@ fn spawn_child(
 
 #[derive(Debug)]
 enum IoMessage {
-    Stdout(Result<Value, String>),
+    /// `bytes` 是解析前的原始帧长度，供订阅背压精确记账。
+    Stdout {
+        bytes: usize,
+        parsed: Result<Value, String>,
+    },
     Stderr(String),
 }
 
@@ -648,12 +737,18 @@ fn spawn_stdout_reader(
                             }
                         }
                         Err(error) => {
-                            let _ = tx.send(IoMessage::Stdout(Err(error.to_string())));
+                            let _ = tx.send(IoMessage::Stdout {
+                                bytes: 0,
+                                parsed: Err(error.to_string()),
+                            });
                             return;
                         }
                     },
                     Err(error) => {
-                        let _ = tx.send(IoMessage::Stdout(Err(error.to_string())));
+                        let _ = tx.send(IoMessage::Stdout {
+                            bytes: 0,
+                            parsed: Err(error.to_string()),
+                        });
                         return;
                     }
                 }
@@ -666,8 +761,9 @@ fn send_stdout_frame(tx: &Sender<IoMessage>, frame: Vec<u8>) {
     if frame.is_empty() {
         return;
     }
+    let bytes = frame.len();
     let parsed = serde_json::from_slice(&frame).map_err(|error| error.to_string());
-    let _ = tx.send(IoMessage::Stdout(parsed));
+    let _ = tx.send(IoMessage::Stdout { bytes, parsed });
 }
 
 fn spawn_stderr_reader(mut stderr: ChildStderr, tx: Sender<IoMessage>) -> JoinHandle<()> {
@@ -709,11 +805,16 @@ fn handle_io_message(shared: &Shared, message: IoMessage) {
             shared,
             ClientEvent::Lifecycle(LifecycleEvent::Stderr { line }),
         ),
-        IoMessage::Stdout(Err(error)) => broadcast(
+        IoMessage::Stdout {
+            parsed: Err(error), ..
+        } => broadcast(
             shared,
             ClientEvent::Unknown(Value::String(format!("invalid stdout JSON: {error}"))),
         ),
-        IoMessage::Stdout(Ok(value)) => {
+        IoMessage::Stdout {
+            bytes,
+            parsed: Ok(value),
+        } => {
             if value.get("type").and_then(Value::as_str) == Some("response") {
                 match serde_json::from_value::<RpcResponse>(value.clone()) {
                     Ok(response) => {
@@ -730,14 +831,14 @@ fn handle_io_message(shared: &Shared, message: IoMessage) {
                             let _ = pending.tx.send(Ok(response));
                             return;
                         }
-                        broadcast(shared, ClientEvent::Unknown(value));
+                        broadcast_sized(shared, ClientEvent::Unknown(value), bytes);
                     }
-                    Err(_) => broadcast(shared, ClientEvent::Unknown(value)),
+                    Err(_) => broadcast_sized(shared, ClientEvent::Unknown(value), bytes),
                 }
             } else {
                 match serde_json::from_value::<RpcEvent>(value.clone()) {
-                    Ok(event) => broadcast(shared, ClientEvent::Rpc(Box::new(event))),
-                    Err(_) => broadcast(shared, ClientEvent::Unknown(value)),
+                    Ok(event) => broadcast_sized(shared, ClientEvent::Rpc(Box::new(event)), bytes),
+                    Err(_) => broadcast_sized(shared, ClientEvent::Unknown(value), bytes),
                 }
             }
         }
@@ -752,11 +853,55 @@ fn fail_all_pending(shared: &Shared) {
 }
 
 fn broadcast(shared: &Shared, event: ClientEvent) {
-    shared
-        .subscribers
-        .lock()
-        .unwrap()
-        .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    let bytes = estimate_event_bytes(&event);
+    broadcast_sized(shared, event, bytes);
+}
+
+/// 广播一条已知字节数的事件。
+///
+/// 对 stdout 来源的事件，`bytes` 是解析前的原始 JSONL 帧长度 —— 比结构化估算更准，
+/// 且不需要为了记账再序列化一次。
+fn broadcast_sized(shared: &Shared, event: ClientEvent, bytes: usize) {
+    let bytes = bytes.saturating_add(EVENT_OVERHEAD_BYTES);
+    shared.subscribers.lock().unwrap().retain(|subscriber| {
+        let queued = subscriber.queued_bytes.load(Ordering::Acquire);
+        if queued.saturating_add(bytes) > subscriber.limit {
+            // 不丢中间事件、也不阻塞生产者：发终态后断开，让上层按会话失败处理。
+            let _ = subscriber.tx.send(QueuedEvent {
+                bytes: 0,
+                event: ClientEvent::Lifecycle(LifecycleEvent::EventBacklogOverflow {
+                    queued_bytes: queued,
+                    limit: subscriber.limit,
+                }),
+            });
+            return false;
+        }
+        subscriber.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if subscriber
+            .tx
+            .send(QueuedEvent {
+                bytes,
+                event: event.clone(),
+            })
+            .is_err()
+        {
+            subscriber.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        true
+    });
+}
+
+/// 非 stdout 来源事件的字节估算：只算真正持有的堆字符串，其余按固定开销记账。
+fn estimate_event_bytes(event: &ClientEvent) -> usize {
+    match event {
+        ClientEvent::Lifecycle(LifecycleEvent::Stderr { line }) => line.len(),
+        ClientEvent::Lifecycle(LifecycleEvent::RestartFailed { error }) => error.len(),
+        ClientEvent::Lifecycle(_) => 0,
+        ClientEvent::Unknown(Value::String(text)) => text.len(),
+        // 结构化 Unknown / Rpc 只在 stdout 路径产生，那里走 broadcast_sized 传真实帧长。
+        ClientEvent::Unknown(_) | ClientEvent::Rpc(_) => 0,
+    }
 }
 
 #[cfg(windows)]

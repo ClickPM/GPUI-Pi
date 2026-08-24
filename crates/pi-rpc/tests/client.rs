@@ -641,3 +641,146 @@ fn fake_queue_and_abort_emit_settled_tails() {
     assert!(abort_message_end);
     client.shutdown().unwrap();
 }
+
+/// R22：任何背压路径下 stdout 都必须持续 drain，绝不因下游满而阻塞 pi。
+///
+/// 订阅者完全停摆，且积压额度被压到远小于本次事件量。要求同时成立：
+/// 1. 子进程写完 1500 条事件后仍能返回 prompt 响应 —— 证明它从未被写阻塞；
+/// 2. 订阅队列字节数始终不超过配置额度 —— 证明这条链路有界；
+/// 3. 溢出以显式终态事件收场，而不是静默丢事件 —— 丢事件会破坏正文完整性。
+#[test]
+fn stdout_keeps_draining_while_a_subscriber_stalls_and_the_backlog_stays_bounded() {
+    const BACKLOG_LIMIT: usize = 8 * 1024;
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut config = config();
+    config.event_backlog_bytes = BACKLOG_LIMIT;
+    let client = Client::spawn(config).unwrap();
+    let events = client.subscribe();
+
+    let started = Instant::now();
+    let response = client
+        .request(
+            Command::Prompt {
+                message: "stream".into(),
+                images: None,
+                streaming_behavior: None,
+            },
+            REQUEST_TIMEOUT,
+        )
+        .unwrap();
+    // 这条断言本身就是「stdout 未被阻塞」的证明：fake child 先写完 1500 条事件、
+    // 最后才写 response，只有 supervisor 全程持续 drain 才可能收到成功响应。
+    assert!(
+        response.success,
+        "订阅者停摆时子进程仍必须能写完 stdout 并应答"
+    );
+    assert!(
+        started.elapsed() < REQUEST_TIMEOUT,
+        "子进程被下游背压拖慢即视为阻塞 pi"
+    );
+    assert!(
+        events.queued_bytes() <= BACKLOG_LIMIT,
+        "订阅积压必须有界：{} > {BACKLOG_LIMIT}",
+        events.queued_bytes()
+    );
+
+    // 排空订阅：溢出前送达的必须是事件流的**连续前缀**（无空洞），
+    // 末尾必须是显式的溢出终态，之后流关闭。
+    let mut delivered = Vec::new();
+    let mut overflow = None;
+    loop {
+        match events.try_recv() {
+            Ok(ClientEvent::Lifecycle(LifecycleEvent::EventBacklogOverflow {
+                queued_bytes,
+                limit,
+            })) => {
+                assert!(overflow.is_none(), "溢出终态只应出现一次");
+                overflow = Some((queued_bytes, limit));
+            }
+            Ok(event) => {
+                assert!(
+                    overflow.is_none(),
+                    "溢出终态之后不应再有事件：这条流已经断开"
+                );
+                delivered.push(event);
+            }
+            Err(_) => break,
+        }
+    }
+    let (queued_bytes, limit) = overflow.expect("积压超限必须以显式终态事件收场，不能静默丢事件");
+    assert_eq!(limit, BACKLOG_LIMIT);
+    assert!(queued_bytes <= BACKLOG_LIMIT);
+
+    // fake child 的 "stream" 序列固定为 agent_start → message_start → 1500×message_update
+    // → message_end → agent_end → agent_settled。校验 RPC 前缀逐条对得上，才能证明
+    // 「溢出前的事件完整送达」，而不是零散丢了几条。
+    // （stderr 的启动横幅走 Lifecycle，与 RPC 事件流无关，这里先滤掉。）
+    let rpc_events = delivered
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Rpc(rpc) => Some(rpc.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rpc_events.len() > 2,
+        "溢出前至少应送达开头几条 RPC 事件，实际 {}",
+        rpc_events.len()
+    );
+    assert!(matches!(rpc_events[0], RpcEvent::AgentStart));
+    assert!(matches!(rpc_events[1], RpcEvent::MessageStart { .. }));
+    for (index, event) in rpc_events.iter().enumerate().skip(2) {
+        assert!(
+            matches!(event, RpcEvent::MessageUpdate { .. }),
+            "第 {index} 条应仍在连续的 message_update 前缀内，实际 {event:?}"
+        );
+    }
+    assert!(
+        rpc_events.len() < 1502,
+        "本用例的额度必须小到真的触发溢出，否则等于没测背压"
+    );
+
+    client.shutdown().unwrap();
+}
+
+/// 默认额度足够宽，正常会话不会被溢出终态误伤。
+#[test]
+fn default_backlog_budget_delivers_a_full_streaming_burst() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    assert!(
+        client
+            .request(
+                Command::Prompt {
+                    message: "stream".into(),
+                    images: None,
+                    streaming_behavior: None,
+                },
+                Duration::from_secs(10),
+            )
+            .unwrap()
+            .success
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut updates = 0;
+    let mut settled = false;
+    while Instant::now() < deadline && !settled {
+        match events.recv_timeout(Duration::from_millis(50)) {
+            Ok(ClientEvent::Rpc(event)) => match *event {
+                RpcEvent::MessageUpdate { .. } => updates += 1,
+                RpcEvent::AgentSettled => settled = true,
+                _ => {}
+            },
+            Ok(ClientEvent::Lifecycle(LifecycleEvent::EventBacklogOverflow { .. })) => {
+                panic!("默认额度不应在一次普通流式回复中溢出")
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert_eq!(updates, 1500);
+    assert!(settled);
+    assert_eq!(events.queued_bytes(), 0, "全部消费后额度必须完全归还");
+    client.shutdown().unwrap();
+}
