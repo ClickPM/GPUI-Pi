@@ -322,6 +322,23 @@ impl SessionUiState {
     }
 }
 
+impl SessionUiState {
+    /// 这个标签当前绑定的会话文件。
+    ///
+    /// 以 `controls.session_file` 为准（内核回报的权威值）；还没拿到 controls 时
+    /// 退回历史文档的来源路径。
+    fn bound_session_file(&self) -> Option<PathBuf> {
+        self.controls
+            .as_ref()
+            .and_then(|controls| controls.session_file.clone())
+            .or_else(|| match &self.status {
+                ChatStatus::Ready(document) => Some(document.source_path.clone()),
+                _ => None,
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+    }
+}
+
 impl ChatPanel {
     /// 投影游标的落点。`min` 只是防御性收敛：下标漂移宁可落到最后一个标签，
     /// 也不要在渲染路径上 panic。
@@ -483,6 +500,17 @@ const fn start_action_copy(queued: bool, registered: bool) -> (&'static str, &'s
         (false, true) => ("恢复运行", "重新为该会话申请一个 pi 运行槽"),
         (false, false) => ("启动活会话", "为这份历史启动官方 pi RPC 活会话"),
     }
+}
+
+/// 两个路径是不是同一份会话文件。
+///
+/// Windows 上大小写不敏感，还可能差一个 `\\?\` 前缀，直接比 `PathBuf` 会漏判——
+/// 漏判的后果是两个 pi 进程绑上同一份 JSONL。能规范化就以规范化结果为准；
+/// 文件已经不在了就退回原样比较。
+fn same_session_file(left: &Path, right: &Path) -> bool {
+    let normalize =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize(left) == normalize(right)
 }
 
 /// fresh 会话的标签标题。
@@ -2676,6 +2704,20 @@ impl ChatPanel {
             return;
         }
         let Some(active) = self.active.take() else {
+            // 没有 Runtime 时改预设必须同步到 Manager 的会话描述上：
+            // 恢复运行是拿**那份描述**去起进程的，只改 UI 就会出现
+            // 「界面写着 ReadOnly、进程却按挂起前那套更宽的工具起来」。
+            if let Some(session) = self.session
+                && let Err(error) = self
+                    .runtime_manager
+                    .set_session_tool_preset(session, preset)
+            {
+                self.rpc_success = None;
+                self.rpc_error_protected = true;
+                self.rpc_error = Some(format!("切换工具预设失败：{error}"));
+                cx.notify();
+                return;
+            }
             self.tool_preset = preset;
             self.rpc_success = None;
             self.rpc_error = None;
@@ -2850,6 +2892,33 @@ impl ChatPanel {
     /// 单独成一个方法而不是写在续体里：这是选择器回来之后唯一会改状态的地方，
     /// 拎出来才能在没有真实 `SessionHandle` 的测试里直接钉住「落在哪个标签」。
     fn apply_session_switch_choice(&mut self, tab_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(index) = self.slot_index_for_tab(tab_id) else {
+            return;
+        };
+        // 不能切进另一个标签已经登记的会话文件：那会让**两个** pi 进程绑同一份
+        // JSONL，各自往里追加，落盘历史交错甚至写坏。这条路径绕开了侧栏选择时的
+        // `slot_index_for_key` 去重，必须自己查一次。
+        if let Some(owner) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(other, slot)| {
+                *other != index
+                    && slot.session.is_some()
+                    && slot
+                        .bound_session_file()
+                        .is_some_and(|owned| same_session_file(&owned, &path))
+            })
+            .map(|(_, slot)| slot.tab_title.clone())
+        {
+            self.project(index, |panel| {
+                panel.rpc_success = None;
+                panel.rpc_error_protected = true;
+                panel.rpc_error = Some(format!("该会话已在标签「{owner}」中打开，请直接切过去"));
+                cx.notify();
+            });
+            return;
+        }
         self.project_tab(tab_id, |panel| {
             if path
                 .extension()
@@ -5270,12 +5339,19 @@ mod tests {
     }
 
     fn fixture_controls(session_id: &str) -> SessionControls {
+        fixture_controls_with_file(session_id, None)
+    }
+
+    fn fixture_controls_with_file(
+        session_id: &str,
+        session_file: Option<PathBuf>,
+    ) -> SessionControls {
         SessionControls {
             model: None,
             thinking_level: pi_rpc::ThinkingLevel::Off,
             models: Vec::new(),
             thinking_levels: Vec::new(),
-            session_file: None,
+            session_file,
             session_id: session_id.to_owned(),
             tree: pi_rpc::TreeData {
                 tree: Vec::new(),
@@ -7031,6 +7107,49 @@ mod tests {
                 assert!(panel.active.is_none());
                 panel.apply_runtime_effect(controls_error(3), cx);
                 assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第十轮独立审查 P1：不许把一个标签切进另一个标签已经占着的会话文件。
+    ///
+    /// 那会让两个 pi 进程绑同一份 JSONL，各自往里追加，落盘历史交错甚至写坏。
+    /// 「切换会话」走的是原生选择器，绕开了侧栏选择时的去重，必须自己查一次。
+    #[gpui::test]
+    fn switching_into_a_session_another_tab_owns_is_refused(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        std::fs::write(&owned, "").expect("write session file");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 一号已经登记了会话，并且绑在 owned.jsonl 上。
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(owned.clone())));
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                let second_tab = panel.sessions[second].tab_id;
+
+                // 二号试图切到一号占着的那份文件：必须被拒，且不得开始任何控制操作。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("一号")),
+                    "拒绝理由要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none(), "被拒时不得发起控制操作");
+                assert!(
+                    panel.sessions[0].rpc_error.is_none(),
+                    "错误只属于发起切换的标签"
+                );
             });
         });
     }

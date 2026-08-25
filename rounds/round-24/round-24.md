@@ -400,6 +400,24 @@ Codex thread `01a038e6-ebbf-75d2-b71f-d2b7658b3a1a`。结论：**1 项 P2**，�
 > 而所有单会话时代写的代码都默认这两类是同一回事。** 本轮的 findings 有相当一部分
 > 就是这条默认假设在各个角落的残留。
 
+### 第十轮独立代码审查与整改
+
+Codex thread `01a038f4-7bd9-71e1-8943-797c05468e92`。结论：**2 项 P1**，均成立。
+严重度在第 8–9 轮降到 P2/P3 之后**回升**——这两条都不是「显示不对」，而是权限与落盘正确性。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P1 | 会话处于 `Parked` / `Failed` 时工具选择器仍然可用，但 `set_tool_preset` 因为 `active` 是 `None` 只改了 `SessionUiState`。「恢复运行」是拿 **Manager 的会话描述**去起进程的，于是挂起一个 Full/Inherit 会话、改成 ReadOnly、再恢复 —— 界面写着 ReadOnly，进程却按旧的宽权限起来了 | `pi-runtime` 新增 `RuntimeManager::set_session_tool_preset`，**只允许改没有 Runtime 的会话**（有 Runtime 必须走 `restart_with_tools` 重启进程，否则「描述」与「进程实际权限」又会分家——R23 审查 P1-1 修的就是这条，不能再开后门）；app 在无 Runtime 分支里同步过去，失败就报错并不改 UI | `a_parked_session_can_have_its_tool_preset_changed_before_it_resumes`（含「运行中必须拒绝且不改动任何状态」） |
+| P1 | 「切换会话」走原生选择器，绕开了侧栏选择时的 `slot_index_for_key` 去重，也没做路径撞车检查。多标签并行时可以选中**另一个标签已经占着**的 JSONL，于是两个 pi 进程绑同一份文件各自追加，内存历史分叉、落盘历史交错甚至写坏 | 切换前按「已登记会话的标签」查一遍路径撞车，命中就明确拒绝并指出是谁占着（`该会话已在标签「X」中打开，请直接切过去`），不发起任何控制操作。路径比较走 `same_session_file`：Windows 大小写不敏感、还可能差一个 `\\?\` 前缀，直接比 `PathBuf` 会漏判 | `switching_into_a_session_another_tab_owns_is_refused` |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **149 passed**；
+`cargo test -p pi-runtime --test multi_session_fake_child` → **5 passed**。
+
+> 严重度回升值得记一笔：前九轮把「状态该归谁」这条线基本理顺了，第十轮换了一个方向 ——
+> **多会话让原本互斥的资源变得可以被同时争抢**（同一份会话文件、同一个会话的启动参数）。
+> 这是与「状态分层」并列的第二类多会话问题，之前几轮完全没触及。
+> 说明 findings 数量下降不等于面已经覆盖完，只说明**当前这条线**挖到底了。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

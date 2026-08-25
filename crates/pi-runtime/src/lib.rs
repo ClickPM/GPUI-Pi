@@ -1942,6 +1942,28 @@ impl RuntimeManager {
         })
     }
 
+    /// 改一个**当前没有 Runtime** 的会话的工具预设。
+    ///
+    /// 有 Runtime 时一律拒绝：进程已经按旧参数起来了，换预设必须重启进程
+    /// （[`SessionHandle::restart_with_tools`]）。只改描述会让「描述」与「进程实际
+    /// 拥有的权限」分家——R23 审查 P1-1 修的就是这条，这里不能再开一个后门。
+    pub fn set_session_tool_preset(
+        &self,
+        session: SessionId,
+        tool_preset: ToolPreset,
+    ) -> Result<(), String> {
+        let mut core = self.inner.core.lock().unwrap();
+        let slot = core
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "会话不存在".to_owned())?;
+        if slot.entry.is_some() {
+            return Err("会话正在运行，改工具预设需要重启进程".to_owned());
+        }
+        slot.descriptor.tool_preset = tool_preset;
+        Ok(())
+    }
+
     pub fn scheduler_report(&self) -> SchedulerReport {
         let core = self.inner.core.lock().unwrap();
         // 槽位计数必须在调度锁内取：先读槽位再拿锁会拼出一份「状态与槽位互相矛盾」的

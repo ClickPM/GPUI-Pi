@@ -298,3 +298,43 @@ fn park_finishes_a_queued_handoff_on_the_calling_thread() {
         manager.remove_session(session);
     }
 }
+
+/// R24 第十轮审查 P1：改一个已挂起会话的工具预设，必须真的落到它下次启动的参数上。
+///
+/// 否则 UI 上写着 ReadOnly，恢复出来的进程却还带着挂起前那套更宽的工具——
+/// 「显示的权限」与「实际的权限」分家。
+#[test]
+fn a_parked_session_can_have_its_tool_preset_changed_before_it_resumes() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let manager = test_manager(SchedulerLimits::default());
+    let session = register(&manager, workspace.path(), "preset");
+    assert_eq!(
+        manager.session_descriptor(session).map(|d| d.tool_preset),
+        Some(ToolPreset::Inherit)
+    );
+
+    manager
+        .set_session_tool_preset(session, ToolPreset::ReadOnly)
+        .expect("挂起态可以改预设");
+    assert_eq!(
+        manager.session_descriptor(session).map(|d| d.tool_preset),
+        Some(ToolPreset::ReadOnly),
+        "改动必须落到描述上，下次启动才会按新预设起进程"
+    );
+
+    // 跑起来之后就不许再从这条路改了：进程已经按旧参数起来，只改描述会让
+    // 「描述」与「进程实际权限」分家。
+    let handle = run(&manager, session, Priority::FOREGROUND);
+    let refused = manager
+        .set_session_tool_preset(session, ToolPreset::Inherit)
+        .expect_err("运行中必须拒绝");
+    assert!(refused.contains("重启"), "{refused}");
+    assert_eq!(
+        manager.session_descriptor(session).map(|d| d.tool_preset),
+        Some(ToolPreset::ReadOnly),
+        "被拒绝的调用不得改动任何状态"
+    );
+
+    drop(handle);
+    manager.remove_session(session);
+}
