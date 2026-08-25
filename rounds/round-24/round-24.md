@@ -166,6 +166,36 @@
 - `.\scripts\validate.ps1 -Logic` → `VALIDATE OK`；完整 `.\scripts\validate.ps1` → **`VALIDATE OK`**
   （release 构建 2m47s，全部测试目标零失败；仅有既存的 linker stdout 与 `proc-macro-error2` future-incompat 警告）。
 
+### 独立代码审查与整改
+
+审查通道：Claude Code harness → **codex 插件**（`/codex:review --scope branch --base main --background`，
+Codex thread `01a03809-c451-71a1-b82e-ef46baf1cfce`）。只读、与 writer 隔离。
+本轮由主会话实现，因此由主会话修复，writer 归属未变。
+
+> 记一笔：发起前 `CLAUDE.md` 还写着「这两个命令标了 `disable-model-invocation`，主会话无法自行触发」。
+> 实际生效的插件版本是 **1.0.6**（`installed_plugins.json` 的 `installPath`），其
+> `commands/review.md` 已是 `disable-model-invocation: false`；只有旧版 1.0.1 与
+> `marketplaces/` 下的副本仍是 `true`，我最初读错了副本。已按用户指示同步修正
+> `CLAUDE.md` / `AGENTS.md`，改为「以实际生效的 `installPath` 下那份命令定义为准」。
+
+结论：**1 项 P1 + 1 项 P2**。逐条核对源码后确认**全部成立**，且都落在本轮新写的代码里，
+已全部整改并补回归测试。P1 的影响面比审查点名的更大——顺着它给的判据把
+`panels.rs` 里所有跨 await 点的续体扫了一遍，共 **6 处**，不是 2 处。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P1 | 多标签投影之后，既有的异步续体仍然靠 `Deref` 落到「回来时的前台标签」，而不是发起它的那个标签。跨 await 点的写入因此会串台：附件挂到别人身上（或因对错 `load_generation` 被静默丢弃）、Extension UI 超时去取消别人的同名请求 | 新增 `ChatPanel::project_tab(tab_id, body)`：发起时捕获 `tab_id`，回来先定位再投影；标签已关就整段跳过。逐处钉住 **6 条**续体：`start_attach_paths`、`choose_images`（原生选择器）、`send_extension_response` 的错误写回、Extension UI 超时定时器，以及自查追加的 `choose_session_switch`、`export_html` | `an_attachment_started_on_one_tab_never_lands_on_another`、`an_extension_dialog_timeout_only_cancels_its_own_tabs_request`、`a_session_switch_choice_lands_on_the_tab_that_opened_the_picker` |
+| P2 | 调度器桥接线程把上游「容量 1、满帧即丢」的订阅原样倒进一条 `mpsc::unbounded`。GPUI 执行器一卡住，这条线程就会把上游取空并在桥接侧堆成无界队列，电平触发的合并保证到这里作废 | 桥接侧改为 `mpsc::channel(0)` + `try_send`，满帧即丢、只在 `is_disconnected()` 时退出，与上游同一条合并规则。端到端上限因此是「上游 1 + 桥接 1」，与 UI 卡多久无关 | 无新增用例：这是 3 行的构造性收敛，桥接线程与私有通道在 app 层没有可注入的观测点，硬造一个 stall 只会测到 GPUI 执行器而不是这段代码。退订即断链那一半已由 `pi-runtime` 的 `dropping_a_subscription_unregisters_it_and_disconnects_the_bridge` 覆盖 |
+
+整改中额外发现并修掉的一个缺口（由 P1 的超时用例逼出来）：切走标签时对话框会被收起
+（`extension_dialog_open` 清空），而 `finish_extension_dialog` 要求「这个对话框此刻正开着」
+才肯收口——于是后台标签的超时只留下一条错误，请求本身悬在队列里，pi 那头一直等。
+这是本轮 suspend-on-switch 引入的缺口，新增 `expire_extension_dialog`：
+**截止时间属于请求、不属于窗口**，无论此刻显不显示都回一个 cancelled。
+
+整改后：`.\scriptsalidate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **136 passed**
+（较整改前 133 增 3 条 P1 回归用例）。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

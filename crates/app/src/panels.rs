@@ -544,6 +544,17 @@ impl ChatPanel {
         self.sessions.iter().position(|slot| slot.tab_id == tab_id)
     }
 
+    /// 把一段**延后执行**的投影逻辑钉回发起它的那个标签。
+    ///
+    /// 异步回调（文件读取、原生选择器、Extension UI 超时、响应写回）回来时，前台可能
+    /// 已经换了标签；走 `Deref` 就会把 A 的结果写进 B。所有跨 await 点的续体都必须在
+    /// 发起时捕获 `tab_id`，回来再用它定位。标签已经关掉就整段跳过——它的会话态
+    /// 已经不存在，硬找一个替身写进去只会造出更难查的串台。
+    fn project_tab<R>(&mut self, tab_id: u64, body: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let index = self.slot_index_for_tab(tab_id)?;
+        Some(self.project(index, body))
+    }
+
     /// 按 pi 会话身份找标签。
     ///
     /// `draft_key` 就是这份身份：历史选择时是侧栏给的会话 id，fresh 会话落盘后由
@@ -823,12 +834,17 @@ impl ChatPanel {
             return;
         };
         self.scheduler_subscription = Some(subscription);
-        let (tx, mut rx) = mpsc::unbounded();
+        // 桥接侧也必须有界且合并，否则 `pi-runtime` 那头「容量 1、满帧即丢」的保证
+        // 到这里就作废了：GPUI 执行器一卡住，这条线程会把上游一条条取空、原样堆进
+        // 一条无界队列。合并规则与上游一致——通知是电平触发的，堆多少条都是同一件事。
+        let (mut tx, mut rx) = mpsc::channel(0);
         std::thread::Builder::new()
             .name("pi-runtime-scheduler-bridge".into())
             .spawn(move || {
                 while receiver.recv().is_ok() {
-                    if tx.unbounded_send(()).is_err() {
+                    if let Err(error) = tx.try_send(())
+                        && error.is_disconnected()
+                    {
                         break;
                     }
                 }
@@ -1708,16 +1724,20 @@ impl ChatPanel {
             return;
         };
         let id = response.id().to_owned();
+        // 写回失败的诊断属于**这个会话**，不属于用户此刻正看着的那个标签。
+        let tab_id = self.tab_id;
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor.spawn(async move { sender.send(response) }).await;
             let _ = panel.update(cx, |panel, cx| {
-                if let Err(error) = result {
-                    panel.rpc_error = Some(format!(
-                        "Extension UI 响应 {id} 未写回，已丢弃并继续队列：{error}"
-                    ));
-                }
-                cx.notify();
+                panel.project_tab(tab_id, |panel| {
+                    if let Err(error) = result {
+                        panel.rpc_error = Some(format!(
+                            "Extension UI 响应 {id} 未写回，已丢弃并继续队列：{error}"
+                        ));
+                    }
+                    cx.notify();
+                });
             });
         })
         .detach();
@@ -1786,24 +1806,23 @@ impl ChatPanel {
             let panel = cx.weak_entity();
             let timeout_id = dialog_request.id.clone();
             let timeout_sequence = dialog_request.sequence;
+            // 超时属于开出这个对话框的标签。不钉住的话，定时器会去检查前台标签的
+            // 队列——id 撞上就取消了**别人**的请求，撞不上则这条超时被静默吞掉。
+            let tab_id = self.tab_id;
             let timer = cx.background_executor().clone();
             cx.spawn(async move |_, cx| {
                 timer
                     .timer(deadline.saturating_duration_since(std::time::Instant::now()))
                     .await;
                 let _ = panel.update(cx, |panel, cx| {
-                    if panel.extension_ui.active_dialog().is_some_and(|dialog| {
-                        dialog.id == timeout_id && dialog.sequence == timeout_sequence
-                    }) {
-                        panel.extension_dialog_needs_close = true;
-                        panel.finish_extension_dialog(
-                            &timeout_id,
-                            pi_rpc::ExtensionUiResponse::cancelled(&timeout_id),
-                            cx,
-                        );
-                        panel.rpc_error = Some("Extension UI 请求已超时".to_owned());
-                        cx.notify();
-                    }
+                    panel.project_tab(tab_id, |panel| {
+                        if panel.extension_ui.active_dialog().is_some_and(|dialog| {
+                            dialog.id == timeout_id && dialog.sequence == timeout_sequence
+                        }) {
+                            panel.expire_extension_dialog(&timeout_id, cx);
+                            panel.rpc_error = Some("Extension UI 请求已超时".to_owned());
+                        }
+                    });
                 });
             })
             .detach();
@@ -2071,6 +2090,30 @@ impl ChatPanel {
                 self.rpc_error = Some("未知 Extension UI dialog 请求已取消".to_owned());
             }
         }
+    }
+
+    /// 让一个**已到期**的请求收口，无论它此刻是否正显示在窗口上。
+    ///
+    /// 截止时间属于**请求**，不属于窗口。标签被切走时对话框会被收起
+    /// （`extension_dialog_open` 清空），但 pi 那头仍在等一个响应；只按
+    /// 「窗口上正开着」判断，后台标签的超时请求就会永远悬着。
+    fn expire_extension_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self
+            .extension_ui
+            .active_dialog()
+            .map(|dialog| dialog.id.as_str())
+            != Some(id)
+        {
+            return;
+        }
+        // 只有确实是自己开着的那一个才请求关窗；别人的对话框不归这里管。
+        if self.extension_dialog_open.as_deref() == Some(id) {
+            self.extension_dialog_needs_close = true;
+            self.extension_dialog_open = None;
+        }
+        self.send_extension_response(pi_rpc::ExtensionUiResponse::cancelled(id), cx);
+        self.extension_ui.finish_dialog(id);
+        cx.notify();
     }
 
     fn finish_extension_dialog(
@@ -2487,6 +2530,9 @@ impl ChatPanel {
         if self.control_operation.is_some() || self.active.is_none() {
             return;
         }
+        // 原生选择器可能开着好几秒。不钉住标签，用户切一下界面就会把**别人的**
+        // 活会话切到这里挑的文件上。
+        let tab_id = self.tab_id;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -2502,23 +2548,33 @@ impl ChatPanel {
                 .and_then(|paths| paths.into_iter().next());
             let Some(path) = path else { return };
             let _ = panel.update(cx, |panel, cx| {
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-                {
-                    panel.begin_control(
-                        ControlOperation::SwitchSession,
-                        ControlRequest::SwitchSession { path },
-                        cx,
-                    );
-                } else {
-                    panel.rpc_success = None;
-                    panel.rpc_error = Some("只能切换到 .jsonl 会话文件".to_owned());
-                    cx.notify();
-                }
+                panel.apply_session_switch_choice(tab_id, path, cx);
             });
         })
         .detach();
+    }
+
+    /// 把用户在原生选择器里挑中的会话文件应用到**发起这次切换的那个标签**。
+    ///
+    /// 单独成一个方法而不是写在续体里：这是选择器回来之后唯一会改状态的地方，
+    /// 拎出来才能在没有真实 `SessionHandle` 的测试里直接钉住「落在哪个标签」。
+    fn apply_session_switch_choice(&mut self, tab_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        self.project_tab(tab_id, |panel| {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                panel.begin_control(
+                    ControlOperation::SwitchSession,
+                    ControlRequest::SwitchSession { path },
+                    cx,
+                );
+            } else {
+                panel.rpc_success = None;
+                panel.rpc_error = Some("只能切换到 .jsonl 会话文件".to_owned());
+                cx.notify();
+            }
+        });
     }
 
     fn export_html(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2535,6 +2591,8 @@ impl ChatPanel {
             .as_ref()
             .map(|controls| controls.session_id.clone())
             .unwrap_or_else(|| "session".to_owned());
+        // 同上：导出的必须是**发起导出的那个会话**，不是选完路径时正看着的那个。
+        let tab_id = self.tab_id;
         let receiver =
             cx.prompt_for_new_path(&start, Some(&format!("pi-session-{session_id}.html")));
         cx.spawn_in(window, async move |panel, cx| {
@@ -2543,13 +2601,15 @@ impl ChatPanel {
                 return;
             };
             let _ = panel.update(cx, |panel, cx| {
-                panel.begin_control(
-                    ControlOperation::ExportHtml,
-                    ControlRequest::ExportHtml {
-                        output_path: destination,
-                    },
-                    cx,
-                );
+                panel.project_tab(tab_id, |panel| {
+                    panel.begin_control(
+                        ControlOperation::ExportHtml,
+                        ControlRequest::ExportHtml {
+                            output_path: destination,
+                        },
+                        cx,
+                    );
+                });
             });
         })
         .detach();
@@ -2759,6 +2819,8 @@ impl ChatPanel {
     }
 
     fn choose_images(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 原生选择器可能开着好几秒；附件该落在**点按钮时**那个标签上。
+        let tab_id = self.tab_id;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -2771,15 +2833,23 @@ impl ChatPanel {
             };
             let _ = cx.update(|_, cx| {
                 let _ = panel.update(cx, |panel, cx| {
-                    panel.start_attach_paths(paths, cx);
+                    panel.start_attach_paths(tab_id, paths, cx);
                 });
             });
         })
         .detach();
     }
 
-    fn start_attach_paths(&self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let generation = self.load_generation;
+    /// 读盘并把图片挂到**发起这次附件操作的那个标签**上。
+    ///
+    /// `tab_id` 由调用方在用户动作发生的那一刻捕获：拖拽是当时的前台标签，
+    /// 原生选择器则是点「添加图片」时的那个——选择器可能开着好几秒，
+    /// 期间用户完全可能切走。
+    fn start_attach_paths(&self, tab_id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(index) = self.slot_index_for_tab(tab_id) else {
+            return;
+        };
+        let generation = self.sessions[index].load_generation;
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor
@@ -2798,21 +2868,23 @@ impl ChatPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel, cx| {
-                if generation != panel.load_generation {
-                    return;
-                }
-                match result {
-                    Ok(images) => {
-                        if let Err(error) = panel.add_draft_images(images, cx) {
-                            panel.rpc_error = Some(error.to_string());
+                panel.project_tab(tab_id, |panel| {
+                    if generation != panel.load_generation {
+                        return;
+                    }
+                    match result {
+                        Ok(images) => {
+                            if let Err(error) = panel.add_draft_images(images, cx) {
+                                panel.rpc_error = Some(error.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error = Some(error);
                         }
                     }
-                    Err(error) => {
-                        panel.rpc_success = None;
-                        panel.rpc_error = Some(error);
-                    }
-                }
-                cx.notify();
+                    cx.notify();
+                });
             });
         })
         .detach();
@@ -3508,7 +3580,8 @@ impl Render for ChatPanel {
             .capture_action(cx.listener(Self::capture_composer_paste))
             .on_key_down(cx.listener(Self::composer_key_down))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.start_attach_paths(paths.paths().to_vec(), cx);
+                let tab_id = this.tab_id;
+                this.start_attach_paths(tab_id, paths.paths().to_vec(), cx);
             }))
             .size_full()
             .min_w_0()
@@ -6364,6 +6437,170 @@ mod tests {
                     Some("后台会话的错误")
                 );
                 assert!(panel.sessions[1].compacting);
+            });
+        });
+    }
+
+    /// 独立代码审查 P1：跨 await 点的续体必须钉回发起它的标签。
+    ///
+    /// 附件读盘期间用户切走标签是完全正常的操作；不钉标签的话，图片要么挂到别人身上，
+    /// 要么因为对错了 `load_generation` 被静默丢弃。
+    #[gpui::test]
+    fn an_attachment_started_on_one_tab_never_lands_on_another(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let png = workspace.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nattach-fixture").expect("write png");
+
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                let origin = panel.tab_id;
+                panel.start_attach_paths(origin, vec![png.clone()], cx);
+                // 读盘还没回来就切走——这正是不钉标签会出错的那一刻。
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+            });
+        });
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.focused, 1);
+            assert_eq!(
+                panel.sessions[0].attachments.len(),
+                1,
+                "附件必须落回发起它的标签"
+            );
+            assert!(
+                panel.sessions[1].attachments.is_empty(),
+                "切过去的标签不得凭空多出一张图"
+            );
+            assert!(panel.sessions[1].rpc_error.is_none());
+        });
+    }
+
+    /// 独立代码审查 P1：Extension UI 超时定时器也必须钉回开出它的标签。
+    ///
+    /// 不钉住的话，定时器会去检查前台标签的队列——id 撞上就取消了别人的请求，
+    /// 撞不上则这条超时被静默吞掉，pi 那头永远等不到响应。
+    #[gpui::test]
+    fn an_extension_dialog_timeout_only_cancels_its_own_tabs_request(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        // 超时给得足够长，好让「打开对话框 → 切走标签 → 定时器到点」这三步的先后
+        // 由测试说了算，而不是靠抢时间。
+        panel.update(cx, |panel, cx| {
+            panel.draft_key = Some("one".into());
+            panel.extension_ui.apply(
+                "shared-id".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "一号的确认".into(),
+                    message: "Continue?".into(),
+                    timeout: Some(5_000),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.extension_dialog_open.as_deref(),
+                Some("shared-id"),
+                "对话框要先真的打开，定时器才会被装上"
+            );
+        });
+
+        // 切到第二个标签，并让它挂上一条**同名**的待处理请求。
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                panel.extension_ui.apply(
+                    "shared-id".into(),
+                    pi_rpc::ExtensionUiRequest::Confirm {
+                        title: "二号的确认".into(),
+                        message: "Continue?".into(),
+                        timeout: None,
+                    },
+                );
+                cx.notify();
+            });
+        });
+        draw_frames(&mut visual, 3);
+
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(6_000));
+        visual.run_until_parked();
+        draw_frames(&mut visual, 3);
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.focused, 1);
+            // 一号的请求超时后被取消，诊断也留在一号。
+            assert!(
+                panel.sessions[0].extension_ui.active_dialog().is_none(),
+                "发起标签的请求应已超时取消"
+            );
+            assert!(
+                panel.sessions[0]
+                    .rpc_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("超时")),
+                "超时诊断必须留在发起标签：{:?}",
+                panel.sessions[0].rpc_error
+            );
+            // 二号的同名请求毫发无伤。
+            let survivor = panel.sessions[1]
+                .extension_ui
+                .active_dialog()
+                .expect("另一个标签的同名请求不得被别人的超时取消");
+            assert_eq!(survivor.id, "shared-id");
+            assert!(
+                matches!(
+                    &survivor.request,
+                    pi_rpc::ExtensionUiRequest::Confirm { title, .. } if title == "二号的确认"
+                ),
+                "留下的必须是二号自己那条请求"
+            );
+            assert!(panel.sessions[1].rpc_error.is_none());
+        });
+    }
+
+    /// 独立代码审查 P1 的同类路径：原生选择器回来后，结果必须落在**发起它的标签**。
+    ///
+    /// 选择器可能开着好几秒。不钉住的话，用户切一下界面就会把别人的活会话切到这里
+    /// 挑的文件上——比附件挂错标签严重得多。
+    #[gpui::test]
+    fn a_session_switch_choice_lands_on_the_tab_that_opened_the_picker(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                let origin = panel.tab_id;
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                assert_eq!(panel.focused, 1);
+
+                // 选择器是在一号上打开的，尽管此刻前台是二号。
+                panel.apply_session_switch_choice(origin, PathBuf::from("note.txt"), cx);
+                assert_eq!(
+                    panel.sessions[0].rpc_error.as_deref(),
+                    Some("只能切换到 .jsonl 会话文件"),
+                    "结果必须回到发起选择器的标签"
+                );
+                assert!(
+                    panel.sessions[1].rpc_error.is_none(),
+                    "前台标签不得替别人背这条错误"
+                );
+
+                // 标签已经关掉时整段跳过，不找替身写进去。
+                panel.close_tab(0, window, cx);
+                panel.apply_session_switch_choice(origin, PathBuf::from("note.txt"), cx);
+                assert!(panel.sessions.iter().all(|slot| slot.rpc_error.is_none()));
             });
         });
     }
