@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -113,6 +113,13 @@ pub enum LifecycleEvent {
         queued_bytes: usize,
         limit: usize,
     },
+    /// 订阅方主动断开（[`EventStream::detach`]）：这是本订阅流的最后一个事件。
+    ///
+    /// 与 [`LifecycleEvent::Exited`] 的区别是**进程还活着**。R23 的 Park 需要在保留
+    /// pi 进程的前提下确定性地结束 reducer pump 线程，而 pump 阻塞在 `recv` 上，
+    /// 只有一个哨兵事件能把它叫醒；靠丢 `Client` 唤醒会连进程一起杀掉，靠等下一条
+    /// 业务事件唤醒则在空闲会话上永远等不到。
+    Detached,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,12 +180,31 @@ struct Subscriber {
 pub struct EventStream {
     rx: Receiver<QueuedEvent>,
     queued_bytes: Arc<AtomicUsize>,
+    /// 只持弱引用：订阅流绝不能反过来让 pi 进程续命。
+    shared: Weak<Shared>,
 }
 
 impl EventStream {
     fn settle(&self, queued: QueuedEvent) -> ClientEvent {
         self.queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
         queued.event
+    }
+
+    /// 主动断开本订阅，**不影响进程与其他订阅者**。见 [`EventDetach`]。
+    pub fn detach(&self) {
+        self.detach_handle().detach();
+    }
+
+    /// 取一个可跨线程持有的断开句柄。
+    ///
+    /// [`EventStream`] 自身因为内含 [`Receiver`] 而不是 `Sync`，没法被消费线程之外的
+    /// 结构共享；但「叫醒并断开这条订阅」这件事必须由外部发起，所以单独拆出这个
+    /// `Send + Sync` 的小句柄。
+    pub fn detach_handle(&self) -> EventDetach {
+        EventDetach {
+            shared: self.shared.clone(),
+            queued_bytes: Arc::clone(&self.queued_bytes),
+        }
     }
 
     pub fn recv(&self) -> Result<ClientEvent, mpsc::RecvError> {
@@ -198,6 +224,44 @@ impl EventStream {
     /// 当前尚未被消费的事件字节数，用于观测背压水位。
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Acquire)
+    }
+}
+
+/// 订阅流的断开句柄：`Send + Sync`，可以由消费线程之外的持有者调用。
+#[derive(Clone)]
+pub struct EventDetach {
+    /// 只持弱引用：断开句柄绝不能反过来让 pi 进程续命。
+    shared: Weak<Shared>,
+    /// 用它做订阅身份标识 —— 每条订阅的字节计数器都是独立的 `Arc`。
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl EventDetach {
+    /// 断开对应订阅，**不影响进程与其他订阅者**。
+    ///
+    /// 把该订阅从订阅表摘除后投一条 [`LifecycleEvent::Detached`] 哨兵：阻塞中的 `recv`
+    /// 因此立刻返回该事件，之后（发送端已随摘除而 drop）返回 `Err`。生产侧的
+    /// stdout reader 与 supervisor 全程不受影响，drain 不中断。
+    ///
+    /// 幂等：重复调用只是找不到自己，直接返回。
+    pub fn detach(&self) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut subscribers = shared.subscribers.lock().unwrap();
+        let Some(index) = subscribers
+            .iter()
+            .position(|subscriber| Arc::ptr_eq(&subscriber.queued_bytes, &self.queued_bytes))
+        else {
+            return;
+        };
+        let subscriber = subscribers.remove(index);
+        // 先放锁再发哨兵：send 只是入队，但没必要在订阅表锁内做。
+        drop(subscribers);
+        let _ = subscriber.tx.send(QueuedEvent {
+            bytes: 0,
+            event: ClientEvent::Lifecycle(LifecycleEvent::Detached),
+        });
     }
 }
 
@@ -268,7 +332,11 @@ impl Client {
             queued_bytes: Arc::clone(&queued_bytes),
             limit: self.shared.event_backlog_bytes,
         });
-        EventStream { rx, queued_bytes }
+        EventStream {
+            rx,
+            queued_bytes,
+            shared: Arc::downgrade(&self.shared),
+        }
     }
 
     /// 当前活跃进程退出后，监督器用于自动恢复的会话文件。
