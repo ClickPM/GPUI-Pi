@@ -602,6 +602,14 @@ impl ChatPanel {
         result
     }
 
+    /// 当前投影的是不是用户正看着的那个标签。
+    ///
+    /// 后台事件泵会把游标临时指到自己那一槽，只有二者相同时才轮得到动全局资源
+    /// （窗口标题、工作区面板）。
+    fn projecting_focused_tab(&self) -> bool {
+        self.cursor == self.focused
+    }
+
     fn slot_index_for_tab(&self, tab_id: u64) -> Option<usize> {
         self.sessions.iter().position(|slot| slot.tab_id == tab_id)
     }
@@ -1263,10 +1271,13 @@ impl ChatPanel {
             panel.sync_list_document(&document, true);
             panel.list_state.reset(0);
             panel.list_items.clear();
-            // fresh 会话的草稿键是临时的；`ControlsLoaded` 拿到真实 session id 后迁移。
-            let draft_key = format!("fresh-{tab_id}-{generation}");
-            panel.draft_key = Some(draft_key.clone());
-            panel.drafts.clear(&draft_key);
+            // **不给 fresh 会话编一个 `draft_key`**：那个字段是对外的 pi 会话身份
+            // （去重认它、工作区 tooltip 也显示它），编出来的值会以「真实身份」的
+            // 名义漏到界面上。草稿自有 `draft_slot_key()` 兜底，等 `ControlsLoaded`
+            // 拿到真的 session id 再迁移过去。
+            panel.draft_key = None;
+            let draft_slot = panel.draft_slot_key();
+            panel.drafts.clear(&draft_slot);
             panel.composer_cwd = Some(cwd.clone());
             panel.fresh_session = true;
             panel.load_generation
@@ -1482,16 +1493,23 @@ impl ChatPanel {
     ) {
         let receiver = handle.subscribe_dirty();
         let tab_id = self.sessions[index].tab_id;
-        self.project(index, |panel| {
+        let terminal = self.project(index, |panel| {
             panel.install_active(handle);
             // 立刻拉一次：`subscribe_dirty` 只登记发送端，不补发当前修订号。
             // 启动/热接管的元数据可能在我们订阅**之前**就跑完了，那几条 Dirty
             // 发给了零个订阅者；不在这里补一次，这个标签就会一直没有模型、
             // 没有 slash 命令、没有启动诊断，直到下一次运行时事件——空闲会话
             // 可能永远等不到。
-            panel.pull_runtime_snapshot(cx);
+            panel.pull_runtime_snapshot(cx)
         });
         self.spawn_dirty_pump(tab_id, receiver, window.window_handle(), cx);
+        if terminal {
+            // 订阅不补发之前的 Dirty：进程若在「Manager 发布 Running」与「订阅装好」
+            // 之间就退出了，上面这次补拉就是**唯一**一次能看到终态的机会。
+            // 不在这里收口，运行槽会一直挂在 Running 上，排队会话要等 reaper 轮询
+            //（默认 TTL 下最长 45s）才补位。走后台，`tick()` 可能就地拉起新会话。
+            self.spawn_scheduler_job(window, cx, |manager| manager.tick(), |_, (), _, _| {});
+        }
         cx.notify();
     }
 
@@ -1822,10 +1840,14 @@ impl ChatPanel {
                 match result {
                     Ok(controls) => {
                         if self.fresh_session {
-                            if let Some(old_key) = self.draft_key.clone() {
-                                migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
-                            }
+                            let old_key = self.draft_slot_key();
+                            migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
                             self.draft_key = Some(controls.session_id.clone());
+                            // 身份刚从「无」变成真实 session id：前台标签得把它广播出去，
+                            // 否则工作区 tooltip 会一直停在校准之前的状态。
+                            if self.projecting_focused_tab() {
+                                self.emit_focused_session(cx);
+                            }
                             if controls.session_file.is_some() {
                                 self.fresh_session = false;
                                 cx.emit(SessionsChanged);
@@ -5226,6 +5248,24 @@ mod tests {
         render_status_with_panel(cx, status).0
     }
 
+    fn fixture_controls(session_id: &str) -> SessionControls {
+        SessionControls {
+            model: None,
+            thinking_level: pi_rpc::ThinkingLevel::Off,
+            models: Vec::new(),
+            thinking_levels: Vec::new(),
+            session_file: None,
+            session_id: session_id.to_owned(),
+            tree: pi_rpc::TreeData {
+                tree: Vec::new(),
+                leaf_id: None,
+            },
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+            is_compacting: false,
+        }
+    }
+
     fn fixture_model(id: &str, name: &str, provider: &str) -> pi_rpc::Model {
         pi_rpc::Model {
             id: id.to_owned(),
@@ -6966,6 +7006,55 @@ mod tests {
                 assert!(panel.active.is_none());
                 panel.apply_runtime_effect(controls_error(3), cx);
                 assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第八轮独立审查 P3：fresh 会话在校准之前不得对外暴露编造的会话身份。
+    ///
+    /// `draft_key` 是对外的 pi 会话身份（标签去重认它、工作区 tooltip 显示它）。
+    /// 从前 fresh 会话会先塞一个 `fresh-{tab}-{generation}`，那个编出来的值会以
+    /// 「真实身份」的名义漏到界面上，直到 `ControlsLoaded` 才被换掉。
+    #[gpui::test]
+    fn a_fresh_session_publishes_no_identity_until_it_is_calibrated(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.fresh_session = true;
+                panel.draft_key = None;
+                // 校准之前：没有身份可广播，草稿仍然有地方存。
+                assert!(panel.draft_key.is_none());
+                let slot = panel.draft_slot_key();
+                assert!(slot.starts_with("tab-"), "{slot}");
+                panel.drafts.set(
+                    slot.clone(),
+                    pi_data::ComposerDraft {
+                        text: "开会话前先写了半句".into(),
+                        images: Vec::new(),
+                    },
+                );
+
+                // 校准：拿到真实 session id，草稿一并迁过去。
+                panel.apply_runtime_effect(
+                    pi_runtime::RuntimeEffect {
+                        sequence: 1,
+                        epoch: 0,
+                        kind: pi_runtime::RuntimeEffectKind::ControlsLoaded(Ok(fixture_controls(
+                            "real-session-id",
+                        ))),
+                    },
+                    cx,
+                );
+                assert_eq!(panel.draft_key.as_deref(), Some("real-session-id"));
+                assert_eq!(
+                    panel.drafts.get("real-session-id").text,
+                    "开会话前先写了半句",
+                    "校准时草稿要跟着迁到真实身份下"
+                );
+                assert!(
+                    panel.drafts.get(&slot).text.is_empty(),
+                    "临时键迁移后应清空"
+                );
             });
         });
     }
