@@ -231,7 +231,11 @@ impl Workspace {
             move |workspace, _, event: &FocusedSessionChanged, window, cx| {
                 // 标题状态**无条件**跟上：两个标签同属一个项目时下面的目录短路会生效，
                 // 但前台会话确实换了，标题不跟就会一直显示另一个会话的名字。
-                workspace.focused_session = Some(event.clone());
+                //
+                // 没有任何身份的事件（关掉最后一个标签后重置出的空白标签）不算「有会话」，
+                // 存下来会让标题显示成「新标签」，反而盖掉仍然有效的项目目录回退。
+                workspace.focused_session =
+                    (event.cwd.is_some() || event.session_key.is_some()).then(|| event.clone());
                 let Some(cwd) = event.cwd.clone() else {
                     cx.notify();
                     return;
@@ -678,6 +682,59 @@ mod tests {
                 workspace.tab_label().as_ref(),
                 "会话乙",
                 "同项目内切标签，标题也必须跟着走"
+            );
+        });
+    }
+
+    /// 第五轮独立审查 P2：关掉最后一个会话标签后，标题要回落到项目目录。
+    ///
+    /// `ChatPanel` 会把最后一个标签重置成空白标签并广播一个「没有任何身份」的事件；
+    /// 照单收下会让标题显示成「新标签」，反而盖掉仍然有效的项目目录回退。
+    #[gpui::test]
+    fn closing_the_last_session_falls_back_to_the_project_directory(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("test font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let window = cx.open_window(size(px(1200.), px(800.)), move |window, cx| {
+            let workspace =
+                cx.new(|cx| Workspace::new_with_probe(window, cx, LayoutProbe::default()));
+            *output.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = captured.borrow().clone().unwrap();
+        let project = PathBuf::from("C:/fixture/only-project");
+        let chat = workspace.read_with(cx, |workspace, cx| {
+            workspace.main_panel.read(cx).chat_for_test().clone()
+        });
+
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                chat.open_two_tabs_for_test(project.clone(), project.clone(), window, cx);
+                chat.set_tab_titles_for_test("会话甲", "会话乙");
+                chat.focus_tab(0, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tab_label().as_ref(), "会话甲");
+        });
+
+        // 关掉两个标签；第二次会把最后一个标签重置成空白标签。
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                chat.close_tab(1, window, cx);
+                chat.close_tab(0, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.tab_label().as_ref(),
+                "only-project",
+                "没有会话时标题应回落到项目目录，而不是显示空白标签的名字"
             );
         });
     }

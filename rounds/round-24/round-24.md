@@ -322,6 +322,22 @@ Codex thread `01a0388a-369d-7542-ba59-16a05eb67ece`。结论：**3 项 P2**，�
 > 同一类结构只收敛了一半）。这一点值得写进后续轮次的经验：**findings 驱动的整改必须重新过审**，
 > 而且要专门检查「这条修复的同类入口是不是都覆盖了」。
 
+### 第五轮独立代码审查与整改
+
+Codex thread `01a03897-99fa-7db2-b33d-f937d3544982`。结论：**2 项 P2**，核对源码后确认**全部成立**。
+两条又都是前几轮整改的副产物。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P2 | 第二轮为保住附件让「带附件的空标签」不被复用，但那个标签仍然没有 `draft_key`（那是 pi 会话身份），于是 `save_current_draft` 是空操作、`open_tab` 又清空了共享 composer——在空标签上写的字，去开别的标签再切回来就没了 | 拆开两个职责：`draft_key` 仍只表示 pi 会话身份，另加 `SessionUiState::draft_slot_key()`，没有会话身份时退回标签自己的身份。**所有草稿读写路径统一走它**（共 9 处：回填、变更、提交清空、增删附件、fork 回填、Extension UI 写入、提交被拒恢复）。`is_pristine` 同时升级为 `is_focused_tab_pristine`，把「写过字」也算作用过，并要求调用前先存草稿 | `text_typed_on_an_empty_tab_survives_a_detour_to_another_tab` |
+| P2 | 关掉最后一个会话标签后，`ChatPanel` 会重置出一个空白标签并广播「没有任何身份」的事件，第四轮的处理照单收下，于是工具栏显示成「新标签」，反而盖掉仍然有效的项目目录回退 | 没有 `cwd` 也没有 `session_key` 的事件按 `None` 处理，恢复既有的目录回退 | `closing_the_last_session_falls_back_to_the_project_directory` |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **144 passed**。
+
+> 第五轮的第一条值得单独记：它暴露的是**一个字段承担了两个职责**——`draft_key` 既是 pi 会话身份
+> 又是草稿存放位置。前四轮一直在这个含糊上打补丁（谁该判 pristine、谁该存草稿），直到把两个职责
+> 拆开才真正到底。**反复在同一处出 findings，往往说明那里有个没拆开的概念，而不是又一个疏忽。**
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

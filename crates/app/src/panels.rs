@@ -308,6 +308,20 @@ impl SessionUiState {
     }
 }
 
+impl SessionUiState {
+    /// 这个标签的草稿存放键。
+    ///
+    /// `draft_key` 记的是 **pi 会话身份**（标签去重、`ControlsLoaded` 的键迁移都认它），
+    /// 还没登记会话的标签没有它；但草稿必须从标签一诞生就有地方存，否则
+    /// 「在空标签上写了字 → 去开别的标签 → 切回来」这条路上字就没了。
+    /// 没有会话身份时退回标签自己的身份。
+    fn draft_slot_key(&self) -> String {
+        self.draft_key
+            .clone()
+            .unwrap_or_else(|| format!("tab-{}", self.tab_id))
+    }
+}
+
 impl ChatPanel {
     /// 投影游标的落点。`min` 只是防御性收敛：下标漂移宁可落到最后一个标签，
     /// 也不要在渲染路径上 panic。
@@ -615,14 +629,18 @@ impl ChatPanel {
 
     /// 这个标签还是干净的吗？干净的标签可以直接复用，不必再开一个。
     ///
-    /// 附件也算「用过」：空标签上挂着的图片没有 `draft_key` 可存，复用这个标签
-    /// 等于把一张无关的图静默带进新会话。判成不干净就会另开一个标签，
-    /// 图片留在原处——既不串台，也不丢用户已经做过的操作。
-    fn is_pristine(slot: &SessionUiState) -> bool {
+    /// 「干净」的判据是**用户往里放过东西没有**：会话、历史、附件、草稿文字，任何一样
+    /// 都算用过。放过东西却被当成空白复用，就是把用户的输入静默丢掉或串进新会话。
+    ///
+    /// 草稿走 `draft_slot_key`，因此调用前必须先 `save_current_draft` ——
+    /// composer 是全窗口一个，内容只有存下来之后才落在这个标签自己身上。
+    fn is_focused_tab_pristine(&self) -> bool {
+        let slot = &self.sessions[self.focused];
         slot.session.is_none()
             && slot.draft_key.is_none()
             && slot.attachments.is_empty()
             && matches!(slot.status, ChatStatus::Empty)
+            && self.drafts.get(&slot.draft_slot_key()).text.is_empty()
     }
 
     /// 开一个新标签，返回它的下标。
@@ -635,7 +653,10 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<usize, String> {
-        if Self::is_pristine(&self.sessions[self.focused]) {
+        // 先存草稿再判断：判据要看「用户往这个标签里放过东西没有」，而 composer 的
+        // 内容只有存下来之后才在标签自己身上。
+        self.save_current_draft(cx);
+        if self.is_focused_tab_pristine() {
             let index = self.focused;
             self.sessions[index].tab_title = title;
             return Ok(index);
@@ -645,7 +666,6 @@ impl ChatPanel {
                 "最多同时打开 {MAX_SESSION_TABS} 个会话标签；请先关闭一个再试"
             ));
         }
-        self.save_current_draft(cx);
         self.suspend_foreground_dialog(window, cx);
         let tab_id = self.allocate_tab_id();
         let mut slot = SessionUiState::new(tab_id, new_list_state(tab_id, cx.weak_entity()));
@@ -709,7 +729,7 @@ impl ChatPanel {
     }
 
     /// 关闭一个标签：注销会话（进程随之回收），标签从条上摘掉。
-    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.sessions.len() {
             return;
         }
@@ -1039,17 +1059,12 @@ impl ChatPanel {
     }
 
     fn save_current_draft(&mut self, cx: &App) {
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        let key = self.draft_slot_key();
+        self.drafts.set(key, self.current_draft(cx));
     }
 
     fn prepare_draft_restore(&mut self) {
-        let draft = self
-            .draft_key
-            .as_deref()
-            .map(|key| self.drafts.get(key))
-            .unwrap_or_default();
+        let draft = self.drafts.get(&self.draft_slot_key());
         self.pending_draft_restore = true;
         self.attachments = draft
             .images
@@ -1718,11 +1733,10 @@ impl ChatPanel {
                         self.rpc_success = None;
                         let mut restored_draft = false;
                         if should_restore_submission(kind)
-                            && let (Some(key), Some(submission)) =
-                                (self.draft_key.clone(), submission)
+                            && let Some(submission) = submission
                         {
                             let restored = self.drafts.restore_submission(
-                                &key,
+                                &self.draft_slot_key(),
                                 pi_data::ComposerDraft {
                                     text: submission.message,
                                     images: submission.images,
@@ -1910,9 +1924,7 @@ impl ChatPanel {
         if let Some(text) = self.extension_ui.take_editor_text() {
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));
-            if let Some(key) = self.draft_key.clone() {
-                self.drafts.set(key, self.current_draft(cx));
-            }
+            self.save_current_draft(cx);
         }
         if self.extension_dialog_needs_close {
             return;
@@ -2430,7 +2442,7 @@ impl ChatPanel {
             ControlOutcome::Forked { data, controls } => {
                 self.apply_session_rebind(controls);
                 self.drafts.set(
-                    self.draft_key.clone().unwrap_or_default(),
+                    self.draft_slot_key(),
                     pi_data::ComposerDraft {
                         text: data.text,
                         images: Vec::new(),
@@ -2447,7 +2459,7 @@ impl ChatPanel {
             } => {
                 if let Some(data) = fork_data {
                     self.drafts.set(
-                        self.draft_key.clone().unwrap_or_default(),
+                        self.draft_slot_key(),
                         pi_data::ComposerDraft {
                             text: data.text,
                             images: Vec::new(),
@@ -2825,9 +2837,7 @@ impl ChatPanel {
         if self.pending_draft_restore {
             self.pending_draft_restore = false;
         }
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        self.save_current_draft(cx);
         let input = input.read(cx);
         self.refresh_popup_for_value(input.value().as_ref(), input.cursor());
         cx.notify();
@@ -3018,9 +3028,7 @@ impl ChatPanel {
         input.update(cx, |input, cx| input.set_value("", window, cx));
         self.attachments.clear();
         self.popup = None;
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.clear(&key);
-        }
+        self.drafts.clear(&self.draft_slot_key());
         cx.notify();
     }
 
@@ -3104,9 +3112,7 @@ impl ChatPanel {
         pi_data::validate_image_batch(self.attachments.len(), &images)?;
         self.attachments
             .extend(images.into_iter().filter_map(attachment_from_draft));
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        self.save_current_draft(cx);
         self.rpc_success = None;
         self.rpc_error = None;
         Ok(())
@@ -3146,9 +3152,7 @@ impl ChatPanel {
     fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.attachments.len() {
             self.attachments.remove(index);
-            if let Some(key) = self.draft_key.clone() {
-                self.drafts.set(key, self.current_draft(cx));
-            }
+            self.save_current_draft(cx);
             cx.notify();
         }
     }
@@ -3588,11 +3592,7 @@ impl Render for ChatPanel {
                 .is_some_and(SessionHandle::is_quiescent);
         if self.pending_draft_restore {
             let input = self.composer.clone();
-            let text = self
-                .draft_key
-                .as_deref()
-                .map(|key| self.drafts.get(key).text)
-                .unwrap_or_default();
+            let text = self.drafts.get(&self.draft_slot_key()).text;
             input.update(cx, |input, cx| input.set_value(text, window, cx));
             self.pending_draft_restore = false;
         }
@@ -6940,6 +6940,44 @@ mod tests {
         });
     }
 
+    /// 第五轮独立审查 P2：留在空标签上的草稿文字不能丢。
+    ///
+    /// 空标签没有 `draft_key`（那是 pi 会话身份），从前草稿就无处可存：
+    /// 写了字 → 去开别的标签 → 切回来，字没了。现在每个标签从诞生起就有草稿落点。
+    #[gpui::test]
+    fn text_typed_on_an_empty_tab_survives_a_detour_to_another_tab(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                assert!(panel.draft_key.is_none(), "空标签没有会话身份");
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("还没想好发给谁的一段话", window, cx);
+                });
+                // 写过字就不算没用过：这个标签不该被当成空白复用。
+                panel.save_current_draft(cx);
+                assert!(!panel.is_focused_tab_pristine());
+
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("另开一个标签");
+                assert_eq!(panel.sessions.len(), 2);
+                assert_eq!(panel.composer.read(cx).value().as_ref(), "");
+
+                panel.focus_tab(0, window, cx);
+            });
+        });
+        // 草稿回填发生在渲染时（`pending_draft_restore`）。
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.composer.read(cx).value().as_ref(),
+                "还没想好发给谁的一段话",
+                "切走再切回来，空标签上的字必须还在"
+            );
+        });
+    }
+
     /// 第二轮独立审查 P2：空标签上挂着的附件不能被静默带进新会话。
     ///
     /// 这类附件没有 `draft_key` 可存，复用这个标签就等于把一张无关的图带进新会话；
@@ -6950,7 +6988,7 @@ mod tests {
         visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 // 干净的空标签会被原地复用，不长出第二个标签。
-                assert!(ChatPanel::is_pristine(&panel.sessions[0]));
+                assert!(panel.is_focused_tab_pristine());
 
                 let draft = pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\ncarry".to_vec())
                     .expect("fixture png");
@@ -6958,10 +6996,7 @@ mod tests {
                     .add_draft_images(vec![draft], cx)
                     .expect("挂一张图到空标签上");
                 assert_eq!(panel.attachments.len(), 1);
-                assert!(
-                    !ChatPanel::is_pristine(&panel.sessions[0]),
-                    "挂了附件就不算没用过"
-                );
+                assert!(!panel.is_focused_tab_pristine(), "挂了附件就不算没用过");
 
                 let opened = panel
                     .open_tab("新会话".to_owned(), window, cx)
