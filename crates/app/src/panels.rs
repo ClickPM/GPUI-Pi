@@ -1029,6 +1029,16 @@ impl ChatPanel {
         self.rpc_error_protected = false;
     }
 
+    /// 这个标签是不是正在交出进程？
+    ///
+    /// Park / Stop 会把正在执行的元数据请求连同 client 一起抽走，那几条 `get_state` /
+    /// `get_commands` 必然超时（实测「加载会话控制失败：request req_5 timed out」）。
+    /// 用户刚点了「挂起」，进程没了正是他要的结果，不是需要他处理的故障——
+    /// 报出来只会让一次正常操作看起来失败了，而且横幅一进一出还会顶得 composer 跳行。
+    fn is_tearing_down(&self) -> bool {
+        self.scheduler_job.is_some() || self.active.is_none()
+    }
+
     fn set_host_extension_degradation(&mut self, diagnostic: Option<&str>) {
         self.host_extension_degradation = diagnostic.map(str::to_owned);
     }
@@ -1660,6 +1670,8 @@ impl ChatPanel {
                         self.slash_commands = commands;
                         self.refresh_popup_without_input();
                     }
+                    // 拆除期间的元数据失败是交出进程的必然产物，不是故障。
+                    Err(_) if self.is_tearing_down() => {}
                     Err(error) => {
                         self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("加载 slash 命令失败：{error}"));
@@ -1682,6 +1694,7 @@ impl ChatPanel {
                         }
                         self.apply_controls(controls);
                     }
+                    Err(_) if self.is_tearing_down() => {}
                     Err(error) => {
                         self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("加载会话控制失败：{error}"));
@@ -6773,6 +6786,47 @@ mod tests {
         // 排队优先于「已登记」：这一格按钮此刻没有任何可执行的动作。
         assert_eq!(start_action_copy(true, true).0, "排队中…");
         assert!(start_action_copy(true, true).1.contains("自动启动"));
+    }
+
+    /// 视觉审查 V-6：挂起过程中不该闪一条红色「加载会话控制失败」。
+    ///
+    /// Park 会把在执行的元数据请求连同 client 一起抽走，那几条必然超时；用户刚点了
+    /// 「挂起」，这正是他要的结果。实测在 2 活跃 + 1 排队场景下能看到
+    /// 「加载会话控制失败：request req_5 timed out」一闪而过。
+    #[gpui::test]
+    fn teardown_metadata_failures_are_not_reported_as_errors(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        let controls_error = |sequence: u64| pi_runtime::RuntimeEffect {
+            sequence,
+            epoch: 0,
+            kind: pi_runtime::RuntimeEffectKind::ControlsLoaded(Err(
+                "request req_5 timed out".to_owned()
+            )),
+        };
+        let commands_error = |sequence: u64| pi_runtime::RuntimeEffect {
+            sequence,
+            epoch: 0,
+            kind: pi_runtime::RuntimeEffectKind::CommandsLoaded(Err(
+                "request req_2 timed out".to_owned()
+            )),
+        };
+
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                // 正在挂起：两条元数据失败都不该出横幅。
+                panel.scheduler_job = Some("挂起中…");
+                panel.apply_runtime_effect(controls_error(1), cx);
+                panel.apply_runtime_effect(commands_error(2), cx);
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+
+                // 挂起落地、已经没有 Runtime 了：迟到的失败同样不该出横幅，
+                // 它已经无法据以行动。
+                panel.scheduler_job = None;
+                assert!(panel.active.is_none());
+                panel.apply_runtime_effect(controls_error(3), cx);
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
     }
 
     #[test]
