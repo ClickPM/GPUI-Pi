@@ -303,6 +303,25 @@ P2-2 有回归测试 `an_attachment_on_the_empty_tab_keeps_it_from_being_reused`
 > 其中**至少 3 条是我自己引入的回归**（续体串台、fresh 会话文件索引代次、只收敛了一半的桥），
 > 说明「实现完 → validate 全绿」远不等于可以收口。
 
+### 第四轮独立代码审查与整改
+
+Codex thread `01a0388a-369d-7542-ba59-16a05eb67ece`。结论：**3 项 P2**，核对源码后确认**全部成立**。
+其中两条是第三轮整改自己带出来的新问题——修一个同步问题时只覆盖了部分入口。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P2 | 标签已达上限时再从侧栏选会话，`load_selection` 只在自己身上留一条错误就返回，而 `Workspace` **已经无条件**把工具栏、文件浏览器和工作区根切到了那个被拒绝的会话——聊天还在旧会话，工作区却指向新的 | `load_selection` 改为返回 `Result`；`Workspace` 先让聊天面板受理，被拒就弹通知并原样返回，不搬任何根目录 | 在 `the_tab_strip_is_bounded_and_refuses_instead_of_evicting` 里补断言 |
+| P2 | `open_tab` 换 `focused` 时没有 `apply_window_title`。新标签的 `window_title` 是初值 `GPUI-Pi`，而窗口上挂的可能是上一个会话由 Extension UI 设的标题；`process_extension_ui` 只在「与本标签记录值不同」时才写窗口，两者恰好相等就永远不会纠正，旧标题一直挂着 | `open_tab` 无条件写一次窗口标题。这与第三轮给 `focus_tab` / `close_tab` 补的是同一条修复——当时漏了 `open_tab` 这个入口 | 无：`window.set_window_title` 在 GPUI 测试里没有可读回的观测点。按「所有改 `focused` 的路径都必须 `apply_window_title`」的不变量收敛，三个入口现已齐全 |
+| P2 | 两个标签同属一个项目时，`FocusedSessionChanged` 里的 `cwd` 相同，第三轮加的「目录没变就短路」会连**标题状态**一起跳过，于是工具栏一直显示上一个会话的名字 | 标题状态改为无条件跟上，短路只跳过昂贵的文件树重建；同时把工具栏标题的数据源从「侧栏最近选中的那一条」换成「前台会话标签」（`focused_session`），并让事件带上 `title` / `session_key` | `the_toolbar_title_follows_the_focused_tab_within_one_project` |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **142 passed**。
+
+> 四轮共 **10 条 findings，全部成立、全部整改**。分布很说明问题：
+> 首轮 2、二轮 2、三轮 3、四轮 3——**数量没有随轮次收敛**，因为每一轮的整改本身都会引入新的
+> 待审面。真正收敛的是性质：前两轮是「实现里的洞」，后两轮是「修复覆盖不全」（同一条修复漏了某个入口、
+> 同一类结构只收敛了一半）。这一点值得写进后续轮次的经验：**findings 驱动的整改必须重新过审**，
+> 而且要专门检查「这条修复的同类入口是不是都覆盖了」。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

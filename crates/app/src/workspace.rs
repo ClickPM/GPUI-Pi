@@ -36,7 +36,12 @@ pub struct Workspace {
     main_panel: gpui::Entity<MainPanel>,
     model_config: gpui::Entity<ModelConfigPanel>,
     selected_directory: Option<PathBuf>,
-    selected_session: Option<SessionSelected>,
+    /// 前台会话标签的身份，工具栏标题只认它。
+    ///
+    /// 不再用「侧栏最近选中的那一条」：标签条是第二个切会话入口，走它切换时侧栏
+    /// 根本没有事件，标题就会一直停在别的会话上。所有会改变前台标签的路径
+    /// （侧栏选择、新建会话、切标签、关标签）都会广播 `FocusedSessionChanged`。
+    focused_session: Option<FocusedSessionChanged>,
     _appearance_subscription: Subscription,
     _session_subscription: Subscription,
     _new_session_subscription: Subscription,
@@ -150,11 +155,20 @@ impl Workspace {
             &sidebar,
             window,
             move |workspace, _, event: &SessionSelected, window, cx| {
+                // 先让聊天面板受理；被拒（例如标签已达上限）就不能搬工作区，
+                // 否则会出现「聊天还在旧会话、文件树已经跳到被拒绝的那个」。
+                if let Err(error) = chat_panel.update(cx, |panel, cx| {
+                    panel.load_selection(event.clone(), window, cx)
+                }) {
+                    window.push_notification(
+                        gpui_component::notification::Notification::error(format!(
+                            "打开会话失败：{error}"
+                        )),
+                        cx,
+                    );
+                    return;
+                }
                 workspace.selected_directory = Some(event.cwd.clone());
-                workspace.selected_session = Some(event.clone());
-                chat_panel.update(cx, |panel, cx| {
-                    panel.load_selection(event.clone(), window, cx);
-                });
                 file_panel.update(cx, |panel, cx| {
                     panel.set_root(Some(event.cwd.clone()), window, cx);
                 });
@@ -177,7 +191,6 @@ impl Workspace {
                 }) {
                     Ok(()) => {
                         workspace.selected_directory = Some(event.cwd.clone());
-                        workspace.selected_session = None;
                         fresh_files.update(cx, |panel, cx| {
                             panel.set_root(Some(event.cwd.clone()), window, cx);
                         });
@@ -216,14 +229,18 @@ impl Workspace {
             &chat,
             window,
             move |workspace, _, event: &FocusedSessionChanged, window, cx| {
+                // 标题状态**无条件**跟上：两个标签同属一个项目时下面的目录短路会生效，
+                // 但前台会话确实换了，标题不跟就会一直显示另一个会话的名字。
+                workspace.focused_session = Some(event.clone());
                 let Some(cwd) = event.cwd.clone() else {
+                    cx.notify();
                     return;
                 };
-                // 已经指着同一个目录就别再重建一次文件树：切标签是高频操作。
+                // 目录没变就别再重建一次文件树：切标签是高频操作。
                 if workspace.selected_directory.as_deref() == Some(cwd.as_path()) {
+                    cx.notify();
                     return;
                 }
-                workspace.selected_session = None;
                 workspace.apply_browsing_root(cwd, window, cx);
             },
         );
@@ -235,7 +252,7 @@ impl Workspace {
             main_panel: workspace,
             model_config,
             selected_directory: None,
-            selected_session: None,
+            focused_session: None,
             _appearance_subscription: appearance_subscription,
             _session_subscription: session_subscription,
             _new_session_subscription: new_session_subscription,
@@ -323,7 +340,6 @@ impl Workspace {
             let _ = cx.update(|window, cx| {
                 let _ = workspace.update(cx, |workspace, cx| {
                     workspace.selected_directory = Some(path.clone());
-                    workspace.selected_session = None;
                     workspace.file_explorer.update(cx, |panel, cx| {
                         panel.set_root(Some(path.clone()), window, cx);
                     });
@@ -342,7 +358,7 @@ impl Workspace {
     }
 
     fn tab_label(&self) -> SharedString {
-        self.selected_session.as_ref().map_or_else(
+        self.focused_session.as_ref().map_or_else(
             || {
                 self.selected_directory
                     .as_deref()
@@ -360,9 +376,14 @@ impl Workspace {
     }
 
     fn tab_tooltip(&self) -> SharedString {
-        self.selected_session.as_ref().map_or_else(
+        self.focused_session.as_ref().map_or_else(
             || self.directory_tooltip(),
-            |session| format!("{}\n{}", session.id, session.cwd.display()).into(),
+            |session| match (&session.session_key, &session.cwd) {
+                (Some(key), Some(cwd)) => format!("{key}\n{}", cwd.display()).into(),
+                (Some(key), None) => key.clone().into(),
+                (None, Some(cwd)) => cwd.display().to_string().into(),
+                (None, None) => session.title.clone().into(),
+            },
         )
     }
 }
@@ -607,6 +628,56 @@ mod tests {
             assert_eq!(
                 workspace.file_explorer.read(cx).root_for_test(),
                 Some(second.as_path())
+            );
+        });
+    }
+
+    /// 第四轮独立审查 P2：两个标签同属一个项目时，工具栏标题也必须跟着前台会话走。
+    ///
+    /// 目录没变会走「跳过重建文件树」的短路，但前台会话确实换了；标题不跟就会一直
+    /// 显示另一个会话的名字，而下面已经是别人的对话了。
+    #[gpui::test]
+    fn the_toolbar_title_follows_the_focused_tab_within_one_project(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("test font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let window = cx.open_window(size(px(1200.), px(800.)), move |window, cx| {
+            let workspace =
+                cx.new(|cx| Workspace::new_with_probe(window, cx, LayoutProbe::default()));
+            *output.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = captured.borrow().clone().unwrap();
+        let shared = PathBuf::from("C:/fixture/one-project");
+        let chat = workspace.read_with(cx, |workspace, cx| {
+            workspace.main_panel.read(cx).chat_for_test().clone()
+        });
+
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                // 两个标签、同一个目录、不同标题。
+                chat.open_two_tabs_for_test(shared.clone(), shared.clone(), window, cx);
+                chat.set_tab_titles_for_test("会话甲", "会话乙");
+                chat.focus_tab(0, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tab_label().as_ref(), "会话甲");
+        });
+
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| chat.focus_tab(1, window, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.tab_label().as_ref(),
+                "会话乙",
+                "同项目内切标签，标题也必须跟着走"
             );
         });
     }

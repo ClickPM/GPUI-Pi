@@ -54,6 +54,10 @@ pub struct SessionsChanged;
 pub struct FocusedSessionChanged {
     /// 该标签的工作目录；纯历史预览尚未确定目录时为 `None`。
     pub cwd: Option<PathBuf>,
+    /// 该标签的显示标题，供工作区工具栏使用。
+    pub title: String,
+    /// pi 会话身份，供 tooltip 使用；fresh 会话落盘前没有。
+    pub session_key: Option<String>,
 }
 
 /// 同时打开的会话标签上限。
@@ -652,6 +656,10 @@ impl ChatPanel {
         self.cursor = index;
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
+        // 新标签的 `window_title` 是初值 "GPUI-Pi"，而窗口上挂的可能是上一个会话
+        // 由 Extension UI 设的标题。`process_extension_ui` 只在「与本标签记录值不同」
+        // 时才写窗口，两者恰好相等就永远不会纠正——必须在这里无条件写一次。
+        self.apply_window_title(window);
         Ok(index)
     }
 
@@ -685,6 +693,8 @@ impl ChatPanel {
     fn emit_focused_session(&mut self, cx: &mut Context<Self>) {
         cx.emit(FocusedSessionChanged {
             cwd: self.composer_cwd.clone(),
+            title: self.tab_title.clone(),
+            session_key: self.draft_key.clone(),
         });
     }
 
@@ -992,6 +1002,12 @@ impl ChatPanel {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_tab_titles_for_test(&mut self, first: &str, second: &str) {
+        self.sessions[0].tab_title = first.to_owned();
+        self.sessions[1].tab_title = second.to_owned();
+    }
+
+    #[cfg(test)]
     pub(crate) fn composer_value_for_test(&self, cx: &App) -> String {
         self.composer.read(cx).value().to_string()
     }
@@ -1116,22 +1132,19 @@ impl ChatPanel {
         selection: SessionSelected,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         if let Some(index) = self.slot_index_for_key(&selection.id) {
             self.focus_tab(index, window, cx);
-            return;
+            return Ok(());
         }
-        let index = match self.open_tab(selection.title.clone(), window, cx) {
-            Ok(index) => index,
-            Err(error) => {
-                self.rpc_error_protected = true;
-                self.rpc_error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
+        // 失败必须交回调用方：工作区会跟着这次选择去搬文件树和工具栏标题，
+        // 这里只在自己身上留一条错误的话，界面就会「聊天还在旧会话、工作区已经
+        // 指向被拒绝的那个」。
+        let index = self.open_tab(selection.title.clone(), window, cx)?;
         self.load_history_into(index, selection, cx);
+        self.emit_focused_session(cx);
         cx.notify();
+        Ok(())
     }
 
     /// 把一份历史会话装进指定标签。调用方保证该标签已经是干净的。
@@ -1229,6 +1242,7 @@ impl ChatPanel {
         };
         self.start_file_index(tab_id, load_generation, cwd, cx);
         self.bind_session(index, descriptor, document, window, cx);
+        self.emit_focused_session(cx);
         cx.notify();
         Ok(())
     }
@@ -6502,19 +6516,23 @@ mod tests {
         visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 let first = fixture_selection("alpha", "Alpha", workspace.path());
-                panel.load_selection(first.clone(), window, cx);
+                panel
+                    .load_selection(first.clone(), window, cx)
+                    .expect("首个标签");
                 assert_eq!(panel.sessions.len(), 1, "干净标签被原地复用");
                 assert_eq!(panel.draft_key.as_deref(), Some("alpha"));
 
-                panel.load_selection(
-                    fixture_selection("beta", "Beta", workspace.path()),
-                    window,
-                    cx,
-                );
+                panel
+                    .load_selection(
+                        fixture_selection("beta", "Beta", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("第二个标签");
                 assert_eq!(panel.sessions.len(), 2);
                 assert_eq!(panel.focused, 1);
 
-                panel.load_selection(first, window, cx);
+                panel.load_selection(first, window, cx).expect("切回第一个");
                 assert_eq!(panel.sessions.len(), 2, "重复选中不得再开一个标签");
                 assert_eq!(panel.focused, 0);
             });
@@ -6542,6 +6560,17 @@ mod tests {
                 assert!(refused.contains(&MAX_SESSION_TABS.to_string()), "{refused}");
                 assert_eq!(panel.sessions.len(), MAX_SESSION_TABS, "失败不得动已有标签");
                 assert_eq!(panel.focused, MAX_SESSION_TABS - 1);
+
+                // 第四轮独立审查 P2：失败必须交回调用方。工作区会跟着这次选择去搬
+                // 文件树和工具栏标题，只在自己身上留一条错误的话，界面就会
+                // 「聊天还在旧会话、工作区已经指向被拒绝的那个」。
+                let overflow = panel.load_selection(
+                    fixture_selection("overflow", "溢出会话", std::path::Path::new("C:/fixture")),
+                    window,
+                    cx,
+                );
+                assert!(overflow.is_err(), "标签已满时选择必须返回 Err");
+                assert_eq!(panel.sessions.len(), MAX_SESSION_TABS);
             });
         });
     }
