@@ -64,11 +64,20 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 
 ## 代码审查工具路由
 
-- **本节只约束已有代码改动的独立审查通道**：不规定实现阶段由主会话还是子代理承担，也不得据此改变模型基于任务、能力与当前上下文自主选择的任务拆解、委派策略或 writer。使用 `claude-code-review` 不代表主会话必须充当 writer，也不降低 worker、scout 等子代理在实现阶段的可用性或优先级。
+- **本节只约束已有代码改动的独立审查通道**：不规定实现阶段由主会话还是子代理承担，也不得据此改变模型基于任务、能力与当前上下文自主选择的任务拆解、委派策略或 writer。无论调用 `claude-code-review` 还是 codex 插件的审查命令，都不代表主会话必须充当 writer，也不降低 worker、scout 等子代理在实现阶段的可用性或优先级。
 - 当已有代码改动需要独立代码审查时，按开发 harness 选择审查通道：
   - 使用 **pi harness** 时：优先调用 `claude-code-review`（独立 Claude Code 子进程，只读审查，默认 `scope=working`）；若 `claude-code-review` 不可用（未登记、鉴权/限流不可用、启动失败等），降级派发 pi-subagents 的 `reviewer` 子代理，走下方「pi-subagents 审查路径」；
-  - 使用 **Claude Code / codex** 时：**不适用上述路由规则**，代码审查按对应 harness 自身的流程执行。
+  - 使用 **Claude Code harness** 时：优先走 **codex 插件**（`codex@openai-codex`）做独立代码审查，走下方「codex 插件审查路径」；只有该路径确实不可用时才降级到 Claude Code 自带的 `/code-review`，并在轮次记录写明降级原因；
+  - 使用 **codex harness** 时：审查者与 writer 同源，本节路由不适用，代码审查按 codex 自身流程执行。
 - 审查器始终只读，并与当前 writer 隔离。主会话负责判断是否接受审查结论；需要修改代码时，保持审查前已经形成的 writer 归属：此前由主会话实现则由主会话修复，此前由 worker 实现则将 findings 交回同一 worker。审查工具的选择本身不得触发 writer 身份切换。
+
+### codex 插件审查路径（Claude Code harness 用）
+
+- 默认命令是 `/codex:review`（Codex 原生只读审查），可带 `--base <ref>`、`--scope auto|working-tree|branch`；需要质疑实现思路、设计取舍与假设，而不只是挑实现缺陷时，改用 `/codex:adversarial-review [focus...]`。两者都是 review-only、不改代码，天然满足「审查器只读」。
+- **这两个命令标了 `disable-model-invocation`，主会话无法自行触发**：主代理必须先把本轮 diff 收敛稳定（validate 已全绿），再在正文给出待运行的完整命令（含 scope 与 base）请用户手动输入。用户运行前不得声称代码审查已完成，也不得拿主会话自审冒充独立审查。
+- 改动超过 1–2 个文件时，交给用户的命令直接带 `--background`；随后用 `/codex:status` 看进度、`/codex:result <job-id>` 取完整结论。findings 必须按原文对齐处理，不得只留一句摘要就判通过。
+- 判定 codex 路径不可用只认硬失败：`/codex:setup` 报 Codex CLI 未安装/未登录、命令启动失败，或用户明确拒绝使用 codex 审查。此时才降级 `/code-review`；「等得久」「改动小」都不是降级理由。
+- `/codex:setup --enable-review-gate` 打开的 stop 时挑战式复查属于**补充信号**，不替代本节的独立代码审查门禁，也不能单独作为「代码审查通过」的依据。
 
 ### pi-subagents 审查路径（pi harness 降级用）
 
