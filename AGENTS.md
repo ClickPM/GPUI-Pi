@@ -76,8 +76,9 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 ### codex 插件审查路径（Claude Code harness 用）
 
 - 默认命令是 `/codex:review`（Codex 原生只读审查），可带 `--base <ref>`、`--scope auto|working-tree|branch`；需要质疑实现思路、设计取舍与假设，而不只是挑实现缺陷时，改用 `/codex:adversarial-review [focus...]`。两者都是 review-only、不改代码，天然满足「审查器只读」。
-- **这两个命令标了 `disable-model-invocation`，主会话无法自行触发**：主代理必须先把本轮 diff 收敛稳定（validate 已全绿），再在正文给出待运行的完整命令（含 scope 与 base）请用户手动输入。用户运行前不得声称代码审查已完成，也不得拿主会话自审冒充独立审查。
-- 改动超过 1–2 个文件时，交给用户的命令直接带 `--background`；随后用 `/codex:status` 看进度、`/codex:result <job-id>` 取完整结论。findings 必须按原文对齐处理，不得只留一句摘要就判通过。
+- **主会话能不能自己触发，以盘上那份命令定义为准，不以本文件为准**：codex 插件 **1.0.6 起** `review.md` / `adversarial-review.md` 的 `disable-model-invocation` 已是 `false`，主会话可直接调用；1.0.1 等旧版仍是 `true`。当前生效版本看 `~/.claude/plugins/installed_plugins.json` 里 `codex@openai-codex` 的 `installPath`，再读该目录下 `commands/review.md` 的 frontmatter——cache 里留存的旧版本目录和 `marketplaces/` 下的副本都可能是过期值，别拿它们判断。若装的确实是标 `true` 的版本，就退回「在正文给出完整命令（含 scope 与 base）请用户手动运行」。
+- **谁触发都不改变前置与判定**：主代理必须先把本轮 diff 收敛稳定（validate 已全绿）再发起审查；结论回来之前不得声称代码审查已完成，也不得拿主会话自审冒充独立审查。
+- 改动超过 1–2 个文件时直接带 `--background`；随后用 `/codex:status` 看进度、`/codex:result <job-id>` 取完整结论。findings 必须按原文对齐处理，不得只留一句摘要就判通过。
 - 判定 codex 路径不可用只认硬失败：`/codex:setup` 报 Codex CLI 未安装/未登录、命令启动失败，或用户明确拒绝使用 codex 审查。此时才降级 `/code-review`；「等得久」「改动小」都不是降级理由。
 - `/codex:setup --enable-review-gate` 打开的 stop 时挑战式复查属于**补充信号**，不替代本节的独立代码审查门禁，也不能单独作为「代码审查通过」的依据。
 
