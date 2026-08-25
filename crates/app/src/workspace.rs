@@ -18,7 +18,7 @@ use crate::main_panel::MainPanel;
 use crate::model_config::ModelConfigPanel;
 #[cfg(test)]
 use crate::panels::LayoutProbe;
-use crate::panels::{ChatPanel, SessionsChanged};
+use crate::panels::{ChatPanel, FocusedSessionChanged, SessionsChanged};
 use crate::session_sidebar::{
     NewSessionRequested, SessionSelected, SessionSidebar, WorktreeSelected,
 };
@@ -42,6 +42,8 @@ pub struct Workspace {
     _new_session_subscription: Subscription,
     _worktree_subscription: Subscription,
     _sessions_changed_subscription: Subscription,
+    /// 会话标签条切换前台会话时，把文件浏览器与工作区根目录一起切过去。
+    _focused_session_subscription: Subscription,
 }
 
 impl Workspace {
@@ -210,6 +212,22 @@ impl Workspace {
             },
         );
 
+        let focused_session_subscription = cx.subscribe_in(
+            &chat,
+            window,
+            move |workspace, _, event: &FocusedSessionChanged, window, cx| {
+                let Some(cwd) = event.cwd.clone() else {
+                    return;
+                };
+                // 已经指着同一个目录就别再重建一次文件树：切标签是高频操作。
+                if workspace.selected_directory.as_deref() == Some(cwd.as_path()) {
+                    return;
+                }
+                workspace.selected_session = None;
+                workspace.apply_browsing_root(cwd, window, cx);
+            },
+        );
+
         Self {
             dock_area,
             sidebar,
@@ -223,6 +241,7 @@ impl Workspace {
             _new_session_subscription: new_session_subscription,
             _worktree_subscription: worktree_subscription,
             _sessions_changed_subscription: sessions_changed_subscription,
+            _focused_session_subscription: focused_session_subscription,
         }
     }
 
@@ -530,6 +549,65 @@ mod tests {
                     Some(selected.as_path())
                 );
             });
+        });
+    }
+
+    /// 第三轮独立审查 P2：标签条切前台会话时，文件浏览器与工作区根目录必须跟着切。
+    ///
+    /// 多会话之后标签条成了第二个「切会话」入口，而这些面板原本只认侧栏事件。
+    /// 不同步就会出现「B 的对话配着 A 的文件树」，工作区操作还打在 A 上。
+    #[gpui::test]
+    fn switching_session_tabs_moves_the_workspace_roots(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            gpui_pi_ui::theme::init_fonts(cx).expect("test font init failed");
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = captured.clone();
+        let window = cx.open_window(size(px(1200.), px(800.)), move |window, cx| {
+            let workspace =
+                cx.new(|cx| Workspace::new_with_probe(window, cx, LayoutProbe::default()));
+            *output.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = captured.borrow().clone().unwrap();
+        let first = PathBuf::from("C:/fixture/project-a");
+        let second = PathBuf::from("C:/fixture/project-b");
+
+        let chat = workspace.read_with(cx, |workspace, cx| {
+            workspace.main_panel.read(cx).chat_for_test().clone()
+        });
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| {
+                chat.open_two_tabs_for_test(first.clone(), second.clone(), window, cx);
+                // 开完之后前台是第二个标签。
+                chat.focus_tab(0, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.selected_directory.as_ref(), Some(&first));
+            assert_eq!(
+                workspace.file_explorer.read(cx).root_for_test(),
+                Some(first.as_path()),
+                "文件浏览器必须跟着前台会话走"
+            );
+            assert_eq!(
+                workspace.main_panel.read(cx).root_for_test(),
+                Some(first.as_path())
+            );
+        });
+
+        let _ = window.update(cx, |_, window, cx| {
+            chat.update(cx, |chat, cx| chat.focus_tab(1, window, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.selected_directory.as_ref(), Some(&second));
+            assert_eq!(
+                workspace.file_explorer.read(cx).root_for_test(),
+                Some(second.as_path())
+            );
         });
     }
 

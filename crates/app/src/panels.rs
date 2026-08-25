@@ -45,6 +45,17 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionsChanged;
 
+/// 前台会话标签变了。
+///
+/// 多会话之后标签条成了第二个「切会话」入口，而文件浏览器、工作区根目录这些面板
+/// 只认侧栏与新建会话事件。不广播这条，切到另一个项目的标签就会出现
+/// 「B 的对话配着 A 的文件树」，工作区操作还打在 A 上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedSessionChanged {
+    /// 该标签的工作目录；纯历史预览尚未确定目录时为 `None`。
+    pub cwd: Option<PathBuf>,
+}
+
 /// 同时打开的会话标签上限。
 ///
 /// 常驻 pi 进程数由调度器兜底（`total_runtime_slots`），但**标签**另有代价：每个标签
@@ -647,7 +658,7 @@ impl ChatPanel {
     /// 切到另一个标签。
     ///
     /// 只动 UI 绑定：**不启动也不停止任何进程**。后台会话继续跑，这正是 R24 的核心承诺。
-    fn focus_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.sessions.len() || index == self.focused {
             return;
         }
@@ -666,7 +677,15 @@ impl ChatPanel {
         self.sync_scheduler_states();
         self.apply_window_title(window);
         self.process_extension_ui(window, cx);
+        self.emit_focused_session(cx);
         cx.notify();
+    }
+
+    /// 广播当前前台标签的身份，让工作区级面板跟着切过去。
+    fn emit_focused_session(&mut self, cx: &mut Context<Self>) {
+        cx.emit(FocusedSessionChanged {
+            cwd: self.composer_cwd.clone(),
+        });
     }
 
     /// 把窗口标题切到前台标签自己那一份。
@@ -721,6 +740,7 @@ impl ChatPanel {
         self.cursor = self.focused;
         self.prepare_draft_restore();
         self.apply_window_title(window);
+        self.emit_focused_session(cx);
         self.reconcile_scheduler(window, cx);
     }
 
@@ -952,6 +972,23 @@ impl ChatPanel {
         sender: std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>,
     ) {
         self.extension_response_sender = Some(sender);
+    }
+
+    /// 造两个各自绑定不同工作目录的标签，供工作区级同步的测试使用。
+    #[cfg(test)]
+    pub(crate) fn open_two_tabs_for_test(
+        &mut self,
+        first: PathBuf,
+        second: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft_key = Some("tab-one".to_owned());
+        self.composer_cwd = Some(first);
+        self.open_tab("二号".to_owned(), window, cx)
+            .expect("第二个标签");
+        self.draft_key = Some("tab-two".to_owned());
+        self.composer_cwd = Some(second);
     }
 
     #[cfg(test)]
@@ -1386,8 +1423,17 @@ impl ChatPanel {
     ) {
         let receiver = handle.subscribe_dirty();
         let tab_id = self.sessions[index].tab_id;
-        self.project(index, |panel| panel.install_active(handle));
+        self.project(index, |panel| {
+            panel.install_active(handle);
+            // 立刻拉一次：`subscribe_dirty` 只登记发送端，不补发当前修订号。
+            // 启动/热接管的元数据可能在我们订阅**之前**就跑完了，那几条 Dirty
+            // 发给了零个订阅者；不在这里补一次，这个标签就会一直没有模型、
+            // 没有 slash 命令、没有启动诊断，直到下一次运行时事件——空闲会话
+            // 可能永远等不到。
+            panel.pull_runtime_snapshot(cx);
+        });
         self.spawn_dirty_pump(tab_id, receiver, window.window_handle(), cx);
+        cx.notify();
     }
 
     fn install_active(&mut self, active: SessionHandle) {
@@ -1421,12 +1467,18 @@ impl ChatPanel {
         window_handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let (tx, mut rx) = mpsc::unbounded();
+        // 有界且合并，与调度器桥同一条规则。`Dirty` 只是「有变化了」的信号——
+        // `pull_runtime_snapshot` 回来会重新读一次完整 Snapshot，中间那些丢掉无损。
+        // 这里必须有界：多会话之后每个 Runtime 各有一条桥，一条无界队列会被会话数
+        // 乘一遍，正是 R22 要消灭的东西。
+        let (mut tx, mut rx) = mpsc::channel(0);
         std::thread::Builder::new()
             .name("pi-runtime-dirty-bridge".into())
             .spawn(move || {
-                while let Ok(dirty) = receiver.recv() {
-                    if tx.unbounded_send(dirty).is_err() {
+                while receiver.recv().is_ok() {
+                    if let Err(error) = tx.try_send(())
+                        && error.is_disconnected()
+                    {
                         break;
                     }
                 }
@@ -3333,6 +3385,7 @@ impl ChatPanel {
 impl EventEmitter<PanelEvent> for ChatPanel {}
 impl EventEmitter<crate::main_panel::OpenFileRequest> for ChatPanel {}
 impl EventEmitter<SessionsChanged> for ChatPanel {}
+impl EventEmitter<FocusedSessionChanged> for ChatPanel {}
 
 impl Focusable for ChatPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {

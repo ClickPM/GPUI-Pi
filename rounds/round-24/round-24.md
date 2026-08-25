@@ -285,6 +285,24 @@ P2-2 有回归测试 `an_attachment_on_the_empty_tab_keeps_it_from_being_reused`
 > 漏掉的 `unused_variables` 被 `validate` 的 `clippy -D warnings` 拦下。
 > **`cargo check` 不 deny warnings，不能替代 validate。**
 
+### 第三轮独立代码审查与整改
+
+第二轮的整改本身也没被审过，因此再跑一轮闭环。通道同前，Codex thread
+`01a03874-8c7e-7f80-b795-d4e80888f355`。结论：**1 项 P1 + 2 项 P2**，核对源码后确认**全部成立**。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P1 | 每个 Runtime 的 dirty 桥仍然用 `mpsc::unbounded()`。多会话之后每个运行中的会话各有一条桥，GPUI 执行器一卡，R22 的有界保证就被会话数乘一遍 | 改成 `mpsc::channel(0)` + `try_send`，与调度器桥同一条合并规则。`Dirty` 只是「有变化了」的信号，`pull_runtime_snapshot` 回来会重读完整 Snapshot，丢掉中间帧无损 | 无新增用例：与首轮 P2 同类的构造性收敛。**首轮我只把调度器桥收敛了，把这条同构的漏掉了**——两条桥形制不一致本身就是这次被抓的原因 |
+| P2 | `subscribe_dirty()` 只登记发送端、不补发当前修订号。启动或热接管的元数据可能在 `reconcile_scheduler` 订阅**之前**就跑完，那几条 Dirty 发给了零个订阅者；`install_active` 又不投影 Snapshot，于是这个标签一直没有模型、没有 slash 命令、没有启动诊断，空闲会话可能永远等不到下一次事件 | `attach_runtime` 装上句柄后立刻 `pull_runtime_snapshot` 补一次 | 见下 |
+| P2 | 两个标签属于不同工作目录时，切标签只更新了 `ChatPanel`；`Workspace.selected_directory`、文件浏览器根、`MainPanel` 根只认侧栏与新建会话事件。结果是「B 的对话配着 A 的文件树」，工作区操作还打在 A 上 | 新增 `FocusedSessionChanged { cwd }` 事件，`focus_tab` / `close_tab` 广播，`Workspace` 订阅后走既有的 `apply_browsing_root`；目录未变则跳过，切标签是高频操作 | `switching_session_tabs_moves_the_workspace_roots`（workspace 层端到端：切标签后浏览器根与工作区根都跟着走） |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **141 passed**
+（`model_service` 的已知 flake BACKLOG #27 偶发，重跑即过）。
+
+> 三轮审查的账：首轮 2 条、二轮 2 条、三轮 3 条，共 7 条 findings 全部成立、全部整改。
+> 其中**至少 3 条是我自己引入的回归**（续体串台、fresh 会话文件索引代次、只收敛了一半的桥），
+> 说明「实现完 → validate 全绿」远不等于可以收口。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在
