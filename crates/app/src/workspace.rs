@@ -344,6 +344,9 @@ impl Workspace {
             let _ = cx.update(|window, cx| {
                 let _ = workspace.update(cx, |workspace, cx| {
                     workspace.selected_directory = Some(path.clone());
+                    // 换项目就不再是「某个会话的工作区」了；不清掉，工具栏会继续
+                    // 显示上一个会话的名字，而下面浏览的已经是另一个项目。
+                    workspace.focused_session = None;
                     workspace.file_explorer.update(cx, |panel, cx| {
                         panel.set_root(Some(path.clone()), window, cx);
                     });

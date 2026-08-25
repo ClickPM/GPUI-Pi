@@ -739,6 +739,13 @@ impl ChatPanel {
         }
         // 关标签前先把这个标签欠 pi 的 Extension UI 响应结清；进程一旦回收就再也送不出去。
         self.project(index, |panel| panel.reset_extension_ui(window, cx));
+        // 匿名标签的草稿存在 `tab-{id}` 下，标签一走这个键就再也取不到了。
+        // 不清掉就是一条随开关次数增长的泄漏——带图片的草稿可能有几十 MB。
+        // 有 `draft_key` 的标签不动：它的草稿按 pi 会话身份存，重新打开还要用。
+        if self.sessions[index].draft_key.is_none() {
+            let orphan = self.sessions[index].draft_slot_key();
+            self.drafts.clear(&orphan);
+        }
         if let Some(session) = self.sessions[index].session.take() {
             // 标签立刻从条上摘掉，进程回收放后台：`remove_session` 要等优雅停机，
             // 随后的 `tick()` 还可能就地拉起一个排队会话，两者都不能占着 UI 线程。
@@ -1149,7 +1156,15 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if let Some(index) = self.slot_index_for_key(&selection.id) {
-            self.focus_tab(index, window, cx);
+            // 侧栏那边可能刚把这个会话改过名，标题以本次选择为准。
+            self.sessions[index].tab_title = selection.title.clone();
+            if index == self.focused {
+                // `focus_tab` 对「已经是前台」会直接返回，改名后的身份就发不出去了。
+                self.emit_focused_session(cx);
+                cx.notify();
+            } else {
+                self.focus_tab(index, window, cx);
+            }
             return Ok(());
         }
         // 失败必须交回调用方：工作区会跟着这次选择去搬文件树和工具栏标题，
@@ -6936,6 +6951,60 @@ mod tests {
                 assert!(panel.active.is_none());
                 panel.apply_runtime_effect(controls_error(3), cx);
                 assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第六轮独立审查 P2：重开一个已打开的会话要带上最新标题；关掉匿名标签要清草稿。
+    #[gpui::test]
+    fn reopening_a_renamed_session_updates_its_tab_and_closing_frees_its_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .load_selection(
+                        fixture_selection("alpha", "旧名字", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("首次打开");
+                assert_eq!(panel.tab_title, "旧名字");
+
+                // 侧栏改名之后再点同一行：标签标题必须跟着改，而不是停在旧名字。
+                panel
+                    .load_selection(
+                        fixture_selection("alpha", "新名字", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("重开同一个会话");
+                assert_eq!(panel.sessions.len(), 1, "同一个会话不该开成两个标签");
+                assert_eq!(panel.tab_title, "新名字");
+            });
+        });
+
+        // 匿名标签（没有会话身份）关掉之后，它的草稿键再也取不到，必须清掉。
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let opened = panel
+                    .open_tab("草稿标签".to_owned(), window, cx)
+                    .expect("再开一个匿名标签");
+                let orphan = panel.sessions[opened].draft_slot_key();
+                assert!(panel.sessions[opened].draft_key.is_none());
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("会被丢掉的草稿", window, cx);
+                });
+                panel.save_current_draft(cx);
+                assert!(!panel.drafts.get(&orphan).text.is_empty());
+
+                panel.close_tab(opened, window, cx);
+                assert!(
+                    panel.drafts.get(&orphan).text.is_empty(),
+                    "匿名标签关掉后，它那份取不回来的草稿必须一起清掉"
+                );
             });
         });
     }
