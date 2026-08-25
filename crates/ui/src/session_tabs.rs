@@ -49,12 +49,16 @@ impl SessionTabState {
 
     /// 状态点颜色。
     ///
-    /// S-10：状态色只上小圆点，不铺底、不铺边。没有进程的两个状态刻意走中性
-    /// `border`——`Parked` / `History` 不是异常，用 `warning` 会把「一切正常」染成
-    /// 一片黄色，状态色也就不再有分辨力。
+    /// S-10：状态色只上小圆点，不铺底、不铺边。没有进程的两个状态刻意走中性色——
+    /// `Parked` / `History` 不是异常，用 `warning` 会把「一切正常」染成一片黄色，
+    /// 状态色也就不再有分辨力。
+    ///
+    /// 中性色取 `muted_foreground`（规范 § 1.2 档 2「元信息、图标」）而**不是**
+    /// `border`：R24 视觉验收实测，`border` 的圆点在浅色主题下几乎与标签底色融为一体，
+    /// 只隐约看得出一个圆形轮廓。状态点是每个标签唯一的状态信号，看不见就等于没有。
     pub fn dot(self, cx: &App) -> Hsla {
         match self {
-            Self::History | Self::Parked => cx.theme().border,
+            Self::History | Self::Parked => cx.theme().muted_foreground,
             Self::Queued | Self::Starting | Self::Stopping => cx.theme().warning,
             Self::Running => cx.theme().success,
             Self::Failed => cx.theme().danger,

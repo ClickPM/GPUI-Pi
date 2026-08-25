@@ -428,6 +428,18 @@ fn tab_state_of(slot: &SessionUiState) -> gpui_pi_ui::SessionTabState {
     }
 }
 
+/// 主操作入口的文案。
+///
+/// 三态各说各的：没登记过是「启动」，登记过没进程是「恢复」，已经在排队则**什么都不用做**
+/// ——轮到它会自动启动，给一个可点的「恢复运行」只会让用户以为按钮没生效。
+const fn start_action_copy(queued: bool, registered: bool) -> (&'static str, &'static str) {
+    match (queued, registered) {
+        (true, _) => ("排队中…", "已在公平队列里等运行槽，轮到它会自动启动"),
+        (false, true) => ("恢复运行", "重新为该会话申请一个 pi 运行槽"),
+        (false, false) => ("启动活会话", "为这份历史启动官方 pi RPC 活会话"),
+    }
+}
+
 /// fresh 会话的标签标题。
 fn fresh_session_title(cwd: &Path) -> String {
     match cwd.file_name().and_then(std::ffi::OsStr::to_str) {
@@ -3450,7 +3462,11 @@ impl Render for ChatPanel {
             self.sessions.len() > 1 || self.sessions.iter().any(|slot| slot.session.is_some());
         let session_state_note = self.session_state_note(cx);
         // 会话已登记但没有进程时，主操作是「恢复运行」而不是「启动活会话」。
+        // 排队中的会话轮到就会**自动**启动：给它一个可点的「恢复运行」是在暗示
+        // 用户必须做点什么，而切到这个标签本身已经把它的优先级抬到前台了。
         let session_registered = self.session.is_some();
+        let session_queued = self.scheduler_state == Some(pi_runtime::SchedulerState::Queued);
+        let (start_label, start_tooltip) = start_action_copy(session_queued, session_registered);
         // 后台还有调度作业没落地时，两个入口都不接受点击：重复点击会叠出第二次
         // 进程操作，而第一次的结果还没回来。
         let scheduler_busy = self.scheduler_job.is_some();
@@ -4043,18 +4059,11 @@ impl Render for ChatPanel {
                                                 .debug_selector(|| "start-live-session".into())
                                                 .ghost()
                                                 .small()
-                                                .label(if session_registered {
-                                                    "恢复运行"
-                                                } else {
-                                                    "启动活会话"
-                                                })
-                                                .tooltip(if session_registered {
-                                                    "重新为该会话申请一个 pi 运行槽"
-                                                } else {
-                                                    "为这份历史启动官方 pi RPC 活会话"
-                                                })
+                                                .label(start_label)
+                                                .tooltip(start_tooltip)
                                                 .disabled(
-                                                    scheduler_busy
+                                                    session_queued
+                                                        || scheduler_busy
                                                         || self.control_operation.is_some()
                                                         || !matches!(
                                                             self.status,
@@ -6754,6 +6763,16 @@ mod tests {
                 assert!(panel.sessions.iter().all(|slot| slot.rpc_error.is_none()));
             });
         });
+    }
+
+    /// 视觉审查 V-3：排队中的会话不该给一个「恢复运行」按钮。
+    #[test]
+    fn a_queued_session_shows_that_it_will_start_by_itself() {
+        assert_eq!(start_action_copy(false, false).0, "启动活会话");
+        assert_eq!(start_action_copy(false, true).0, "恢复运行");
+        // 排队优先于「已登记」：这一格按钮此刻没有任何可执行的动作。
+        assert_eq!(start_action_copy(true, true).0, "排队中…");
+        assert!(start_action_copy(true, true).1.contains("自动启动"));
     }
 
     #[test]
