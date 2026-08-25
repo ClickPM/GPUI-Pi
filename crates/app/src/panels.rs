@@ -658,7 +658,22 @@ impl ChatPanel {
         self.save_current_draft(cx);
         if self.is_focused_tab_pristine() {
             let index = self.focused;
-            self.sessions[index].tab_title = title;
+            let tab_id = self.sessions[index].tab_id;
+            // **原地重建**，而不是只改个标题。
+            //
+            // 「pristine」只保证用户没往这个标签里放过东西，不保证槽里没有残留的
+            // 瞬时状态——比如往空标签里拖了一张非法图片：附件没加上，`rpc_error`
+            // 却留下了。只改标题就会把那条不相干的红色横幅带进新开的会话。
+            // 逐个字段去清就是在追着枚举，以后新增一个瞬时字段就漏一个；
+            // 直接换一份全新的槽，新增字段自动被覆盖。
+            let mut slot = SessionUiState::new(tab_id, new_list_state(tab_id, cx.weak_entity()));
+            slot.tab_title = title;
+            // 这三项是**用户偏好**不是瞬时状态：在空标签上先挑好工具预设 / 收起
+            // minimap 再开会话是正常用法，重建不该把它们抹掉。
+            slot.minimap_visible = self.sessions[index].minimap_visible;
+            slot.composer_mode = self.sessions[index].composer_mode;
+            slot.tool_preset = self.sessions[index].tool_preset;
+            self.sessions[index] = slot;
             return Ok(index);
         }
         if self.sessions.len() >= MAX_SESSION_TABS {
@@ -6951,6 +6966,45 @@ mod tests {
                 assert!(panel.active.is_none());
                 panel.apply_runtime_effect(controls_error(3), cx);
                 assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第七轮独立审查 P2：复用空白标签时，槽里的瞬时状态必须一并清掉。
+    ///
+    /// 往空标签里拖一张非法图片：附件没加上，`rpc_error` 却留下了，而这仍然满足
+    /// 「用户没往里放过东西」。只改标题就复用，那条不相干的红色横幅会跟进新会话。
+    #[gpui::test]
+    fn reusing_the_pristine_tab_drops_its_leftover_error(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 用户偏好先设好，重建不该把它抹掉。
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                panel.minimap_visible = false;
+
+                // 一次失败的拖入：只留下错误，没有附件。
+                panel.rpc_error = Some("无法识别的图片格式".to_owned());
+                panel.rpc_error_protected = true;
+                assert!(
+                    panel.is_focused_tab_pristine(),
+                    "只留了个错误横幅，仍然算没往里放过东西"
+                );
+
+                let index = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("复用空白标签");
+                assert_eq!(index, 0, "干净标签仍然原地复用");
+                assert!(
+                    panel.rpc_error.is_none(),
+                    "上一段的错误不得跟进新会话：{:?}",
+                    panel.rpc_error
+                );
+                assert!(!panel.rpc_error_protected);
+                assert_eq!(panel.tab_title, "新会话");
+                // 偏好留下。
+                assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
+                assert!(!panel.minimap_visible);
             });
         });
     }
