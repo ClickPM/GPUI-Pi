@@ -682,3 +682,173 @@ fn park_to_warm_and_resume_via_switch_session_hold_against_real_pi() {
         "zero-token park/resume test wrote into the temporary cwd"
     );
 }
+
+/// R24：两个真实 pi 会话同时在跑，各自独立；切前台不动后台，关一个才让排队的补位。
+///
+/// 全程零 token —— 只走 `get_commands` / `get_state`，从不发 prompt。
+#[test]
+#[ignore = "requires PI_RUNTIME_TEST_BINARY=official pi 0.84.2"]
+fn two_real_pi_sessions_run_in_parallel_and_survive_foreground_switches() {
+    let binary = configured_binary();
+    assert_pinned_version(&binary);
+    assert!(
+        env::var_os("PI_CODING_AGENT_SESSION_DIR").is_none(),
+        "unset PI_CODING_AGENT_SESSION_DIR before running this isolation test"
+    );
+
+    let temp = tempfile::tempdir().expect("failed to create isolated runtime test root");
+    let agent_dir = temp.path().join("agent");
+    let cwd = temp.path().join("project");
+    let sessions_dir = agent_dir.join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+
+    let clock = Arc::new(FakeClock::new());
+    let injected: Arc<dyn Clock> = clock.clone();
+    let limits = SchedulerLimits {
+        user_session_slots: 2,
+        total_runtime_slots: 3,
+        warm_idle: 0,
+        idle_ttl: Duration::from_secs(180),
+        queue_capacity: 8,
+        aging_step: Duration::from_secs(5),
+    };
+    let manager = RuntimeManager::with_test_clock(
+        RuntimeLimits {
+            scheduler: limits,
+            ..RuntimeLimits::default()
+        },
+        injected,
+    );
+    let mut subscription = manager.subscribe_scheduler();
+    let notices = subscription.take_receiver().expect("receiver");
+
+    let descriptor = |path: &Path| SessionDescriptor {
+        binary: binary.clone(),
+        cwd: cwd.clone(),
+        session_path: Some(path.to_path_buf()),
+        tool_preset: ToolPreset::Inherit,
+        agent_dir: Some(agent_dir.clone()),
+    };
+
+    let files: Vec<PathBuf> = ["r24-a", "r24-b", "r24-c"]
+        .iter()
+        .map(|name| {
+            let path = sessions_dir.join(format!("{name}.jsonl"));
+            fs::write(&path, "").unwrap();
+            path
+        })
+        .collect();
+    let sessions: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            manager.create_session(
+                descriptor(path),
+                empty_document(&format!("r24-{index}"), &cwd),
+            )
+        })
+        .collect();
+
+    // ---- 两个会话同时冷启动 ----
+    let handle_a = manager
+        .request_run(sessions[0], Priority::FOREGROUND)
+        .unwrap_or_else(|error| panic!("A cold start failed: {error}"))
+        .expect("a free run slot must be available");
+    let dirty_a = handle_a.subscribe_dirty();
+    let handle_b = manager
+        .request_run(sessions[1], Priority::FOREGROUND)
+        .unwrap_or_else(|error| panic!("B cold start failed: {error}"))
+        .expect("a second run slot must be available");
+    let dirty_b = handle_b.subscribe_dirty();
+
+    let (_, controls_a) = wait_for_controls(&handle_a, &dirty_a, "session A");
+    let (_, controls_b) = wait_for_controls(&handle_b, &dirty_b, "session B");
+    assert_ne!(
+        controls_a.session_id, controls_b.session_id,
+        "两个会话必须绑到不同的 pi 会话"
+    );
+
+    let pid_a = handle_a.process_id().expect("A pid");
+    let pid_b = handle_b.process_id().expect("B pid");
+    assert_ne!(pid_a, pid_b, "两个会话必须是两个真实进程");
+    let report = manager.scheduler_report();
+    assert_eq!(report.running, 2);
+    assert_eq!(report.resident_pi, 2);
+    assert!(report.resident_pi <= limits.total_runtime_slots);
+
+    // ---- 第三个会话没有运行槽，必须排队而不是挤掉别人 ----
+    assert!(
+        manager
+            .request_run(sessions[2], Priority::FOREGROUND)
+            .expect("queueing must not be an error")
+            .is_none(),
+        "并发已满时不得再给出运行槽"
+    );
+    assert_eq!(
+        manager.session_state(sessions[2]),
+        Some(SchedulerState::Queued)
+    );
+
+    // ---- 模拟 UI 反复切前台：只抬优先级，不动任何进程 ----
+    for session in [sessions[1], sessions[0], sessions[1]] {
+        let _ = manager.request_run(session, Priority::FOREGROUND);
+    }
+    assert_eq!(
+        manager.session_state(sessions[0]),
+        Some(SchedulerState::Running)
+    );
+    assert_eq!(
+        manager.session_state(sessions[1]),
+        Some(SchedulerState::Running)
+    );
+    assert_eq!(handle_a.process_id(), Some(pid_a), "切前台不得重启 A");
+    assert_eq!(handle_b.process_id(), Some(pid_b), "切前台不得重启 B");
+    assert!(handle_a.snapshot().terminal.is_none());
+    assert!(handle_b.snapshot().terminal.is_none());
+    assert_eq!(manager.scheduler_report().resident_pi, 2);
+
+    // ---- 关掉 A：运行槽空出来，排队的 C 立刻补位 ----
+    while notices.try_recv().is_ok() {}
+    manager.remove_session(sessions[0]);
+    manager.tick();
+    let deadline = Instant::now() + TIMEOUT;
+    while manager.session_state(sessions[2]) != Some(SchedulerState::Running) {
+        assert!(
+            Instant::now() < deadline,
+            "运行槽空出来之后排队会话没有补位：{:?}",
+            manager.scheduler_report()
+        );
+        manager.tick();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        notices.try_recv(),
+        Ok(pi_runtime::SchedulerChanged),
+        "补位必须唤醒 UI 的调度器订阅"
+    );
+    let handle_c = manager.session_handle(sessions[2]).expect("C 已经在跑");
+    assert_ne!(
+        handle_c.process_id(),
+        Some(pid_a),
+        "warm pool 容量为 0，C 只能是一个新进程"
+    );
+    // B 全程没被动过。
+    assert_eq!(handle_b.process_id(), Some(pid_b));
+    assert_eq!(
+        manager.session_state(sessions[1]),
+        Some(SchedulerState::Running)
+    );
+    let report = manager.scheduler_report();
+    assert_eq!(report.running, 2);
+    assert!(report.resident_pi <= limits.total_runtime_slots);
+
+    manager.remove_session(sessions[1]);
+    manager.remove_session(sessions[2]);
+    manager.tick();
+    assert_eq!(manager.scheduler_report().resident_pi, 0);
+    assert!(
+        fs::read_dir(&cwd).unwrap().next().is_none(),
+        "zero-token multi-session test wrote into the temporary cwd"
+    );
+}
