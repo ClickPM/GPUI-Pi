@@ -28,7 +28,7 @@
 | **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ 已完成 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | 2026-08-22 |
 | **R21** | 权威设计同步 + 单会话 Runtime 集中化 + 会话态收敛 | Windows | ✅ 已完成（BLOCKED 已解除：fresh 不落盘是钉死 pi 权威契约，resume 接缝走 `--session` 空文件分支零 token 验证，见 [`rounds/round-21/BLOCKED.md`](rounds/round-21/BLOCKED.md)） | [#31](https://github.com/cking000bigdemon/GPUI-Pi/pull/31) | 2026-08-24 |
 | **R22** | 单 Runtime 有界 Actor 与事件背压 | Windows | ✅ 已完成（代码审查 PASS；视觉审查 `CODE_ONLY_PASS`，未验证真实渲染，见 [`rounds/round-22/round-22.md`](rounds/round-22/round-22.md)） | [#32](https://github.com/cking000bigdemon/GPUI-Pi/pull/32) | 2026-08-24 |
-| **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ⬜ | — | — |
+| **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ✅ 已完成（纯逻辑轮，`crates/app` / `crates/ui` 零 diff；四轮 codex 独立审查共 21 条 findings 全部整改，见 [`rounds/round-23/round-23.md`](rounds/round-23/round-23.md)） | 待创建 | 2026-08-25 |
 | **R24** | 有界多用户 Session UI 接线 | Windows | ⬜ | — | — |
 | **R25** | Windows Job Object + 进程树与内存治理 | Windows | ⬜ | — | — |
 | **R26** | 内建只读子代理任务与配额调度 | Windows | ⬜ | — | — |

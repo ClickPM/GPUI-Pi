@@ -23,9 +23,30 @@ use std::{
 /// 必须与请求次数无关。
 static SPAWNED_THREADS: AtomicU64 = AtomicU64::new(0);
 
+/// pi-runtime 进程内当前**存活**的线程数。
+///
+/// 与 [`spawned_thread_count`] 的分工：累计计数证明「稳态下不再新建线程」，存活计数
+/// 证明「用完的线程真的退出了」。R23 的 Park/Resume 每轮都会换一批线程，只有存活计数
+/// 能证明旧的那批确实收掉了。
+static LIVE_THREADS: AtomicU64 = AtomicU64::new(0);
+
 /// 累计线程创建计数快照。
 pub fn spawned_thread_count() -> u64 {
     SPAWNED_THREADS.load(Ordering::Acquire)
+}
+
+/// 当前存活的 pi-runtime 线程数快照。
+pub fn live_thread_count() -> u64 {
+    LIVE_THREADS.load(Ordering::Acquire)
+}
+
+/// 线程存活计数的 RAII 归还：正常结束与 panic 展开都会减一。
+struct LiveThreadGuard;
+
+impl Drop for LiveThreadGuard {
+    fn drop(&mut self) {
+        LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 统一的线程创建入口，保证每一处 spawn 都被计数。
@@ -34,10 +55,18 @@ where
     F: FnOnce() + Send + 'static,
 {
     SPAWNED_THREADS.fetch_add(1, Ordering::AcqRel);
-    thread::Builder::new()
-        .name(name)
-        .spawn(body)
-        .expect("failed to spawn pi-runtime thread")
+    LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
+    match thread::Builder::new().name(name).spawn(move || {
+        let _live = LiveThreadGuard;
+        body();
+    }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            // spawn 失败时线程根本没起来，守卫也就不会执行 —— 这里必须手动配平。
+            LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
+            panic!("failed to spawn pi-runtime thread: {error}");
+        }
+    }
 }
 
 /// 作业投递失败原因。
@@ -137,6 +166,12 @@ struct Queue {
     ready: Condvar,
     channel: Channel,
     capacity: usize,
+    /// 已出队、尚未执行完的作业数。
+    ///
+    /// **必须与出队在同一把锁内自增**：一旦「`pop` 返回」与「计数 +1」之间存在缝隙，
+    /// worker 恰好在缝隙里被调度出去时，Park 会看到 `in_flight == 0` 就把进程交给
+    /// 下一个会话，随后那条陈旧作业醒来，把 RPC 发到已经被复用的 pi 上。
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl Queue {
@@ -146,6 +181,7 @@ impl Queue {
                 jobs: VecDeque::new(),
                 closed: false,
             }),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             ready: Condvar::new(),
             channel,
             capacity,
@@ -179,11 +215,21 @@ impl Queue {
         Ok(())
     }
 
-    fn pop(&self) -> Option<Job> {
+    /// 取出一条作业，并在**同一把锁内**把它计入在执行数。
+    ///
+    /// 返回的守卫负责在作业结束（含 panic 展开）时配平计数，因此从 Park 的视角看，
+    /// 「队列里没有、也没人在跑」这个判断在任何时刻都是真的。
+    fn pop(self: &Arc<Self>) -> Option<(Job, InFlightGuard)> {
         let mut state = self.state.lock().unwrap();
         loop {
             if let Some((_, job)) = state.jobs.pop_front() {
-                return Some(job);
+                self.in_flight.fetch_add(1, Ordering::AcqRel);
+                return Some((
+                    job,
+                    InFlightGuard {
+                        counter: Arc::clone(&self.in_flight),
+                    },
+                ));
             }
             if state.closed {
                 return None;
@@ -277,6 +323,27 @@ impl Actor {
         self.live_workers.load(Ordering::Acquire)
     }
 
+    /// Actor 是否完全静止：两条队列都空，且没有作业在跑。
+    ///
+    /// Park 的硬前提。控制类作业（Compact / Fork / SwitchSession）不改 reducer 的
+    /// phase，只看 phase 会把「队列里还压着一次 Fork」当成空闲，而 `close()` 会把它
+    /// 直接丢掉。
+    pub(crate) fn is_idle(&self) -> bool {
+        self.queued(Channel::Command) == 0
+            && self.queued(Channel::Control) == 0
+            && self.in_flight() == 0
+    }
+
+    /// 当前正在执行的作业数（两条通道之和）。
+    ///
+    /// 计数由 [`Queue::pop`] 在出队锁内自增、由作业结束时的守卫自减，因此
+    /// 「`queued() == 0 && in_flight() == 0`」是一个真正的静止判据，Park 可以据它
+    /// 安全地把进程交给下一个会话。
+    pub(crate) fn in_flight(&self) -> usize {
+        self.command.in_flight.load(Ordering::Acquire)
+            + self.control.in_flight.load(Ordering::Acquire)
+    }
+
     fn queue(&self, channel: Channel) -> &Arc<Queue> {
         match channel {
             Channel::Command => &self.command,
@@ -288,11 +355,23 @@ impl Actor {
 fn spawn_worker(name: String, queue: Arc<Queue>, live: Arc<AtomicUsize>) {
     live.fetch_add(1, Ordering::AcqRel);
     spawn_named(name, move || {
-        while let Some(job) = queue.pop() {
+        // 在执行计数已经由 `pop` 在出队锁内加过；这里只负责让守卫在作业返回时落地。
+        while let Some((job, _running)) = queue.pop() {
             job();
         }
         live.fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+/// 在执行计数的 RAII 归还：作业 panic 时同样要配平。
+struct InFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +548,59 @@ mod tests {
         assert!(
             wait_until(|| actor.live_workers() == 0),
             "close 后 worker 必须退出"
+        );
+    }
+
+    /// 在执行计数必须由 `pop` 在**出队锁内**完成，而不是由 worker 拿到作业之后再加。
+    ///
+    /// 这条差别决定了 Park 的安全性：只要「已出队但还没计数」这个窗口存在，
+    /// Park 就可能在窗口里看到「队列空 + 没人在跑」，把进程交给下一个会话，
+    /// 随后那条陈旧作业醒来，把 RPC 发到已经被复用的 pi 上。
+    #[test]
+    fn dequeue_accounts_for_the_job_before_pop_returns() {
+        // 直接用裸队列，不起 worker —— 否则作业会被 worker 抢走，测不到 pop 自身的行为。
+        let queue = Arc::new(Queue::new(Channel::Command, 4));
+        assert_eq!(queue.in_flight.load(Ordering::Acquire), 0);
+        queue.push(None, Box::new(|| {})).expect("within capacity");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            0,
+            "还在队列里的作业不算在执行"
+        );
+
+        let (job, guard) = queue.pop().expect("job available");
+        assert_eq!(queue.len(), 0, "作业已经离开队列");
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            1,
+            "pop 一返回就必须已经计入在执行：这中间不允许有窗口"
+        );
+        job();
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            1,
+            "作业跑完但守卫还在，仍算在执行"
+        );
+        drop(guard);
+        assert_eq!(queue.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn in_flight_is_balanced_even_when_a_job_panics() {
+        let queue = Arc::new(Queue::new(Channel::Command, 4));
+        queue
+            .push(None, Box::new(|| panic!("job blew up")))
+            .expect("within capacity");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (job, _guard) = queue.pop().expect("job available");
+            job();
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(
+            queue.in_flight.load(Ordering::Acquire),
+            0,
+            "panic 展开也必须配平在执行计数，否则 Park 会永远等下去"
         );
     }
 

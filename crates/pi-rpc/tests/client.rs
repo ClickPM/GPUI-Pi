@@ -784,3 +784,95 @@ fn default_backlog_budget_delivers_a_full_streaming_burst() {
     assert_eq!(events.queued_bytes(), 0, "全部消费后额度必须完全归还");
     client.shutdown().unwrap();
 }
+
+/// R23：`detach` 必须在**保留进程**的前提下确定性地结束一条订阅。
+///
+/// Park 的前提就是这一条：pump 线程阻塞在 `recv` 上，而空闲会话不会再产生任何事件，
+/// 靠等下一条业务事件唤醒等于永远等下去；靠丢 `Client` 唤醒又会把进程一起杀掉。
+#[test]
+fn detach_wakes_a_blocked_subscriber_and_leaves_the_process_running() {
+    let client = Client::spawn(config()).unwrap();
+    let events = client.subscribe();
+    let detach = events.detach_handle();
+
+    // 消费线程阻塞在 recv 上：没有哨兵它就不会返回。
+    let consumer = thread::spawn(move || {
+        let mut tail = Vec::new();
+        while let Ok(event) = events.recv() {
+            tail.push(event);
+        }
+        tail
+    });
+
+    // 先把启动横幅之类的既有事件放过去，再断开，确保唤醒的确实是一次阻塞中的 recv。
+    thread::sleep(Duration::from_millis(50));
+    detach.detach();
+    let tail = consumer.join().expect("consumer thread");
+    assert!(
+        matches!(
+            tail.last(),
+            Some(ClientEvent::Lifecycle(LifecycleEvent::Detached))
+        ),
+        "断开必须以显式哨兵收场，最后收到的是 {:?}",
+        tail.last()
+    );
+
+    // 进程仍然活着：这正是 Park 到 warm pool 的价值所在。
+    assert!(client.pid().is_some());
+    let response = client
+        .request(Command::GetMessages, Duration::from_secs(5))
+        .expect("detach 之后进程必须仍然可用");
+    assert!(response.success);
+
+    // 幂等：重复 detach 只是找不到自己。
+    detach.detach();
+    client.shutdown().unwrap();
+}
+
+/// 断开一条订阅不得影响其他订阅者，也不得影响 stdout 的持续 drain。
+#[test]
+fn detaching_one_subscriber_does_not_disturb_the_others() {
+    let client = Client::spawn(config()).unwrap();
+    let parked = client.subscribe();
+    let live = client.subscribe();
+
+    parked.detach();
+    assert!(
+        matches!(
+            parked.recv(),
+            Ok(ClientEvent::Lifecycle(LifecycleEvent::Detached))
+        ),
+        "被断开的订阅先收到哨兵"
+    );
+    assert!(parked.recv().is_err(), "哨兵之后本订阅即关闭");
+
+    let response = client
+        .request(
+            Command::Prompt {
+                message: "complete".into(),
+                images: None,
+                streaming_behavior: None,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(response.success, "另一条订阅在场时 stdout 必须继续被 drain");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_agent_event = false;
+    while Instant::now() < deadline {
+        match live.recv_timeout(Duration::from_millis(100)) {
+            Ok(ClientEvent::Rpc(event)) => {
+                if matches!(*event, RpcEvent::AgentStart) {
+                    saw_agent_event = true;
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(saw_agent_event, "未被断开的订阅必须照常收到事件");
+    assert_eq!(parked.queued_bytes(), 0);
+    client.shutdown().unwrap();
+}

@@ -1,11 +1,19 @@
 mod actor;
+pub mod clock;
 mod effects;
+pub mod scheduler;
 
-pub use actor::{ActorLimits, spawned_thread_count};
+pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
+pub use clock::{Clock, FakeClock, SystemClock};
 pub use effects::{BackpressureStats, EffectLimits};
+pub use scheduler::{
+    IllegalTransition, Priority, QueueFull, SchedulerLimits, SchedulerReport, SchedulerState,
+    SessionId, SlotCounts, SlotKind,
+};
 
 use actor::{Actor, Channel, JobKey, QueueError};
 use effects::EffectBuffer;
+use scheduler::{SlotLease, SlotPool, WaitQueue};
 
 use pi_render::{
     ConversationDocument, LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase,
@@ -16,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
@@ -24,10 +32,10 @@ use std::{
 
 use pi_rpc::{
     AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
-    Command, CommandsData, CompactionResult, EventStream, ExportPathData, ExtensionUiRequest,
-    ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType, RpcEvent,
-    RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel, ThinkingLevelsData,
-    TreeData, WidgetPlacement,
+    Command, CommandsData, CompactionResult, EventDetach, EventStream, ExportPathData,
+    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType,
+    RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
+    ThinkingLevelsData, TreeData, WidgetPlacement,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -788,6 +796,8 @@ impl RuntimeId {
 pub struct RuntimeLimits {
     /// Maintenance job 的独立配额，不占用户会话运行槽。
     pub maintenance_slots: usize,
+    /// 会话调度器的运行槽、warm pool、队列与 Idle TTL 配置。
+    pub scheduler: SchedulerLimits,
     /// 单 Runtime 命令 Actor 的队列容量与 worker 数。
     pub actor: ActorLimits,
     /// 单 Session effect 缓存的固定上限。
@@ -802,6 +812,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             maintenance_slots: 1,
+            scheduler: SchedulerLimits::default(),
             actor: ActorLimits::default(),
             effects: EffectLimits::default(),
             event_frame: DEFAULT_EVENT_FRAME,
@@ -848,11 +859,139 @@ pub struct RuntimeManager {
     inner: Arc<ManagerInner>,
 }
 
+/// 启动一个 Runtime 所需的全部输入。
+///
+/// Park 之后进程没了，但这份描述留着 —— Resume 时既可能拿它冷启动，也可能拿它
+/// 去 warm pool 里匹配一个参数一致的热进程。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDescriptor {
+    pub binary: PathBuf,
+    pub cwd: PathBuf,
+    /// 会话文件；`None` 表示 fresh 会话（尚未落盘，因此不可 Park、不可 warm 复用）。
+    pub session_path: Option<PathBuf>,
+    pub tool_preset: ToolPreset,
+    pub agent_dir: Option<PathBuf>,
+}
+
+/// 热进程的可复用性判据。
+///
+/// `switch_session` 只能换会话文件，**换不了** cwd、工具集和扩展目录——这些是启动参数。
+/// 因此只有这四项完全一致的热进程才能被复用，否则必须冷启动。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmKey {
+    binary: PathBuf,
+    cwd: PathBuf,
+    tool_preset: ToolPreset,
+    agent_dir: Option<PathBuf>,
+}
+
+impl WarmKey {
+    fn of(descriptor: &SessionDescriptor) -> Self {
+        Self {
+            binary: descriptor.binary.clone(),
+            cwd: descriptor.cwd.clone(),
+            tool_preset: descriptor.tool_preset,
+            agent_dir: descriptor.agent_dir.clone(),
+        }
+    }
+}
+
+/// 池内的空闲热进程。
+struct WarmRuntime {
+    client: Client,
+    key: WarmKey,
+    idle_since: Duration,
+    /// 常驻槽凭证：热进程也占内存，必须一直占着名额直到真正退出。
+    lease: SlotLease,
+}
+
+/// 一个已登记的用户会话。
+///
+/// `Parked` 时 `entry` / `lease` 均为 `None`：零进程零线程，只留描述与轻量摘要。
+struct SessionSlot {
+    descriptor: SessionDescriptor,
+    /// Park 时保留的文档摘要，Resume 时作为 reducer 的起点。
+    history: ConversationDocument,
+    state: SchedulerState,
+    priority: Priority,
+    entry: Option<Arc<RuntimeEntry>>,
+    lease: Option<SlotLease>,
+    failure: Option<String>,
+}
+
+impl SessionSlot {
+    /// 受检状态转移。非法转移不改状态，只报错——静默改状态会让槽位回收漏掉一条分支。
+    fn transition(&mut self, next: SchedulerState) -> Result<(), IllegalTransition> {
+        if self.state == next {
+            return Ok(());
+        }
+        if !self.state.can_transition_to(next) {
+            return Err(IllegalTransition {
+                from: self.state,
+                to: next,
+            });
+        }
+        self.state = next;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SchedulerCounters {
+    cold_starts: u64,
+    warm_resumes: u64,
+    warm_parks: u64,
+    idle_reaped: u64,
+}
+
+/// 调度器的全部可变状态，统一由一把锁保护。
+///
+/// **锁序约定**：`core` → `RuntimeEntry::state`，永不反向。任何会阻塞的动作
+/// （`Client::spawn`、`switch_session`、`client.shutdown`）都必须在放开 `core` 之后做。
+struct SchedulerCore {
+    sessions: BTreeMap<SessionId, SessionSlot>,
+    queue: WaitQueue,
+    warm: VecDeque<WarmRuntime>,
+    next_session_id: u64,
+    counters: SchedulerCounters,
+    /// 已经从会话上摘下、但进程可能还没退干净的运行槽。
+    ///
+    /// 终态是在 `shutdown` **之前**发布的（R22 刻意如此：崩溃要立刻可见）。一看到终态
+    /// 就把运行槽还回去，新会话会在旧进程还活着的时候补位，`total_runtime_slots` 这条
+    /// 硬上限就成了空话。这些 lease 先挂在这里，等 `RuntimeEntry::is_released` 为真
+    /// 再真正归还 —— 每次 `tick()` 都会清理一遍。
+    draining: Vec<(Arc<RuntimeEntry>, SlotLease)>,
+}
+
+/// 唤醒 reaper 线程用的停止信号。
+struct Reaper {
+    stop: Mutex<bool>,
+    wake: Condvar,
+}
+
 struct ManagerInner {
     next_runtime_id: AtomicU64,
-    active_user: Mutex<Option<Arc<RuntimeEntry>>>,
+    /// R21 兼容通道：`start_fresh` / `start_session` / `stop_user` 维护的唯一活跃会话。
+    active_user: Mutex<Option<SessionId>>,
     maintenance: MaintenanceGate,
     tuning: RuntimeTuning,
+    limits: SchedulerLimits,
+    slots: SlotPool,
+    clock: Arc<dyn Clock>,
+    core: Mutex<SchedulerCore>,
+    /// `None` 表示测试构造：TTL 与队列推进完全由显式 `tick()` 驱动，避免后台线程
+    /// 抢在断言之前改状态。
+    reaper: Option<Arc<Reaper>>,
+}
+
+impl Drop for ManagerInner {
+    fn drop(&mut self) {
+        let Some(reaper) = self.reaper.as_ref() else {
+            return;
+        };
+        *reaper.stop.lock().unwrap() = true;
+        reaper.wake.notify_all();
+    }
 }
 
 struct MaintenanceGate {
@@ -910,6 +1049,8 @@ struct RuntimeState {
 
 struct RuntimeEntry {
     id: RuntimeId,
+    /// 拥有本 Runtime 的会话。`RuntimeId` 每次 Resume 都会变，`SessionId` 不会。
+    session: SessionId,
     state: Mutex<RuntimeState>,
     subscribers: Mutex<Vec<Sender<Dirty>>>,
     /// 固定线程的命令 Actor；`dispatch` 等只投递作业，绝不新建线程。
@@ -917,6 +1058,42 @@ struct RuntimeEntry {
     tuning: RuntimeTuning,
     /// 存活的事件 pump 线程数（每个 epoch 至多一个）。
     live_pumps: Arc<AtomicUsize>,
+    /// 还有多少条在途作业攥着本 Runtime 的进程句柄。
+    ///
+    /// `restart_with_tools` 会把 `state.client` 置成 `None`、把旧 client 交给一条控制
+    /// 作业。此时 `shutdown_entry` 什么也关不掉，光看它自己无法判断进程是否真的没了。
+    /// 计数由**闭包捕获**的守卫维护：作业跑完固然会减，作业还在队列里就被 `close()`
+    /// 丢掉时同样会减（闭包被 drop，捕获的守卫跟着 drop）—— 这一点是关键，
+    /// 「在闭包体内创建守卫」恰恰盖不住被丢弃那条路。
+    client_owners: Arc<AtomicUsize>,
+    /// pump 在被 detach 唤醒时，手上那一帧还压着未投递的事件。
+    ///
+    /// 那一帧已经无处可去（entry 此时已被 Park 置 `stopped`，`publish` 会被 fence 掉）。
+    /// 若其中含扩展 UI 请求，pi 里那个扩展可能正等着回应 —— 这样的进程绝不能进 warm pool
+    /// 交给下一个会话。正文增量丢一点无妨：pi 自己的会话文件才是权威，Resume 后的
+    /// 落盘校准会把它补回来。
+    pump_lost_events: Arc<AtomicBool>,
+    /// 进程是否已经彻底释放（`shutdown` 已返回）。
+    ///
+    /// 终态是在 `shutdown` **之前**发布的（R22 刻意如此：崩溃要立刻可见，不能等
+    /// grace period）。调度器因此不能一看到终态就归还运行槽 —— 那一刻旧进程可能还活着，
+    /// 新会话补位就突破了常驻上限。
+    released: Arc<AtomicBool>,
+    /// 当前 pump 那条订阅的断开句柄。
+    ///
+    /// Park 需要在**保留 pi 进程**的前提下结束 pump，而 pump 阻塞在 `recv` 上；
+    /// 只有拿到这个句柄才能 `detach()` 把它叫醒。
+    events: Mutex<Option<EventDetach>>,
+    /// **这个进程实际是用什么参数起来的**。
+    ///
+    /// 不能拿 `SessionSlot::descriptor` 顶替：`restart_with_tools` 会在调度器背后换掉
+    /// 工具预设与二进制，Slot 上那份随即过期。用过期的预设去算 `WarmKey`，一个
+    /// 实际带 `--tools full` 的进程会被当成 ReadOnly 放进池子，再被另一个 ReadOnly
+    /// 会话接管——那是把写权限跨会话漏出去。
+    ///
+    /// **锁序：`descriptor` 永远先于 `state`。** 两者会在同一段临界区里被一起持有
+    /// （换进程时要原子地更新参数与状态），反序就是死锁。
+    descriptor: Mutex<SessionDescriptor>,
 }
 
 impl RuntimeEntry {
@@ -962,6 +1139,7 @@ impl RuntimeEntry {
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            session: SessionId(0),
             state: Mutex::new(Self::new_state(
                 history,
                 tuning,
@@ -974,6 +1152,17 @@ impl RuntimeEntry {
             actor: Actor::new(id.get(), tuning.actor),
             tuning,
             live_pumps: Arc::new(AtomicUsize::new(0)),
+            client_owners: Arc::new(AtomicUsize::new(0)),
+            pump_lost_events: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            events: Mutex::new(None),
+            descriptor: Mutex::new(SessionDescriptor {
+                binary: PathBuf::new(),
+                cwd: PathBuf::new(),
+                session_path: None,
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: None,
+            }),
         })
     }
 
@@ -1061,6 +1250,36 @@ impl RuntimeEntry {
         self.actor.live_workers() + self.live_pumps.load(Ordering::Acquire)
     }
 
+    /// pump 是否丢弃过一整帧未投递的事件。
+    fn pump_lost_events(&self) -> bool {
+        self.pump_lost_events.load(Ordering::Acquire)
+    }
+
+    /// 标记进程已彻底释放。
+    fn mark_released(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    /// 进程是否已经彻底释放：拆除流程走完了，**且**没有任何在途作业还攥着句柄。
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire) && self.client_owners.load(Ordering::Acquire) == 0
+    }
+
+    /// 权威终态的廉价读取。
+    ///
+    /// 调度器在持 `core` 锁时会逐个 Runtime 查终态，不能用 `snapshot()`——那会克隆整份
+    /// 文档与 effect 流，把调度锁的持有时间拖到与会话长度成正比。
+    fn terminal_state(&self) -> Option<TerminalState> {
+        self.state.lock().unwrap().terminal.clone()
+    }
+
+    /// 断开当前 pump 的订阅，让它在下一次 `recv` 立刻退出。**不动进程**。
+    fn detach_events(&self) {
+        if let Some(events) = self.events.lock().unwrap().take() {
+            events.detach();
+        }
+    }
+
     fn client_for_epoch(&self, epoch: u64) -> Result<Client, String> {
         let state = self.state.lock().unwrap();
         if state.epoch != epoch || state.stopped {
@@ -1094,9 +1313,45 @@ impl SessionHandle {
         self.entry.id
     }
 
+    /// 拥有本 Runtime 的会话身份。
+    ///
+    /// 与 [`SessionHandle::runtime_id`] 的区别是 R23 的关键：一次 Park/Resume 会换掉
+    /// `RuntimeId`（可能换进程、也可能接管另一个热进程），但 `SessionId` 恒定。
+    /// 需要跨 Park/Resume 记住的东西（草稿、滚动位置）必须挂在它上面。
+    pub fn session_id(&self) -> SessionId {
+        self.entry.session
+    }
+
     /// 本 Runtime 当前存活的常驻线程数（Actor worker + 事件 pump）。
     pub fn live_thread_count(&self) -> usize {
         self.entry.live_threads()
+    }
+
+    /// Runtime 是否已经静止：队列里没有作业，也没有正在执行的作业。
+    ///
+    /// 这是 Park 能否**把进程留给 warm pool** 的前提：正在跑的作业手里攥着一个
+    /// `Client` 克隆，会和下一个会话的 `switch_session` 撞在同一个内核上。
+    /// 启动后的元数据刷新（`get_commands` / `get_state` / models / tree）正是这样一批
+    /// 作业，真实 pi 上要跑好几秒 —— 所以「刚起来就 Park」基本只会退化成优雅停机，
+    /// 会话仍然正确地进入 `Parked`，只是下次 Resume 得付一次冷启动。
+    ///
+    /// 想稳定拿到热进程复用，调用方应等本方法为真再 Park。
+    pub fn is_quiescent(&self) -> bool {
+        self.entry.actor.is_idle()
+    }
+
+    /// 当前绑定的 pi 进程 pid。
+    ///
+    /// 这是「Resume 到底复用了热进程还是冷启动」的客观判据：复用时 pid 与 Park 前相同，
+    /// 冷启动时必然不同。
+    pub fn process_id(&self) -> Option<u32> {
+        self.entry
+            .state
+            .lock()
+            .unwrap()
+            .client
+            .as_ref()
+            .and_then(Client::pid)
     }
 
     /// 本 Runtime 固化后的命令队列参数（已收敛为生效值）。
@@ -1302,6 +1557,19 @@ impl SessionHandle {
         history: ConversationDocument,
         preset: ToolPreset,
     ) -> Result<(), String> {
+        // 换进程等于换启动参数：调度器必须拿到新的 binary / cwd / session / 工具预设，
+        // 否则 Park 会用过期参数算 `WarmKey`，把一个高权限进程当低权限的放进池子。
+        //
+        // **锁序：`descriptor` 永远先于 `state`**（见 `RuntimeEntry::descriptor` 注释）。
+        // 这一段刻意放在拿 `state` 之前，否则与 `capture_runtime_state` 正好互为反序，
+        // 一次「停会话」撞上一次「换工具预设」就会互等到死。
+        let restarted_descriptor = SessionDescriptor {
+            binary: binary.clone(),
+            cwd: cwd.clone(),
+            session_path: session_path.clone(),
+            tool_preset: preset,
+            agent_dir: self.entry.descriptor.lock().unwrap().agent_dir.clone(),
+        };
         let mut state = self.entry.state.lock().unwrap();
         if state.stopped {
             return Err("runtime 已停止".to_owned());
@@ -1313,9 +1581,14 @@ impl SessionHandle {
             .clone()
             .ok_or_else(|| "runtime 已停止".to_owned())?;
         let entry = self.entry.clone();
+        // 旧 client 即将只由这条作业持有；从现在起计数，直到闭包被执行完或被丢弃。
+        let owner = ClientOwnerGuard::acquire(&self.entry);
         let queued = self
             .entry
             .enqueue(&mut state, Channel::Control, None, move || {
+                // `owner` 由闭包捕获：无论本作业跑完、提前 return、panic，还是压根没被
+                // 执行就被 `close()` 丢掉，计数都会归零。
+                let _owner = owner;
                 let shutdown = old_client.shutdown().map_err(|error| error.to_string());
                 if let Err(error) = shutdown {
                     publish_tool_restart_failure(&entry, old_epoch, preset, error);
@@ -1342,10 +1615,15 @@ impl SessionHandle {
                 let events = client.subscribe();
                 let new_epoch;
                 {
+                    // 同一条锁序：descriptor 先于 state。两把锁一起拿，保证「新进程装上」
+                    // 与「权威参数更新」对外是一次原子变更。
+                    let mut descriptor = entry.descriptor.lock().unwrap();
                     let mut state = entry.state.lock().unwrap();
                     if state.epoch != old_epoch || state.stopped {
                         drop(state);
+                        drop(descriptor);
                         let _ = client.shutdown();
+                        // 释放标记由 `ReleaseOnExit` 在 return 时统一置位。
                         return;
                     }
                     state.epoch = state.epoch.wrapping_add(1);
@@ -1356,6 +1634,9 @@ impl SessionHandle {
                     state.startup_diagnostic = diagnostic;
                     state.calibration_path = calibration_path.clone();
                     state.client = Some(client);
+                    // 只有真正换成功了才改权威 descriptor：失败路径上旧进程仍在，
+                    // 旧参数依然是事实。
+                    *descriptor = restarted_descriptor;
                     entry.publish(&mut state, RuntimeEffectKind::ExtensionUiReset);
                     entry.publish(
                         &mut state,
@@ -1376,15 +1657,898 @@ impl SessionHandle {
     }
 }
 
+/// 调度器为一次启动准备好的全部输入。
+struct Admission {
+    descriptor: SessionDescriptor,
+    history: ConversationDocument,
+    /// 运行槽凭证：从这一刻起槽位就被占住，失败路径靠 Drop 归还。
+    lease: SlotLease,
+    /// `Some` 表示复用池内热进程（`switch_session` 首选路径），`None` 表示冷启动。
+    warm: Option<Client>,
+}
+
+/// 一次准入尝试的结论。
+enum Admitted {
+    /// 会话已经在跑，直接把现有 Handle 还回去。
+    AlreadyRunning(SessionHandle),
+    /// 抢到运行槽，可以开始启动。
+    Start(Admission),
+    /// 没抢到运行槽，已进入公平队列。
+    Queued,
+    /// 常驻槽被不可复用的热进程占满：先在锁外把它关掉，再重试准入。
+    Evict(WarmRuntime),
+}
+
+/// reaper 的轮询间隔。
+///
+/// 取 TTL 的四分之一，保证过期热进程最多多活 25% 的 TTL；再夹进 [200ms, 5s]，
+/// 让极短 TTL 不至于把 CPU 烧在轮询上、极长 TTL 也仍能及时发现崩溃的 Runtime。
+fn reaper_interval(idle_ttl: Duration) -> Duration {
+    (idle_ttl / 4).clamp(Duration::from_millis(200), Duration::from_secs(5))
+}
+
 impl RuntimeManager {
     pub fn new(limits: RuntimeLimits) -> Self {
-        Self {
+        Self::build(limits, Arc::new(SystemClock::new()), true)
+    }
+
+    /// 注入时钟的测试构造。
+    ///
+    /// **不启动 reaper 线程**：Idle TTL、aging 与队列提升全部由显式 [`RuntimeManager::tick`]
+    /// 驱动。否则后台线程会抢在断言之前改状态，「推进到 TTL 前一格仍在池中」这类
+    /// 确定性验收就无从写起。
+    pub fn with_test_clock(limits: RuntimeLimits, clock: Arc<dyn Clock>) -> Self {
+        Self::build(limits, clock, false)
+    }
+
+    fn build(limits: RuntimeLimits, clock: Arc<dyn Clock>, reap: bool) -> Self {
+        let scheduler = limits.scheduler.sanitized();
+        let manager = Self {
             inner: Arc::new(ManagerInner {
                 next_runtime_id: AtomicU64::new(0),
                 active_user: Mutex::new(None),
                 maintenance: MaintenanceGate::new(limits.maintenance_slots),
                 tuning: RuntimeTuning::from_limits(&limits),
+                limits: scheduler,
+                slots: SlotPool::new(scheduler),
+                clock,
+                core: Mutex::new(SchedulerCore {
+                    sessions: BTreeMap::new(),
+                    queue: WaitQueue::new(scheduler),
+                    warm: VecDeque::new(),
+                    next_session_id: 0,
+                    counters: SchedulerCounters::default(),
+                    draining: Vec::new(),
+                }),
+                reaper: reap.then(|| {
+                    Arc::new(Reaper {
+                        stop: Mutex::new(false),
+                        wake: Condvar::new(),
+                    })
+                }),
             }),
+        };
+        manager.spawn_reaper();
+        manager
+    }
+
+    /// 整个 Manager 只有这一条后台线程，与 Runtime 数量无关。
+    fn spawn_reaper(&self) {
+        let Some(reaper) = self.inner.reaper.clone() else {
+            return;
+        };
+        let interval = reaper_interval(self.inner.limits.idle_ttl);
+        // 弱引用：reaper 绝不能让 Manager（以及它持有的全部 pi 进程）续命。
+        let weak = Arc::downgrade(&self.inner);
+        actor::spawn_named("pi-runtime-scheduler-reaper".to_owned(), move || {
+            loop {
+                {
+                    let stop = reaper.stop.lock().unwrap();
+                    if *stop {
+                        break;
+                    }
+                    let (stop, _) = reaper.wake.wait_timeout(stop, interval).unwrap();
+                    if *stop {
+                        break;
+                    }
+                }
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                RuntimeManager { inner }.tick();
+            }
+        });
+    }
+
+    fn next_runtime_id(&self) -> RuntimeId {
+        RuntimeId(self.inner.next_runtime_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// 当前调度器有界参数（已收敛为生效值）。
+    pub fn scheduler_limits(&self) -> SchedulerLimits {
+        self.inner.limits
+    }
+
+    /// 登记一个会话，**不启动任何进程**：新会话直接是 `Parked`。
+    ///
+    /// 「创建 20 个 Session，常驻 pi 不超上限」正是靠这一点成立：登记是纯内存操作。
+    pub fn create_session(
+        &self,
+        descriptor: SessionDescriptor,
+        history: ConversationDocument,
+    ) -> SessionId {
+        let mut core = self.inner.core.lock().unwrap();
+        core.next_session_id = core.next_session_id.wrapping_add(1);
+        let id = SessionId(core.next_session_id);
+        core.sessions.insert(
+            id,
+            SessionSlot {
+                descriptor,
+                history,
+                state: SchedulerState::Parked,
+                priority: Priority::default(),
+                entry: None,
+                lease: None,
+                failure: None,
+            },
+        );
+        id
+    }
+
+    pub fn session_state(&self, session: SessionId) -> Option<SchedulerState> {
+        let core = self.inner.core.lock().unwrap();
+        core.sessions.get(&session).map(|slot| slot.state)
+    }
+
+    pub fn session_handle(&self, session: SessionId) -> Option<SessionHandle> {
+        let core = self.inner.core.lock().unwrap();
+        core.sessions
+            .get(&session)?
+            .entry
+            .clone()
+            .map(|entry| SessionHandle { entry })
+    }
+
+    /// 会话最近一次失败的原因（`Failed` 态才有值）。
+    pub fn session_failure(&self, session: SessionId) -> Option<String> {
+        let core = self.inner.core.lock().unwrap();
+        core.sessions.get(&session)?.failure.clone()
+    }
+
+    /// 会话当前的描述。
+    ///
+    /// Runtime 在跑时以**它自己那份**为准：`restart_with_tools` 会在调度器背后换掉工具
+    /// 预设与二进制，Slot 上那份要等到 Park / stop 才同步。返回过期的预设会让调用方以为
+    /// 一个高权限进程还是只读的。
+    pub fn session_descriptor(&self, session: SessionId) -> Option<SessionDescriptor> {
+        let core = self.inner.core.lock().unwrap();
+        let slot = core.sessions.get(&session)?;
+        Some(match slot.entry.as_ref() {
+            Some(entry) => entry.descriptor.lock().unwrap().clone(),
+            None => slot.descriptor.clone(),
+        })
+    }
+
+    pub fn scheduler_report(&self) -> SchedulerReport {
+        let core = self.inner.core.lock().unwrap();
+        // 槽位计数必须在调度锁内取：先读槽位再拿锁会拼出一份「状态与槽位互相矛盾」的
+        // 报表（例如 running 已经归零而 user 槽还显示占用）。
+        let mut report = SchedulerReport {
+            slots: self.inner.slots.counts(),
+            warm: core.warm.len(),
+            cold_starts: core.counters.cold_starts,
+            warm_resumes: core.counters.warm_resumes,
+            warm_parks: core.counters.warm_parks,
+            idle_reaped: core.counters.idle_reaped,
+            ..SchedulerReport::default()
+        };
+        for slot in core.sessions.values() {
+            match slot.state {
+                SchedulerState::Parked => report.parked += 1,
+                SchedulerState::Queued => report.queued += 1,
+                SchedulerState::Starting => report.starting += 1,
+                SchedulerState::Running => report.running += 1,
+                SchedulerState::Stopping => report.stopping += 1,
+                SchedulerState::Failed => report.failed += 1,
+                // Session 永远不会是池内热进程；热进程单独统计在 `warm` 里。
+                SchedulerState::IdleWarm => {}
+            }
+        }
+        report.draining = core.draining.len();
+        // **常驻数直接取运行槽计数**，不去累加各个状态桶。
+        //
+        // 状态桶会在拆除窗口里短暂地谁都不认领这个进程：Park 兜底停机、warm 淘汰、
+        // TTL 回收都是「先从集合里摘走、再到锁外 shutdown」，那一瞬间按桶求和会报 0，
+        // 而进程明明还在退出。lease 才是从 spawn 前占用、到 shutdown 后归还的权威计数。
+        report.resident_pi = report.slots.resident;
+        report
+    }
+
+    /// 请求运行一个会话。
+    ///
+    /// 抢到运行槽返回 `Ok(Some(handle))`；抢不到则进入公平队列并返回 `Ok(None)`，
+    /// 后续由 [`RuntimeManager::tick`] 提升。队列已满时返回 `Err` 且**不改动**会话状态。
+    pub fn request_run(
+        &self,
+        session: SessionId,
+        priority: Priority,
+    ) -> Result<Option<SessionHandle>, String> {
+        self.tick();
+        self.admit_and_start(session, priority)
+    }
+
+    fn admit_and_start(
+        &self,
+        session: SessionId,
+        priority: Priority,
+    ) -> Result<Option<SessionHandle>, String> {
+        // 每一轮要么给出结论，要么淘汰掉一个热进程；因此最多「池容量 + 1」轮。
+        for _ in 0..=self.inner.limits.warm_idle.saturating_add(1) {
+            let admitted = {
+                let mut core = self.inner.core.lock().unwrap();
+                self.admit(&mut core, session, priority)?
+            };
+            match admitted {
+                Admitted::AlreadyRunning(handle) => return Ok(Some(handle)),
+                Admitted::Queued => return Ok(None),
+                Admitted::Start(admission) => {
+                    return self.finish_start(session, admission).map(Some);
+                }
+                // 已经出了锁，关进程不会卡住调度器；`WarmRuntime` 落地时归还常驻槽。
+                Admitted::Evict(warm) => {
+                    let _ = warm.client.shutdown();
+                }
+            }
+        }
+        Err("调度器无法为该会话腾出运行槽，请稍后重试".to_owned())
+    }
+
+    fn admit(
+        &self,
+        core: &mut SchedulerCore,
+        session: SessionId,
+        priority: Priority,
+    ) -> Result<Admitted, String> {
+        let slot = core
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "会话不存在".to_owned())?;
+        // 会话侧记录的是「调用方最近一次的意图」；队列侧另有一条不降级规则
+        // （[`WaitQueue::push`] 对已排队条目取 `min`），避免等待中的条目被反复降级。
+        slot.priority = priority;
+        match slot.state {
+            SchedulerState::Running => {
+                return match slot.entry.clone() {
+                    Some(entry) => Ok(Admitted::AlreadyRunning(SessionHandle { entry })),
+                    // Running 却没有 entry 属于内部不变量被破坏，宁可报错也不静默继续。
+                    None => Err("会话状态不一致：Running 但没有运行时".to_owned()),
+                };
+            }
+            SchedulerState::Starting | SchedulerState::Stopping => {
+                return Err(format!(
+                    "会话正处于 {} 状态，请稍候重试",
+                    slot.state.label()
+                ));
+            }
+            SchedulerState::IdleWarm => {
+                return Err("会话状态不一致：Session 不会处于 IdleWarm".to_owned());
+            }
+            SchedulerState::Parked | SchedulerState::Queued | SchedulerState::Failed => {}
+        }
+        let descriptor = slot.descriptor.clone();
+        let history = slot.history.clone();
+        let key = WarmKey::of(&descriptor);
+        // 会话文件必须真实存在：`switch_session` 切不到一个还没落盘的 fresh 会话。
+        let switchable = descriptor
+            .session_path
+            .as_ref()
+            .is_some_and(|path| path.is_file());
+
+        // ① 首选：复用参数一致的热进程。
+        if switchable && let Some(index) = core.warm.iter().position(|warm| warm.key == key) {
+            let warm = core.warm.remove(index).expect("index from position");
+            match warm.lease.upgrade_to_user() {
+                Ok(lease) => {
+                    let client = warm.client;
+                    Self::mark_starting(core, session)?;
+                    return Ok(Admitted::Start(Admission {
+                        descriptor,
+                        history,
+                        lease,
+                        warm: Some(client),
+                    }));
+                }
+                Err(lease) => {
+                    // 用户并发已满：热进程原样放回池里，本会话转入排队。
+                    core.warm.push_back(WarmRuntime {
+                        client: warm.client,
+                        key: warm.key,
+                        idle_since: warm.idle_since,
+                        lease,
+                    });
+                }
+            }
+        }
+
+        // ② 回退：冷启动。
+        if let Some(lease) = self.inner.slots.try_acquire_user() {
+            Self::mark_starting(core, session)?;
+            return Ok(Admitted::Start(Admission {
+                descriptor,
+                history,
+                lease,
+                warm: None,
+            }));
+        }
+
+        // ③ 常驻槽被「用不上的」热进程占满，而用户并发还有余量：热进程必须给真实需求让路。
+        //    淘汰**最久没被用过**的那一个，而不是队首 —— 复用失败时热进程会被原样放回
+        //    队尾，池内顺序因此不能当成空闲时长顺序。
+        if self.inner.slots.counts().user < self.inner.limits.user_session_slots {
+            let oldest = core
+                .warm
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, warm)| warm.idle_since)
+                .map(|(index, _)| index);
+            if let Some(index) = oldest
+                && let Some(evicted) = core.warm.remove(index)
+            {
+                return Ok(Admitted::Evict(evicted));
+            }
+        }
+
+        // ④ 确实没有槽：入队等待。
+        let now = self.inner.clock.now();
+        core.queue
+            .push(session, priority, now)
+            .map_err(|full| full.to_string())?;
+        let slot = core
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "会话不存在".to_owned())?;
+        if let Err(error) = slot.transition(SchedulerState::Queued) {
+            core.queue.remove(session);
+            return Err(error.to_string());
+        }
+        Ok(Admitted::Queued)
+    }
+
+    fn mark_starting(core: &mut SchedulerCore, session: SessionId) -> Result<(), String> {
+        core.queue.remove(session);
+        let slot = core
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "会话不存在".to_owned())?;
+        slot.transition(SchedulerState::Starting)
+            .map_err(|error| error.to_string())
+    }
+
+    fn finish_start(
+        &self,
+        session: SessionId,
+        admission: Admission,
+    ) -> Result<SessionHandle, String> {
+        let Admission {
+            descriptor,
+            history,
+            lease,
+            warm,
+        } = admission;
+        let mut reused_warm = false;
+        let mut started = None;
+        if let Some(client) = warm {
+            match self.adopt_warm(session, client, &descriptor, history.clone()) {
+                Ok(entry) => {
+                    reused_warm = true;
+                    started = Some(entry);
+                }
+                // 热进程坏了不该让整次 Resume 失败：`adopt_warm` 已清理掉它，这里退回冷启动。
+                Err(_) => started = None,
+            }
+        }
+        let entry = match started {
+            Some(entry) => entry,
+            None => match self.cold_start(session, &descriptor, history) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.fail_session(session, error.clone());
+                    return Err(error);
+                }
+            },
+        };
+
+        let mut core = self.inner.core.lock().unwrap();
+        let Some(slot) = core.sessions.get_mut(&session) else {
+            drop(core);
+            // 启动期间会话被移除：新建的 Runtime 不能留成孤儿进程。
+            shutdown_entry(&entry);
+            return Err("会话已被移除".to_owned());
+        };
+        if let Err(error) = slot.transition(SchedulerState::Running) {
+            drop(core);
+            shutdown_entry(&entry);
+            return Err(error.to_string());
+        }
+        slot.entry = Some(Arc::clone(&entry));
+        slot.lease = Some(lease);
+        slot.failure = None;
+        if reused_warm {
+            core.counters.warm_resumes = core.counters.warm_resumes.wrapping_add(1);
+        } else {
+            core.counters.cold_starts = core.counters.cold_starts.wrapping_add(1);
+        }
+        Ok(SessionHandle { entry })
+    }
+
+    /// 复用池内热进程：新建一个轻量 Runtime 容器，再用 `switch_session` 把会话切过去。
+    ///
+    /// 立项文档 § 三要求 Resume 复用而不是重写这条链路 —— 成本从「重起一个约 203MB 的
+    /// 进程」降到一次 RPC 往返。
+    fn adopt_warm(
+        &self,
+        session: SessionId,
+        client: Client,
+        descriptor: &SessionDescriptor,
+        history: ConversationDocument,
+    ) -> Result<Arc<RuntimeEntry>, String> {
+        let session_path = descriptor
+            .session_path
+            .clone()
+            .ok_or_else(|| "fresh 会话没有会话文件，无法复用热进程".to_owned())?;
+        let calibration_path = Arc::new(Mutex::new(Some(session_path.clone())));
+        let entry = self.new_entry(
+            session,
+            descriptor.clone(),
+            history,
+            None,
+            Some(client.clone()),
+            Arc::clone(&calibration_path),
+        );
+        // 先订阅再切会话：切换过程中的事件不能漏给 reducer。
+        let events = client.subscribe();
+        spawn_event_pump(Arc::clone(&entry), 1, calibration_path, events);
+        let outcome = execute_control(
+            &client,
+            ControlRequest::SwitchSession { path: session_path },
+            descriptor.agent_dir.as_deref(),
+        );
+        match outcome {
+            Ok(ControlOutcome::Switched(controls)) => {
+                {
+                    let mut state = entry.state.lock().unwrap();
+                    apply_controls_identity(&mut state, &controls);
+                    entry.publish(&mut state, RuntimeEffectKind::ControlsLoaded(Ok(controls)));
+                }
+                SessionHandle {
+                    entry: Arc::clone(&entry),
+                }
+                .refresh_metadata();
+                Ok(entry)
+            }
+            other => {
+                // 热进程没能接管：连同它一起关掉，调用方回退冷启动。
+                shutdown_entry(&entry);
+                Err(match other {
+                    Ok(outcome) => format!("热进程未能接管会话：{outcome:?}"),
+                    Err(error) => format!("热进程 switch_session 失败：{error}"),
+                })
+            }
+        }
+    }
+
+    /// 冷启动：无可复用热进程时的回退路径。
+    fn cold_start(
+        &self,
+        session: SessionId,
+        descriptor: &SessionDescriptor,
+        history: ConversationDocument,
+    ) -> Result<Arc<RuntimeEntry>, String> {
+        let (mut config, diagnostic) = active_session_config(
+            descriptor.binary.clone(),
+            descriptor.session_path.clone(),
+            descriptor.cwd.clone(),
+            descriptor.tool_preset,
+        );
+        if let Some(agent_dir) = descriptor.agent_dir.as_ref() {
+            config.env.push((
+                pi_data::AGENT_DIR_ENV.into(),
+                agent_dir.as_os_str().to_owned(),
+            ));
+        }
+        clamp_manager_config(&mut config, self.inner.tuning);
+        let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
+        let client = Client::spawn(config).map_err(|error| error.to_string())?;
+        let events = client.subscribe();
+        let entry = self.new_entry(
+            session,
+            descriptor.clone(),
+            history,
+            diagnostic,
+            Some(client),
+            Arc::clone(&calibration_path),
+        );
+        spawn_event_pump(Arc::clone(&entry), 1, calibration_path, events);
+        SessionHandle {
+            entry: Arc::clone(&entry),
+        }
+        .refresh_metadata();
+        Ok(entry)
+    }
+
+    fn new_entry(
+        &self,
+        session: SessionId,
+        descriptor: SessionDescriptor,
+        history: ConversationDocument,
+        diagnostic: Option<String>,
+        client: Option<Client>,
+        calibration_path: Arc<Mutex<Option<PathBuf>>>,
+    ) -> Arc<RuntimeEntry> {
+        let id = self.next_runtime_id();
+        let tuning = self.inner.tuning;
+        let agent_dir = descriptor.agent_dir.clone();
+        Arc::new(RuntimeEntry {
+            id,
+            session,
+            state: Mutex::new(RuntimeEntry::new_state(
+                history,
+                tuning,
+                diagnostic,
+                client,
+                calibration_path,
+                agent_dir,
+            )),
+            subscribers: Mutex::new(Vec::new()),
+            actor: Actor::new(id.get(), tuning.actor),
+            tuning,
+            live_pumps: Arc::new(AtomicUsize::new(0)),
+            client_owners: Arc::new(AtomicUsize::new(0)),
+            pump_lost_events: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            events: Mutex::new(None),
+            descriptor: Mutex::new(descriptor),
+        })
+    }
+
+    fn fail_session(&self, session: SessionId, error: String) {
+        let mut core = self.inner.core.lock().unwrap();
+        if let Some(slot) = core.sessions.get_mut(&session) {
+            let _ = slot.transition(SchedulerState::Failed);
+            slot.entry = None;
+            // lease 在这里 Drop，运行槽随之归还。
+            slot.lease = None;
+            slot.failure = Some(error);
+        }
+    }
+
+    /// Park：让出进程，会话转 `Parked`。
+    ///
+    /// 优先把进程交给 warm pool（下一次 Resume 就能 `switch_session` 秒接管）；
+    /// 池满、会话尚未落盘或作业没能及时收干净时退化为优雅停机。两种落点都是 `Parked`。
+    ///
+    /// 会话正在执行请求时返回 `Err` 且**不改动任何状态** —— Park 是「让出进程」，
+    /// 不是「打断请求」；想强行结束请用 [`RuntimeManager::stop_session`]。
+    pub fn park(&self, session: SessionId) -> Result<(), String> {
+        // ① 只读地看一眼 Runtime。这一步刻意不改任何状态：下面可能因为会话正忙而拒绝，
+        //    那时必须原样返回，不能留下一个已经被改成 Stopping 的半截会话。
+        let entry = {
+            let mut core = self.inner.core.lock().unwrap();
+            let slot = core
+                .sessions
+                .get_mut(&session)
+                .ok_or_else(|| "会话不存在".to_owned())?;
+            match slot.state {
+                SchedulerState::Parked => return Ok(()),
+                SchedulerState::Queued => {
+                    slot.transition(SchedulerState::Parked)
+                        .map_err(|error| error.to_string())?;
+                    core.queue.remove(session);
+                    return Ok(());
+                }
+                SchedulerState::Failed => {
+                    slot.transition(SchedulerState::Parked)
+                        .map_err(|error| error.to_string())?;
+                    slot.failure = None;
+                    return Ok(());
+                }
+                SchedulerState::Running => {}
+                other => return Err(format!("会话处于 {} 状态，无法 Park", other.label())),
+            }
+            slot.entry
+                .clone()
+                .ok_or_else(|| "会话状态不一致：Running 但没有运行时".to_owned())?
+        };
+
+        // ② 在**任何锁之外**给后台作业一点收尾时间。启动/接管后的元数据刷新是一批
+        //    在跑的作业，等一下就没了；这一步不改任何状态，等不到也只是转入下面的拒绝。
+        wait_for_actor_idle(&entry, PARK_SETTLE_BUDGET);
+
+        // ③ 预留：**在同一把调度锁里**确认会话仍归这个 Runtime、完成 Runtime 侧的
+        //    原子封锁、并把运行槽与 Runtime 一起摘下来。
+        //
+        //    必须是同一把锁：`begin_park` 会先发布 `Stopped` 终态，而槽位此时还是
+        //    `Running`；若中途放开调度锁，并发的 `request_run` 会先 `tick()` 把这个
+        //    entry 当成"外部停掉的"回收掉、再装上一个新的 Runtime，随后我们回来无条件
+        //    改状态，就把那个新 Runtime 连同它的进程一起挤掉了。
+        let (entry, lease, parked) = {
+            let mut core = self.inner.core.lock().unwrap();
+            let slot = core
+                .sessions
+                .get_mut(&session)
+                .ok_or_else(|| "会话不存在".to_owned())?;
+            if slot.state != SchedulerState::Running
+                || !slot
+                    .entry
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                return Err("会话已经被其他操作接管，请重试".to_owned());
+            }
+            let parked = reserve_park(&entry).map_err(ParkRefusal::message)?;
+            slot.transition(SchedulerState::Stopping)
+                .map_err(|error| error.to_string())?;
+            let entry = slot
+                .entry
+                .take()
+                .ok_or_else(|| "会话状态不一致：Running 但没有运行时".to_owned())?;
+            let lease = slot
+                .lease
+                .take()
+                .ok_or_else(|| "会话状态不一致：Running 但没有运行槽".to_owned())?;
+            (entry, lease, parked)
+        };
+
+        // ④ 锁外拆 Runtime：关 Actor、叫醒 pump。进程本身还活着，去留由下一步决定。
+        let parked = finish_park(&entry, parked);
+
+        // ⑤ 落调度器状态。warm 容量在**同一把锁内**复检：并发 Park 各自在锁外判断
+        //    「池里还有位置」，会让 warm_idle=1 的池装进两个进程、多占几百 MB。
+        let descriptor = entry.descriptor.lock().unwrap().clone();
+        let key = WarmKey::of(&descriptor);
+        // 未落盘的会话不进池：它的进程手里还攥着一个从没写进磁盘的会话，把这样的进程
+        // 交给别人 `switch_session` 是我们没有对真实 pi 验证过的状态。文件探测放在锁外。
+        let persisted = parked
+            .session_file
+            .as_ref()
+            .is_some_and(|path| path.is_file());
+        let now = self.inner.clock.now();
+        let surplus = {
+            let mut core = self.inner.core.lock().unwrap();
+            if let Some(slot) = core.sessions.get_mut(&session) {
+                // 这里不能用 `?`：Runtime 与运行槽已经在我们手上，提前返回会让 lease
+                // 先于进程被归还（正是 R23 审查 P2-5 那条）。`Stopping -> Parked`
+                // 由上一步的转移保证合法，真出现异常也只能带着状态往下走完回收。
+                let _ = slot.transition(SchedulerState::Parked);
+                apply_captured_state(
+                    slot,
+                    &descriptor,
+                    parked.history,
+                    parked.session_file.clone(),
+                );
+            }
+            let has_room = core.warm.len() < self.inner.limits.warm_idle;
+            match parked.client {
+                Some(client) if parked.reusable && persisted && has_room => {
+                    core.warm.push_back(WarmRuntime {
+                        client,
+                        key,
+                        idle_since: now,
+                        // 交还用户会话槽、保留常驻槽：热进程仍然占着内存。
+                        lease: lease.downgrade_to_warm(),
+                    });
+                    core.counters.warm_parks = core.counters.warm_parks.wrapping_add(1);
+                    None
+                }
+                // 进不了池就必须关掉。**lease 跟着进程走**：先归还槽位再关进程的话，
+                // 并发的 `request_run` 会在旧进程还没退出时补位，突破常驻上限。
+                client => Some((client, lease)),
+            }
+        };
+        if let Some((client, lease)) = surplus {
+            if let Some(client) = client {
+                let _owner = ClientOwnerGuard::acquire(&entry);
+                let _ = client.shutdown();
+            }
+            entry.mark_released();
+            // 运行槽最后归还：`_owner` 已随上面的作用域结束而落地，此刻进程确实没了。
+            drop(lease);
+        }
+        self.tick();
+        Ok(())
+    }
+
+    /// 停止会话：关掉进程，会话保留在注册表里（转 `Parked`，可再次 `request_run`）。
+    pub fn stop_session(&self, session: SessionId) {
+        let (owns_teardown, entry) = {
+            let mut core = self.inner.core.lock().unwrap();
+            core.queue.remove(session);
+            match core.sessions.get_mut(&session) {
+                // 已经有另一次 stop / park 把 Runtime 摘走并正在关它。这里**什么都不能动**：
+                // 再走一遍收尾会把那次调用的 lease 提前归还，甚至在它之后覆盖新 Runtime
+                // 的状态。让那次调用自己收口。
+                Some(slot) if slot.state == SchedulerState::Stopping && slot.entry.is_none() => {
+                    (false, None)
+                }
+                Some(slot) => {
+                    if slot.state != SchedulerState::Parked {
+                        let _ = slot.transition(SchedulerState::Stopping);
+                    }
+                    (true, slot.entry.take())
+                }
+                None => (false, None),
+            }
+        };
+        if !owns_teardown {
+            self.tick();
+            return;
+        }
+        // 先取快照再停机：pi 可能已经把会话落了盘，不收进 Slot 的话，下一次
+        // `request_run` 会拿着 `session_path=None` 和最初的历史重开一个新会话 ——
+        // 用户的对话就这么凭空消失了。
+        let captured = entry.as_ref().map(|entry| capture_runtime_state(entry));
+        if let Some(entry) = entry.as_ref() {
+            shutdown_entry(entry);
+        }
+        {
+            let mut core = self.inner.core.lock().unwrap();
+            let released = core.sessions.get_mut(&session).and_then(|slot| {
+                let _ = slot.transition(SchedulerState::Parked);
+                slot.failure = None;
+                if let Some((descriptor, history, session_file)) = captured {
+                    apply_captured_state(slot, &descriptor, history, session_file);
+                }
+                slot.lease.take()
+            });
+            // 运行槽跟着进程走。`shutdown_entry` 在有替换作业在跑时不会宣布已释放 ——
+            // 那时旧进程还攥在那条作业手里，提前还槽就会被别的会话补位。
+            if let Some(lease) = released {
+                match entry.as_ref() {
+                    Some(entry) if !entry.is_released() => {
+                        core.draining.push((Arc::clone(entry), lease));
+                    }
+                    _ => drop(lease),
+                }
+            }
+        }
+        self.tick();
+    }
+
+    /// 停止并注销会话。
+    pub fn remove_session(&self, session: SessionId) {
+        self.stop_session(session);
+        // 注销的如果正好是兼容通道的活跃会话，指针必须一起清掉：留着它，
+        // `active_user_session()` 会返回一个已经不存在的 id，而 `stop_user` 再也匹配不上。
+        {
+            let mut active = self.inner.active_user.lock().unwrap();
+            if *active == Some(session) {
+                *active = None;
+            }
+        }
+        let mut core = self.inner.core.lock().unwrap();
+        core.queue.remove(session);
+        core.sessions.remove(&session);
+    }
+
+    /// 推进调度器：回收崩溃的 Runtime、按 Idle TTL 回收热进程、提升排队会话。
+    ///
+    /// 所有耗时动作（关进程、启动进程）都在放开调度锁之后进行。
+    pub fn tick(&self) {
+        let now = self.inner.clock.now();
+        let expired = {
+            let mut core = self.inner.core.lock().unwrap();
+            // 先收已经退干净的进程的运行槽，再判断谁能开跑。
+            core.draining.retain(|(entry, _)| !entry.is_released());
+            Self::reap_terminated(&mut core);
+            Self::reap_idle_warm(&mut core, now, self.inner.limits.idle_ttl)
+        };
+        for warm in expired {
+            let _ = warm.client.shutdown();
+        }
+        self.promote_queued(now);
+    }
+
+    /// 把已经进入终态的 Runtime 从运行槽上摘下来。
+    ///
+    /// 崩溃由 pump 线程写进 `SessionSnapshot.terminal`，调度器自己不订阅事件；
+    /// 不做这一步，一个崩掉的会话会永久占着运行槽。
+    fn reap_terminated(core: &mut SchedulerCore) {
+        let mut releases: Vec<(Arc<RuntimeEntry>, SlotLease)> = Vec::new();
+        for slot in core.sessions.values_mut() {
+            if !matches!(
+                slot.state,
+                SchedulerState::Running | SchedulerState::Starting
+            ) {
+                continue;
+            }
+            let Some(entry) = slot.entry.clone() else {
+                continue;
+            };
+            let Some(terminal) = entry.terminal_state() else {
+                continue;
+            };
+            // 崩溃之前 pi 往往已经把会话落了盘。不在这里把身份与历史收进 Slot，
+            // `Failed` 之后的重试就会当成新会话重开，用户丢掉整段对话。
+            let (descriptor, history, session_file) = capture_runtime_state(&entry);
+            match terminal {
+                TerminalState::Failed { error } => {
+                    let _ = slot.transition(SchedulerState::Failed);
+                    slot.failure = Some(error);
+                }
+                TerminalState::Stopped => {
+                    // 走到这里说明进程在调度器之外被停掉了；补齐状态机与槽位回收。
+                    let _ = slot.transition(SchedulerState::Stopping);
+                    let _ = slot.transition(SchedulerState::Parked);
+                }
+            }
+            apply_captured_state(slot, &descriptor, history, session_file);
+            slot.entry = None;
+            // 运行槽跟着进程走：进程还没退干净就先挂进 `draining`，不能直接还回去。
+            if let Some(lease) = slot.lease.take() {
+                releases.push((entry, lease));
+            }
+        }
+        for (entry, lease) in releases {
+            if !entry.is_released() {
+                core.draining.push((entry, lease));
+            }
+        }
+    }
+
+    /// 回收空闲超过 TTL 的热进程。
+    ///
+    /// 逐个判定而不是「从队首取到第一个未过期的为止」：复用失败时热进程会被原样放回
+    /// 队尾，池内顺序因此并不等于空闲时长顺序，按顺序短路会漏掉排在后面的过期进程。
+    /// 池容量本来就很小（初值 1），全扫的代价可以忽略。
+    fn reap_idle_warm(
+        core: &mut SchedulerCore,
+        now: Duration,
+        idle_ttl: Duration,
+    ) -> Vec<WarmRuntime> {
+        let mut expired = Vec::new();
+        let mut retained = VecDeque::with_capacity(core.warm.len());
+        while let Some(warm) = core.warm.pop_front() {
+            if now.saturating_sub(warm.idle_since) >= idle_ttl {
+                expired.push(warm);
+            } else {
+                retained.push_back(warm);
+            }
+        }
+        core.warm = retained;
+        core.counters.idle_reaped = core.counters.idle_reaped.wrapping_add(expired.len() as u64);
+        expired
+    }
+
+    fn promote_queued(&self, now: Duration) {
+        let budget = self.inner.core.lock().unwrap().queue.len();
+        for _ in 0..budget {
+            // 只 peek 不 pop：真正的出队由 `admit` 在抢到运行槽之后做。先 pop 再放回
+            // 会重置 `enqueued_at`，把这条条目辛苦攒下的 aging 一次清零 —— 恰好惩罚
+            // 等得最久的那个，公平队列就白做了。
+            let candidate = {
+                let core = self.inner.core.lock().unwrap();
+                if self.inner.slots.counts().user >= self.inner.limits.user_session_slots {
+                    return;
+                }
+                core.queue.peek_next(now)
+            };
+            let Some(session) = candidate else {
+                return;
+            };
+            let priority = self
+                .inner
+                .core
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&session)
+                .map(|slot| slot.priority)
+                .unwrap_or_default();
+            let _ = self.admit_and_start(session, priority);
+            // 没能推进（仍在队列里）就停手，否则同一条目会被反复重试到 budget 用尽。
+            if self.session_state(session) == Some(SchedulerState::Queued) {
+                return;
+            }
         }
     }
 
@@ -1418,6 +2582,10 @@ impl RuntimeManager {
         )
     }
 
+    /// R21 起的单会话兼容通道。
+    ///
+    /// 外部语义与改造前完全一致：**先把新会话拉起来，成功之后才停掉旧的** ——
+    /// spawn 失败时用户手里的旧会话必须原样还在。
     fn start_user(
         &self,
         binary: PathBuf,
@@ -1427,62 +2595,126 @@ impl RuntimeManager {
         tool_preset: ToolPreset,
         agent_dir: Option<PathBuf>,
     ) -> Result<SessionHandle, String> {
-        let id = RuntimeId(self.inner.next_runtime_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let (mut config, diagnostic) =
-            active_session_config(binary, session_path, cwd, tool_preset);
-        if let Some(agent_dir) = agent_dir.as_ref() {
-            config.env.push((
-                pi_data::AGENT_DIR_ENV.into(),
-                agent_dir.as_os_str().to_owned(),
-            ));
-        }
-        let tuning = self.inner.tuning;
-        clamp_manager_config(&mut config, tuning);
-        let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
-        let client = Client::spawn(config).map_err(|error| error.to_string())?;
-        let events = client.subscribe();
-        let entry = Arc::new(RuntimeEntry {
-            id,
-            state: Mutex::new(RuntimeEntry::new_state(
-                history,
-                tuning,
-                diagnostic,
-                Some(client),
-                calibration_path.clone(),
+        // 「读 previous → 起新的 → 改 active → 收旧的」整段必须串行。两个窗口并发调用时
+        // 各自读到同一个 previous，最后一个覆盖 `active_user`，先起来的那个 Runtime
+        // 就变成没人认领、`stop_user` 也停不掉的常驻进程。
+        let mut active = self.inner.active_user.lock().unwrap();
+        let previous = *active;
+        let session = self.create_session(
+            SessionDescriptor {
+                binary,
+                cwd,
+                session_path,
+                tool_preset,
                 agent_dir,
-            )),
-            subscribers: Mutex::new(Vec::new()),
-            actor: Actor::new(id.get(), tuning.actor),
-            tuning,
-            live_pumps: Arc::new(AtomicUsize::new(0)),
-        });
-        let old = self
-            .inner
-            .active_user
-            .lock()
-            .unwrap()
-            .replace(entry.clone());
-        if let Some(old) = old {
-            shutdown_entry(&old);
+            },
+            history,
+        );
+        match self.start_compat(session, previous) {
+            Ok(handle) => {
+                *active = Some(session);
+                // 关旧进程可能要等几秒，别攥着 active 锁做。
+                drop(active);
+                if let Some(previous) = previous {
+                    self.remove_session(previous);
+                }
+                Ok(handle)
+            }
+            Err(error) => {
+                // `remove_session` 自己要拿 `active_user` 锁（注销活跃会话时得把指针清掉），
+                // 而 std 的 Mutex 不可重入 —— 这里不先放锁就是自锁。
+                drop(active);
+                self.remove_session(session);
+                // `start_compat` 保证旧会话要么没被动过、要么已经被拉回来；只有回滚
+                // 也失败时它才会真的消失，那时 active 不能再指向一个不存在的 id。
+                if previous.is_some_and(|previous| self.session_state(previous).is_none()) {
+                    let mut active = self.inner.active_user.lock().unwrap();
+                    // 重新取锁期间可能已经有别的调用装上了新会话，只清我们认得的那个。
+                    if *active == previous {
+                        *active = None;
+                    }
+                }
+                Err(error)
+            }
         }
-        spawn_event_pump(entry.clone(), 1, calibration_path, events);
-        let handle = SessionHandle { entry };
-        handle.refresh_metadata();
-        Ok(handle)
+    }
+
+    fn start_compat(
+        &self,
+        session: SessionId,
+        previous: Option<SessionId>,
+    ) -> Result<SessionHandle, String> {
+        if let Some(handle) = self.admit_and_start(session, Priority::FOREGROUND)? {
+            return Ok(handle);
+        }
+        // 走到这里说明用户并发被配成 1，新旧会话在抢同一个槽。
+        let Some(previous) = previous else {
+            return Err("没有可用的会话运行槽".to_owned());
+        };
+        self.dequeue_session(session);
+        // 让位用 Park 而不是 remove：Park 会拒绝正在执行请求的旧会话（那时旧会话
+        // **原样保住**），成功时旧会话也仍然登记在册 —— 新会话起不来还能原地拉回来。
+        self.park(previous)
+            .map_err(|error| format!("没有可用的会话运行槽，且旧会话无法让位：{error}"))?;
+        match self.admit_and_start(session, Priority::FOREGROUND) {
+            Ok(Some(handle)) => Ok(handle),
+            outcome => {
+                // 回滚：把旧会话拉回来。它会拿到新的 `RuntimeId`，调用方必须用
+                // `session_handle(active_user_session())` 重新取句柄。
+                let restored = self.request_run(previous, Priority::FOREGROUND);
+                let reason = match outcome {
+                    Err(error) => error,
+                    _ => "没有可用的会话运行槽".to_owned(),
+                };
+                Err(match restored {
+                    Ok(Some(_)) => format!("{reason}；旧会话已恢复，请重新获取会话句柄"),
+                    _ => format!("{reason}；旧会话恢复失败"),
+                })
+            }
+        }
+    }
+
+    /// 把一个会话从等待队列里摘掉并退回 `Parked`。
+    fn dequeue_session(&self, session: SessionId) {
+        let mut core = self.inner.core.lock().unwrap();
+        core.queue.remove(session);
+        if let Some(slot) = core.sessions.get_mut(&session) {
+            let _ = slot.transition(SchedulerState::Parked);
+        }
+    }
+
+    /// 兼容通道当前的活跃会话。
+    ///
+    /// `start_*` 失败并触发回滚后，旧会话会换一个 `RuntimeId`，调用方需要靠它
+    /// 重新取句柄。
+    pub fn active_user_session(&self) -> Option<SessionId> {
+        *self.inner.active_user.lock().unwrap()
     }
 
     pub fn stop_user(&self, runtime_id: RuntimeId) {
-        let entry = {
+        // 匹配与清空必须在**同一次持锁**里完成：中间放开的话，并发的 `start_fresh`
+        // 会把新会话装进 `active_user`，随后这里一句无条件置 `None` 就把新会话抹掉，
+        // 它的 Runtime 从此再也停不掉。
+        let session = {
             let mut active = self.inner.active_user.lock().unwrap();
-            if active.as_ref().is_some_and(|entry| entry.id == runtime_id) {
-                active.take()
-            } else {
-                None
+            let matched = {
+                let core = self.inner.core.lock().unwrap();
+                active.filter(|session| {
+                    core.sessions
+                        .get(session)
+                        .and_then(|slot| slot.entry.as_ref())
+                        .is_some_and(|entry| entry.id == runtime_id)
+                })
+            };
+            if matched.is_some() {
+                *active = None;
             }
+            matched
         };
-        if let Some(entry) = entry {
-            shutdown_entry(&entry);
-        }
+        let Some(session) = session else {
+            return;
+        };
+        self.remove_session(session);
     }
 
     pub fn export_historical_html(
@@ -1494,20 +2726,194 @@ impl RuntimeManager {
     }
 }
 
+/// Park 之前给后台作业的收尾时间。
+///
+/// 这段等待发生在**所有锁之外、且不改任何状态**：等到了就正常 Park，等不到就明确
+/// 拒绝（`ParkRefusal::PendingJobs`），绝不会把排队作业丢掉。给一个短上限是为了不让
+/// 一次偶发的慢 RPC 把 Park 变成秒级卡顿。
+const PARK_SETTLE_BUDGET: Duration = Duration::from_millis(500);
+const PARK_SETTLE_POLL: Duration = Duration::from_millis(5);
+
+/// 一次 Park 从 Runtime 手里拿到的全部东西。
+struct ParkedRuntime {
+    /// 摘下来的进程；崩溃会话没有它。
+    client: Option<Client>,
+    history: ConversationDocument,
+    session_file: Option<PathBuf>,
+    /// 这个进程能不能进 warm pool 被别的会话接管。
+    reusable: bool,
+}
+
+/// Park 被拒绝的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkRefusal {
+    /// 正在执行一次提交：Park 掉它等于无声地扔掉 in-flight 的 assistant 输出。
+    Busy,
+    /// Actor 里还有排队或在跑的作业。控制类作业（Compact / Fork / SwitchSession）
+    /// **不会**改 reducer 的 phase，光看 phase 会以为空闲；而 `actor.close()` 会把
+    /// 排队作业直接丢掉，正在跑的那条又会被抽掉 client —— 一次用户点过的 Compact
+    /// 或者一次不可重放的 Fork 就这么没了。
+    PendingJobs,
+    /// 正在替换进程（`restart_with_tools`）：既没有稳定的 client，也没有稳定的参数。
+    Replacing,
+}
+
+impl ParkRefusal {
+    fn message(self) -> String {
+        match self {
+            Self::Busy => "会话仍在执行请求，请先停止当前请求再 Park".to_owned(),
+            Self::PendingJobs => "会话仍有未完成的后台作业，请稍后重试".to_owned(),
+            Self::Replacing => "会话正在切换工具预设，请稍后重试".to_owned(),
+        }
+    }
+}
+
+/// 等 Actor 把手头的作业跑完。**不改任何状态**，等不到就由调用方去拒绝。
+fn wait_for_actor_idle(entry: &Arc<RuntimeEntry>, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while !entry.actor.is_idle() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(PARK_SETTLE_POLL);
+    }
+}
+
+/// 预留一次 Park：在 Runtime 自己那把锁里一次完成「确认可停 + 封住新命令 + 摘走进程」。
+///
+/// 三件事必须原子。`dispatch` / `request_control` 全程持同一把 `state` 锁，因此它们
+/// 要么排在我们前面（我们看到 `Running` 或未清空的队列，拒绝 Park 且**不动任何状态**），
+/// 要么排在后面（看到 `stopped`，自己被拒）—— 中间不存在「检查已过、封锁未生效」的缝隙。
+///
+/// 返回成功即意味着：此后不会再有新作业入队，队列是空的，也没有作业在跑。
+fn reserve_park(entry: &Arc<RuntimeEntry>) -> Result<ParkedRuntime, ParkRefusal> {
+    let mut state = entry.state.lock().unwrap();
+    if state.replacing {
+        return Err(ParkRefusal::Replacing);
+    }
+    let crashed = state.terminal.is_some();
+    if !crashed {
+        if state.reducer.phase() != LivePhase::Idle {
+            return Err(ParkRefusal::Busy);
+        }
+        if !entry.actor.is_idle() {
+            return Err(ParkRefusal::PendingJobs);
+        }
+        state.stopped = true;
+        entry.set_terminal(&mut state, TerminalState::Stopped);
+        entry.publish(&mut state, RuntimeEffectKind::Stopped(None));
+    }
+    let client = state.client.take();
+    // 崩溃残骸只是回收，不能拿去给别的会话复用。
+    let reusable = client.is_some() && !crashed;
+    let history = state.reducer.document();
+    let session_file = state.calibration_path.lock().unwrap().clone();
+    Ok(ParkedRuntime {
+        client,
+        history,
+        session_file,
+        reusable,
+    })
+}
+
+/// 拆掉 Runtime 的线程。进程本身还活着，去留由调用方决定。
+fn finish_park(entry: &Arc<RuntimeEntry>, mut parked: ParkedRuntime) -> ParkedRuntime {
+    // 队列在 `reserve_park` 里已经确认为空且无人在跑，这里的 close 只是让 worker 退出。
+    entry.actor.close();
+    // 叫醒阻塞在 recv 上的 pump：进程继续活着，只有本 Runtime 停止消费事件。
+    entry.detach_events();
+    // 等 pump 真的退出再决定进程去留。哨兵已经在它的队列里，这一步通常是亚毫秒级；
+    // 等它不只是为了读 `pump_lost_events`，也保证进程易主时旧 pump 已经彻底离场。
+    let deadline = Instant::now() + PARK_SETTLE_BUDGET;
+    while entry.live_pumps.load(Ordering::Acquire) > 0 {
+        if Instant::now() >= deadline {
+            // 没能确认 pump 收尾：宁可多付一次冷启动，也不把状态不明的进程交给别人。
+            parked.reusable = false;
+            break;
+        }
+        std::thread::sleep(PARK_SETTLE_POLL);
+    }
+    if entry.pump_lost_events() {
+        parked.reusable = false;
+    }
+    // 进程已经从这个 Runtime 手里转走（进池或即将被关掉）：本 entry 不再持有任何进程。
+    entry.mark_released();
+    parked
+}
+
+/// 取一个 Runtime 的当前身份与历史，供 Slot 在丢弃它之前留档。
+fn capture_runtime_state(
+    entry: &RuntimeEntry,
+) -> (SessionDescriptor, ConversationDocument, Option<PathBuf>) {
+    let descriptor = entry.descriptor.lock().unwrap().clone();
+    let mut state = entry.state.lock().unwrap();
+    let history = state.reducer.document();
+    let session_file = state.calibration_path.lock().unwrap().clone();
+    (descriptor, history, session_file)
+}
+
+/// 把 Runtime 的实际身份与历史写回 Slot，供下一次 Resume 使用。
+fn apply_captured_state(
+    slot: &mut SessionSlot,
+    descriptor: &SessionDescriptor,
+    history: ConversationDocument,
+    session_file: Option<PathBuf>,
+) {
+    // 以 Runtime **实际**跑的参数为准：`restart_with_tools` 可能已经换过工具预设。
+    slot.descriptor = descriptor.clone();
+    // 只在真的落盘之后才记会话文件：指向一个还不存在的路径会让下一次冷启动失败。
+    if session_file.as_ref().is_some_and(|path| path.is_file()) {
+        slot.descriptor.session_path = session_file;
+    }
+    slot.history = history;
+}
+
+/// 「这条作业攥着 Runtime 的进程句柄」的 RAII 记账。
+///
+/// 必须由作业闭包**捕获**（而不是在闭包体内创建）：作业还在队列里就被 `close()` 丢掉时，
+/// 闭包连同守卫一起 drop，计数照样归零。R23 第三轮审查整改时先写成「闭包体内创建」，
+/// 结果恰恰漏掉这条路，运行槽被永久扣住。
+struct ClientOwnerGuard {
+    owners: Arc<AtomicUsize>,
+}
+
+impl ClientOwnerGuard {
+    fn acquire(entry: &RuntimeEntry) -> Self {
+        entry.client_owners.fetch_add(1, Ordering::AcqRel);
+        Self {
+            owners: Arc::clone(&entry.client_owners),
+        }
+    }
+}
+
+impl Drop for ClientOwnerGuard {
+    fn drop(&mut self) {
+        self.owners.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn shutdown_entry(entry: &RuntimeEntry) {
-    let client = {
+    let (client, _owner) = {
         let mut state = entry.state.lock().unwrap();
         state.stopped = true;
         // BACKLOG #12（指派给 R22）：优雅停止此前不产生任何可观察终态，观察者只能等超时。
         entry.set_terminal(&mut state, TerminalState::Stopped);
         entry.publish(&mut state, RuntimeEffectKind::Stopped(None));
-        state.client.take()
+        let client = state.client.take();
+        // 关进程要花到 grace period，这段时间里进程还活着。不记账的话，并发的 `park`
+        // 会看到「有终态 + 没有 client」就宣布释放，运行槽在旧进程退出前就被让出去。
+        let owner = client.as_ref().map(|_| ClientOwnerGuard::acquire(entry));
+        (client, owner)
     };
     // 先关队列再关进程：worker 可能正阻塞在一次长请求上，关队列让它跑完当前作业后退出。
+    // 关队列会连同排队作业一起 drop，替换作业手里的旧 client 因此也在这一步被关掉。
     entry.actor.close();
     if let Some(client) = client {
         let _ = client.shutdown();
     }
+    // 拆除流程到此走完。换进程作业可能还攥着旧 client —— 那部分由
+    // `client_owners` 记账，`is_released()` 要两者都满足才为真。
+    entry.mark_released();
 }
 
 fn clamp_manager_config(config: &mut ClientConfig, tuning: RuntimeTuning) {
@@ -1531,6 +2937,10 @@ fn publish_tool_restart_failure(
 ) {
     let mut state = entry.state.lock().unwrap();
     if state.epoch != epoch || state.stopped {
+        // 被 fence 掉也要置位：会话已经被停掉时，这条路径**曾经**是唯一漏掉释放标记的
+        // 出口，`reap_terminated` 于是永远跳过它，运行槽被永久扣住。
+        drop(state);
+        entry.mark_released();
         return;
     }
     // old Client 已退出；先 fence 旧 pump，再保留更准确的重启失败终态。
@@ -1554,16 +2964,22 @@ fn publish_tool_restart_failure(
     );
     drop(state);
     entry.actor.close();
+    // 旧进程在进入本函数之前就已经 shutdown、新进程压根没起来 —— 没有活着的进程了。
+    // 不置这个标记，`reap_terminated` 会永远跳过这个会话，运行槽被永久扣住。
+    entry.mark_released();
 }
 
 fn fail_runtime(entry: &RuntimeEntry, epoch: u64, error: String) {
-    let client = {
+    let (client, _owner) = {
         let mut state = entry.state.lock().unwrap();
         if state.epoch != epoch || state.stopped || state.replacing {
             return;
         }
         state.stopped = true;
         let client = state.client.take();
+        // 与 `shutdown_entry` 同理：终态先于 shutdown 发布，这段窗口里进程还在退出，
+        // 必须记账，否则并发的 `park` / `stop_session` 会提前归还运行槽。
+        let owner = client.as_ref().map(|_| ClientOwnerGuard::acquire(entry));
         state.reducer.set_error(error.clone());
         entry.set_terminal(
             &mut state,
@@ -1572,7 +2988,7 @@ fn fail_runtime(entry: &RuntimeEntry, epoch: u64, error: String) {
             },
         );
         entry.publish(&mut state, RuntimeEffectKind::Stopped(Some(error)));
-        client
+        (client, owner)
     };
     entry.actor.close();
     // Client::shutdown 可能等待 supervisor/stdout 线程退出；必须在 RuntimeState 锁外执行，
@@ -1580,6 +2996,8 @@ fn fail_runtime(entry: &RuntimeEntry, epoch: u64, error: String) {
     if let Some(client) = client {
         let _ = client.shutdown();
     }
+    // 进程真的没了之后才允许调度器归还运行槽（见 `reap_terminated`）。
+    entry.mark_released();
 }
 
 fn dispatch_command(
@@ -2021,7 +3439,10 @@ fn spawn_event_pump(
 ) {
     let frame = entry.tuning.event_frame;
     let live_pumps = Arc::clone(&entry.live_pumps);
+    let lost_events = Arc::clone(&entry.pump_lost_events);
     live_pumps.fetch_add(1, Ordering::AcqRel);
+    // 把断开句柄留一份在 entry 上，Park 才有办法从外部叫醒阻塞中的 pump。
+    *entry.events.lock().unwrap() = Some(events.detach_handle());
     actor::spawn_named(
         format!("pi-runtime-event-pump-{}-{epoch}", entry.id.get()),
         move || {
@@ -2058,8 +3479,26 @@ fn spawn_event_pump(
                     fail_runtime(&entry, epoch, error);
                     break;
                 }
+                // 这一帧收进来的事件，只要 entry 已经被 fence 掉就无处可去。含扩展 UI
+                // 请求时，pi 里那个扩展可能正等着回应 —— 这样的进程不能进 warm pool。
+                let frame_has_payload = !projected.batch.is_empty()
+                    || !projected.extension_requests.is_empty()
+                    || !projected.runtime_events.is_empty()
+                    || projected.extension_reset;
+                if projected.detached {
+                    // Park 让位：进程还活着，只是不再由本 Runtime 消费事件。
+                    if frame_has_payload {
+                        lost_events.store(true, Ordering::Release);
+                    }
+                    break;
+                }
                 let mut state = entry.state.lock().unwrap();
                 if state.epoch != epoch || state.stopped {
+                    // 帧是被 deadline 或 512 条上限截断的，哨兵还排在后面 —— 但 Park
+                    // 已经置了 `stopped`，这一帧同样丢定了，标记不能只挂在哨兵那条路上。
+                    if frame_has_payload {
+                        lost_events.store(true, Ordering::Release);
+                    }
                     break;
                 }
                 if projected.extension_reset {
@@ -2160,6 +3599,8 @@ struct ProjectedPumpFrame {
     extension_reset: bool,
     settled: bool,
     terminal_failure: Option<String>,
+    /// 订阅被主动断开（Park）：pump 正常退出，**不是**会话失败。
+    detached: bool,
 }
 
 fn project_pump_event(
@@ -2256,6 +3697,11 @@ fn project_pump_event(
             projected.terminal_failure = Some(format!(
                 "事件积压超过上限（{queued_bytes} / {limit} 字节），会话已停止，请重新启动"
             ));
+        }
+        ClientEvent::Lifecycle(pi_rpc::LifecycleEvent::Detached) => {
+            // Park：进程被交给 warm pool 继续活着，只有本 pump 退出。
+            // 绝不能走 terminal_failure —— 那会把一次正常的让位报成会话崩溃。
+            projected.detached = true;
         }
         event => {
             if let Some(event) = project_event(event) {
@@ -3206,16 +4652,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(!error.is_empty());
-        let active = manager
-            .inner
-            .active_user
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert_eq!(active.id, runtime_id);
-        assert!(!active.state.lock().unwrap().stopped);
+        let active = (*manager.inner.active_user.lock().unwrap()).expect("旧会话必须原样还在");
+        assert_eq!(manager.session_state(active), Some(SchedulerState::Running));
+        let entry = manager
+            .session_handle(active)
+            .expect("活跃会话仍持有 Runtime");
+        assert_eq!(entry.runtime_id(), runtime_id);
+        assert!(entry.snapshot().terminal.is_none());
+        // 失败的那次尝试不得留下任何残迹：会话注册表与运行槽都必须回到只剩旧会话。
+        let report = manager.scheduler_report();
+        assert_eq!(report.running, 1);
+        assert_eq!(report.resident_pi, 1);
+        assert_eq!(report.failed, 0);
         manager.stop_user(runtime_id);
     }
 
@@ -4071,5 +5519,334 @@ mod tests {
             control.contains("控制队列") && control.contains("8"),
             "{control}"
         );
+    }
+    fn slot_fixture(state: SchedulerState) -> SessionSlot {
+        SessionSlot {
+            descriptor: SessionDescriptor {
+                binary: PathBuf::from("pi"),
+                cwd: PathBuf::from("."),
+                session_path: None,
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: None,
+            },
+            history: test_document("slot"),
+            state,
+            priority: Priority::default(),
+            entry: None,
+            lease: None,
+            failure: None,
+        }
+    }
+
+    /// 复审 P1-4：控制类作业（Compact / Fork / SwitchSession）**不改 reducer 的 phase**。
+    ///
+    /// 只看 phase 会把「队列里还压着一次 Fork」当成空闲，而 `actor.close()` 会把排队作业
+    /// 直接丢掉、正在跑的那条又会被抽掉 client —— 一次用户点过的 Compact 或一次不可重放的
+    /// Fork 就这么无声消失。因此 Park 的准入必须把 Actor 的排队与在执行一起算进去。
+    #[test]
+    fn reserve_park_refuses_while_actor_jobs_are_outstanding() {
+        let entry = RuntimeEntry::test_entry(RuntimeId(11), test_document("pending"));
+        assert_eq!(entry.state.lock().unwrap().reducer.phase(), LivePhase::Idle);
+
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        entry
+            .actor
+            .push(actor::Channel::Control, None, move || {
+                let _ = blocked.recv();
+            })
+            .expect("control queue has room");
+        // 等它真正被 worker 取走，构造出「phase 空闲但作业在跑」这个状态。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while entry.actor.in_flight() == 0 {
+            assert!(Instant::now() < deadline, "控制作业迟迟没有开始执行");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            reserve_park(&entry).err(),
+            Some(ParkRefusal::PendingJobs),
+            "phase 空闲但还有作业在跑时必须拒绝 Park"
+        );
+        {
+            let state = entry.state.lock().unwrap();
+            assert!(!state.stopped, "被拒绝的 Park 不得置停止位");
+            assert!(state.terminal.is_none(), "被拒绝的 Park 不得写终态");
+        }
+
+        release.send(()).expect("unblock the control job");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !entry.actor.is_idle() {
+            assert!(Instant::now() < deadline, "控制作业没有收尾");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(reserve_park(&entry).is_ok(), "作业收干净之后必须可以 Park");
+    }
+
+    /// 复审（四轮）P1：「已释放」必须同时满足两件事 —— 拆除流程走完，**且**没有在途作业
+    /// 还攥着进程句柄。
+    ///
+    /// 终态是在 `shutdown` 之前发布的，`fail_runtime` / `shutdown_entry` 关进程要花到
+    /// grace period。只看标记位的话，并发的 `park` 会在旧进程还在退出时就把运行槽让出去。
+    #[test]
+    fn a_runtime_is_not_released_while_a_job_still_owns_its_process() {
+        let entry = RuntimeEntry::test_entry(RuntimeId(41), test_document("owned"));
+        assert!(!entry.is_released());
+
+        let owner = ClientOwnerGuard::acquire(&entry);
+        shutdown_entry(&entry);
+        assert!(
+            entry.released.load(Ordering::Acquire),
+            "拆除流程本身确实走完了"
+        );
+        assert!(
+            !entry.is_released(),
+            "但还有在途作业攥着进程句柄，此刻不得归还运行槽"
+        );
+
+        drop(owner);
+        assert!(entry.is_released(), "持有者归零之后才算真的释放");
+    }
+
+    /// 复审（三轮）P2：pump 被 detach 唤醒时手上那一帧如果还压着事件，这些事件已经
+    /// 无处可去（entry 已被置 `stopped`，publish 会被 fence 掉）。其中若含扩展 UI 请求，
+    /// pi 里那个扩展可能正等着回应 —— 这样的进程绝不能进 warm pool 交给下一个会话。
+    #[test]
+    fn a_runtime_whose_pump_dropped_a_frame_is_never_pooled() {
+        let entry = RuntimeEntry::test_entry(RuntimeId(31), test_document("lossy"));
+        entry.pump_lost_events.store(true, Ordering::Release);
+        let parked = finish_park(
+            &entry,
+            ParkedRuntime {
+                client: None,
+                history: test_document("lossy"),
+                session_file: None,
+                reusable: true,
+            },
+        );
+        assert!(
+            !parked.reusable,
+            "丢过一帧事件的进程状态不明，只能关掉、不能复用"
+        );
+
+        // 对照：没丢过事件的照常可复用。
+        let clean = RuntimeEntry::test_entry(RuntimeId(32), test_document("clean"));
+        let parked = finish_park(
+            &clean,
+            ParkedRuntime {
+                client: None,
+                history: test_document("clean"),
+                session_file: None,
+                reusable: true,
+            },
+        );
+        assert!(parked.reusable);
+    }
+
+    /// 复审 P1-6：终态是在 `shutdown` **之前**发布的，因此「有终态」不等于「进程没了」。
+    ///
+    /// 调度器靠 `is_released()` 决定何时归还运行槽；任何一条拆除路径漏掉这个标记，
+    /// 要么让运行槽被永久扣住（漏置），要么让新会话在旧进程还活着时补位（早置）。
+    /// 这条用例逐路径钉死。
+    #[test]
+    fn every_teardown_path_marks_the_runtime_as_released() {
+        let fresh = RuntimeEntry::test_entry(RuntimeId(21), test_document("fresh"));
+        assert!(!fresh.is_released(), "刚建好的 Runtime 还持有进程");
+
+        let stopped = RuntimeEntry::test_entry(RuntimeId(22), test_document("stopped"));
+        shutdown_entry(&stopped);
+        assert!(stopped.is_released(), "优雅停止之后必须标记已释放");
+
+        let failed = RuntimeEntry::test_entry(RuntimeId(23), test_document("failed"));
+        fail_runtime(&failed, 1, "boom".to_owned());
+        assert!(failed.is_released(), "崩溃收尾之后必须标记已释放");
+
+        // 工具预设重启失败：旧进程已在调用前 shutdown、新进程没起来，同样没有活进程了。
+        // 漏掉这一处会让 `reap_terminated` 永远跳过该会话，运行槽被永久扣住。
+        let restart_failed =
+            RuntimeEntry::test_entry(RuntimeId(24), test_document("restart-failed"));
+        publish_tool_restart_failure(
+            &restart_failed,
+            1,
+            ToolPreset::Full,
+            "spawn 失败".to_owned(),
+        );
+        assert!(
+            restart_failed.is_released(),
+            "工具预设重启失败之后必须标记已释放，否则运行槽再也回不来"
+        );
+
+        let parked = RuntimeEntry::test_entry(RuntimeId(25), test_document("parked"));
+        let reservation = reserve_park(&parked).expect("空闲 Runtime 可以 Park");
+        finish_park(&parked, reservation);
+        assert!(
+            parked.is_released(),
+            "Park 之后进程已经转走，本 entry 不再持有任何进程"
+        );
+    }
+
+    /// Park 的准入判据：忙的拒绝、空闲的放行、崩溃残骸也放行。
+    ///
+    /// 这三条与「拒绝时不得改动任何状态」一起，是 `park` 不会无声掐掉 in-flight 请求的
+    /// 全部依据；端到端那条在 `tests/scheduler_fake_child.rs`。
+    #[test]
+    fn begin_park_refuses_a_busy_runtime_and_leaves_it_untouched() {
+        let busy = RuntimeEntry::test_entry(RuntimeId(1), test_document("busy"));
+        busy.state.lock().unwrap().reducer.set_running();
+        assert_eq!(
+            reserve_park(&busy).err(),
+            Some(ParkRefusal::Busy),
+            "正在执行请求的 Runtime 不得被 Park"
+        );
+        {
+            let state = busy.state.lock().unwrap();
+            assert!(!state.stopped, "被拒绝的 Park 不得置停止位");
+            assert!(state.terminal.is_none(), "被拒绝的 Park 不得写终态");
+            assert_eq!(state.reducer.phase(), LivePhase::Running);
+        }
+
+        let idle = RuntimeEntry::test_entry(RuntimeId(2), test_document("idle"));
+        let parked = reserve_park(&idle).expect("空闲 Runtime 可以让出进程");
+        // fixture 没有真实进程，因此拿不到 client、也就不可复用；但状态必须已封住。
+        assert!(parked.client.is_none());
+        assert!(!parked.reusable);
+        assert_eq!(
+            idle.state.lock().unwrap().terminal,
+            Some(TerminalState::Stopped)
+        );
+
+        let crashed = RuntimeEntry::test_entry(RuntimeId(3), test_document("crashed"));
+        {
+            let mut state = crashed.state.lock().unwrap();
+            state.reducer.set_running();
+            state.terminal = Some(TerminalState::Failed {
+                error: "boom".to_owned(),
+            });
+        }
+        let salvage = reserve_park(&crashed).expect("崩溃残骸可以回收");
+        assert!(!salvage.reusable);
+        assert_eq!(
+            crashed.state.lock().unwrap().terminal,
+            Some(TerminalState::Failed {
+                error: "boom".to_owned()
+            }),
+            "回收残骸不得覆盖原本的失败原因"
+        );
+    }
+
+    #[test]
+    fn illegal_slot_transitions_leave_the_state_untouched() {
+        let mut slot = slot_fixture(SchedulerState::Running);
+        // 跳过 Stopping 直接回 Parked 会漏掉进程回收与运行槽归还。
+        let error = slot
+            .transition(SchedulerState::Parked)
+            .expect_err("Running -> Parked 必须被拒绝");
+        assert_eq!(error.to_string(), "非法状态转移：Running -> Parked");
+        assert_eq!(
+            slot.state,
+            SchedulerState::Running,
+            "被拒绝的转移不得改变状态"
+        );
+        // 同状态自转移是幂等的 no-op，不算非法。
+        slot.transition(SchedulerState::Running).expect("自转移");
+    }
+
+    /// 七态各自可达的**状态机层**证据。
+    ///
+    /// `Parked` / `Queued` / `Running` / `Failed` / `IdleWarm`（`SchedulerReport::warm`）
+    /// 另有 `tests/scheduler_fake_child.rs` 的端到端断言；`Starting` 与 `Stopping` 按设计
+    /// 是持锁窗口之外的短暂中间态，端到端观察必然是竞态的，因此在这一层逐条钉死。
+    #[test]
+    fn every_scheduler_state_is_reachable_through_the_transition_table() {
+        let mut slot = slot_fixture(SchedulerState::Parked);
+        for next in [
+            SchedulerState::Queued,
+            SchedulerState::Starting,
+            SchedulerState::Running,
+            SchedulerState::Stopping,
+            SchedulerState::Parked,
+        ] {
+            slot.transition(next)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(slot.state, next);
+        }
+        // 启动失败与运行中崩溃都落到 Failed，且 Failed 可重试。
+        slot.transition(SchedulerState::Starting).expect("重试启动");
+        slot.transition(SchedulerState::Failed).expect("启动失败");
+        slot.transition(SchedulerState::Queued)
+            .expect("失败后重排队");
+
+        // IdleWarm 是池内热进程的状态：出池即被接管（Starting）或被回收（Stopping）。
+        let mut warm = slot_fixture(SchedulerState::IdleWarm);
+        warm.transition(SchedulerState::Starting).expect("被接管");
+        let mut reaped = slot_fixture(SchedulerState::IdleWarm);
+        reaped.transition(SchedulerState::Stopping).expect("被回收");
+    }
+
+    #[test]
+    fn default_scheduler_limits_match_the_project_baseline() {
+        // 立项文档 § 七阶段 E 的初始配置；改这些值等于改产品行为，必须先改文档。
+        let limits = RuntimeLimits::default().scheduler;
+        assert_eq!(limits.user_session_slots, 2);
+        assert_eq!(limits.total_runtime_slots, 3);
+        assert_eq!(limits.warm_idle, 1);
+        assert_eq!(limits.idle_ttl, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn reaper_interval_stays_inside_a_sane_band() {
+        assert_eq!(
+            reaper_interval(Duration::from_secs(180)),
+            Duration::from_secs(5),
+            "长 TTL 也要保持秒级巡检，才能及时发现崩溃的 Runtime"
+        );
+        assert_eq!(
+            reaper_interval(Duration::from_millis(100)),
+            Duration::from_millis(200),
+            "极短 TTL 不得把 CPU 烧在轮询上"
+        );
+        assert_eq!(
+            reaper_interval(Duration::from_secs(8)),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// 「`with_test_clock` 不起 reaper 线程」这条断言必须在独立进程里做
+    /// （见 `tests/reaper_thread_budget.rs`）—— 线程计数器是进程级的，lib 测试并行跑时
+    /// 任何一条别的用例都会把它顶掉。这里只覆盖时钟本身完全由测试推进。
+    #[test]
+    fn a_test_clock_only_advances_when_the_test_says_so() {
+        let clock = Arc::new(FakeClock::new());
+        let injected: Arc<dyn Clock> = clock.clone();
+        let manager = RuntimeManager::with_test_clock(RuntimeLimits::default(), injected);
+        assert_eq!(manager.inner.clock.now(), Duration::ZERO);
+        manager.tick();
+        assert_eq!(manager.inner.clock.now(), Duration::ZERO, "tick 不推进时钟");
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(manager.inner.clock.now(), Duration::from_secs(1));
+        assert_eq!(manager.scheduler_report().resident_pi, 0);
+    }
+
+    #[test]
+    fn a_parked_session_holds_no_process_and_no_runtime() {
+        let clock = Arc::new(FakeClock::new());
+        let injected: Arc<dyn Clock> = clock.clone();
+        let manager = RuntimeManager::with_test_clock(RuntimeLimits::default(), injected);
+        let session = manager.create_session(
+            SessionDescriptor {
+                binary: fake_binary(),
+                cwd: std::env::temp_dir(),
+                session_path: None,
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: None,
+            },
+            test_document("parked"),
+        );
+        assert_eq!(manager.session_state(session), Some(SchedulerState::Parked));
+        assert!(
+            manager.session_handle(session).is_none(),
+            "Parked 会话不得持有 Runtime"
+        );
+        assert_eq!(manager.scheduler_report().resident_pi, 0);
+        // 「登记不创建线程」由 `tests/reaper_thread_budget.rs` 在独立进程里断言。
     }
 }

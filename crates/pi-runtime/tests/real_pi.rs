@@ -2,14 +2,15 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::Receiver,
+    sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
 };
 
 use pi_render::ConversationDocument;
 use pi_runtime::{
-    ActorLimits, ComposerMode, ControlOperation, ControlOutcome, ControlRequest, Dirty, RpcIntent,
-    RuntimeEffectKind, RuntimeId, RuntimeLimits, RuntimeManager, SessionControls, SessionHandle,
+    ActorLimits, Clock, ComposerMode, ControlOperation, ControlOutcome, ControlRequest, Dirty,
+    FakeClock, Priority, RpcIntent, RuntimeEffectKind, RuntimeId, RuntimeLimits, RuntimeManager,
+    SchedulerLimits, SchedulerState, SessionControls, SessionDescriptor, SessionHandle,
     SessionSnapshot, TerminalState, ToolPreset,
 };
 
@@ -38,6 +39,17 @@ fn assert_pinned_version(binary: &Path) {
         String::from_utf8_lossy(&output.stdout).trim(),
         pi_rpc::PINNED_PI_VERSION
     );
+}
+
+/// 等到 Runtime 静止（队列空、无在执行作业）。
+///
+/// Park 只有在静止时才能把进程留给 warm pool；启动后的元数据刷新正是一批在执行的作业。
+fn wait_for_quiescence(handle: &SessionHandle, label: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !handle.is_quiescent() {
+        assert!(Instant::now() < deadline, "{label} 迟迟没有静止");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn empty_document(id: &str, cwd: &Path) -> ConversationDocument {
@@ -506,5 +518,167 @@ fn bounded_actor_and_effect_backpressure_hold_against_real_pi() {
             .dispatch(RpcIntent::Prompt, None, ComposerMode::Steer)
             .is_err(),
         "停止后不再接受任何命令"
+    );
+}
+
+/// R23：用真实 pi 验证 Park/Resume 的两条路径，全程零 token。
+///
+/// 只用「`--session` 指向 0 字节文件」这一钉死的空文件分支（session-manager.ts:902-911）
+/// 让 pi 自己落盘，再跑 `switch_session` 与元数据 RPC，不发任何 prompt。
+///
+/// 这里同时钉死立项文档 § 三对 warm pool 的语义要求：热进程是**可被任意 Session 复用的**，
+/// 不是某个会话的预热副本 —— 因此测试特意让 A 的进程去接管 B，而不是 A 自己再接回去。
+#[test]
+#[ignore = "requires PI_RUNTIME_TEST_BINARY=official pi 0.84.2"]
+fn park_to_warm_and_resume_via_switch_session_hold_against_real_pi() {
+    let binary = configured_binary();
+    assert_pinned_version(&binary);
+    assert!(
+        env::var_os("PI_CODING_AGENT_SESSION_DIR").is_none(),
+        "unset PI_CODING_AGENT_SESSION_DIR before running this isolation test"
+    );
+
+    let temp = tempfile::tempdir().expect("failed to create isolated runtime test root");
+    let agent_dir = temp.path().join("agent");
+    let cwd = temp.path().join("project");
+    let sessions_dir = agent_dir.join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+
+    let idle_ttl = Duration::from_secs(180);
+    let clock = Arc::new(FakeClock::new());
+    let injected: Arc<dyn Clock> = clock.clone();
+    // 用 fake clock 构造：TTL 与队列提升全部由显式 tick 驱动，收尾时也能确定性地
+    // 把 warm pool 清空，而不是靠等真实时间。
+    let manager = RuntimeManager::with_test_clock(
+        RuntimeLimits {
+            scheduler: SchedulerLimits {
+                user_session_slots: 2,
+                total_runtime_slots: 3,
+                warm_idle: 1,
+                idle_ttl,
+                queue_capacity: 8,
+                aging_step: Duration::from_secs(5),
+            },
+            ..RuntimeLimits::default()
+        },
+        injected,
+    );
+
+    let descriptor = |path: &Path| SessionDescriptor {
+        binary: binary.clone(),
+        cwd: cwd.clone(),
+        session_path: Some(path.to_path_buf()),
+        tool_preset: ToolPreset::Inherit,
+        agent_dir: Some(agent_dir.clone()),
+    };
+
+    let file_a = sessions_dir.join("r23-a.jsonl");
+    let file_b = sessions_dir.join("r23-b.jsonl");
+    fs::write(&file_a, "").unwrap();
+    fs::write(&file_b, "").unwrap();
+
+    // ---- 先把 B 播种成一个真正的会话文件 ----
+    // `switch_session` 要切到的必须是 pi 自己写过 header 的会话；先起一次再停掉，
+    // 全程零 token（只有 get_commands / get_state）。
+    let session_b = manager.create_session(descriptor(&file_b), empty_document("r23-b", &cwd));
+    let seed = manager
+        .request_run(session_b, Priority::FOREGROUND)
+        .unwrap_or_else(|error| panic!("seed run failed: {error}"))
+        .expect("a free run slot must be available");
+    let seed_dirty = seed.subscribe_dirty();
+    let (_, seed_controls) = wait_for_controls(&seed, &seed_dirty, "seed runtime");
+    let session_b_id = seed_controls.session_id.clone();
+    manager.stop_session(session_b);
+    assert!(file_b.is_file(), "空文件分支必须让 pi 写下 session header");
+
+    // ---- A 冷启动 ----
+    let session_a = manager.create_session(descriptor(&file_a), empty_document("r23-a", &cwd));
+    let running_a = manager
+        .request_run(session_a, Priority::FOREGROUND)
+        .unwrap_or_else(|error| panic!("cold start failed: {error}"))
+        .expect("a free run slot must be available");
+    let a_dirty = running_a.subscribe_dirty();
+    let (_, a_controls) = wait_for_controls(&running_a, &a_dirty, "cold started A");
+    let warm_pid = running_a
+        .process_id()
+        .expect("running pi must report a pid");
+    assert_eq!(
+        canonical(
+            a_controls
+                .session_file
+                .as_deref()
+                .expect("get_state must return a session_file")
+        ),
+        canonical(&file_a)
+    );
+    let before = manager.scheduler_report();
+    assert_eq!(before.cold_starts, 2, "seed 与 A 各一次冷启动");
+    assert_eq!(before.warm_resumes, 0);
+
+    // ---- Park A：进程进 warm pool，会话转 Parked ----
+    // 真实 pi 的启动元数据要跑好几秒；这批作业没收干净时 Park 只会退化成冷停。
+    wait_for_quiescence(&running_a, "cold started A");
+    manager
+        .park(session_a)
+        .unwrap_or_else(|error| panic!("park failed: {error}"));
+    assert_eq!(
+        manager.session_state(session_a),
+        Some(SchedulerState::Parked)
+    );
+    let parked = manager.scheduler_report();
+    assert_eq!(parked.warm, 1, "空闲且已落盘的真实 pi 必须进 warm pool");
+    assert_eq!(parked.warm_parks, 1);
+    assert_eq!(parked.resident_pi, 1, "热进程仍然占着常驻名额");
+
+    // ---- B 复用 A 留下的热进程：走 switch_session，而不是重起一个 203MB 的进程 ----
+    let resumed_b = manager
+        .request_run(session_b, Priority::FOREGROUND)
+        .unwrap_or_else(|error| panic!("warm resume failed: {error}"))
+        .expect("a free run slot must be available");
+    let b_dirty = resumed_b.subscribe_dirty();
+    let (_, b_controls) = wait_for_controls(&resumed_b, &b_dirty, "warm resumed B");
+    let after = manager.scheduler_report();
+    assert_eq!(after.warm_resumes, 1, "Resume 必须优先复用热进程");
+    assert_eq!(after.cold_starts, 2, "复用路径不得触发冷启动");
+    assert_eq!(
+        resumed_b.process_id(),
+        Some(warm_pid),
+        "复用的必须是 Park 前那个 pi 进程"
+    );
+    assert_eq!(
+        b_controls.session_id, session_b_id,
+        "switch_session 之后内核必须真的绑到 B 这个会话"
+    );
+    assert_eq!(
+        canonical(
+            b_controls
+                .session_file
+                .as_deref()
+                .expect("get_state must return a session_file")
+        ),
+        canonical(&file_b)
+    );
+    assert_eq!(resumed_b.session_id(), session_b, "SessionId 跨复用不变");
+
+    // ---- Idle TTL：推进 fake clock 到期，热进程被回收，常驻名额归还 ----
+    wait_for_quiescence(&resumed_b, "warm resumed B");
+    manager
+        .park(session_b)
+        .unwrap_or_else(|error| panic!("park B failed: {error}"));
+    assert_eq!(manager.scheduler_report().warm, 1);
+    clock.advance(idle_ttl + Duration::from_secs(1));
+    manager.tick();
+    let reaped = manager.scheduler_report();
+    assert_eq!(reaped.warm, 0, "TTL 到点必须回收热进程");
+    assert_eq!(reaped.idle_reaped, 1);
+    assert_eq!(reaped.resident_pi, 0);
+
+    manager.remove_session(session_a);
+    manager.remove_session(session_b);
+    assert_eq!(manager.scheduler_report().resident_pi, 0);
+    assert!(
+        fs::read_dir(&cwd).unwrap().next().is_none(),
+        "zero-token park/resume test wrote into the temporary cwd"
     );
 }
