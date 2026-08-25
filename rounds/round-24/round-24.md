@@ -193,7 +193,7 @@ Codex thread `01a03809-c451-71a1-b82e-ef46baf1cfce`）。只读、与 writer 隔
 这是本轮 suspend-on-switch 引入的缺口，新增 `expire_extension_dialog`：
 **截止时间属于请求、不属于窗口**，无论此刻显不显示都回一个 cancelled。
 
-整改后：`.\scriptsalidate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **136 passed**
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **136 passed**
 （较整改前 133 增 3 条 P1 回归用例）。
 
 ### 踩到的坑
