@@ -179,7 +179,7 @@ pub struct SessionUiState {
     extension_widgets_above_scroll: ScrollHandle,
     extension_widgets_below_scroll: ScrollHandle,
     status: ChatStatus,
-    load_generation: u64,
+    load_generation: LoadGeneration,
     composer_mode: ComposerMode,
     draft_key: Option<String>,
     attachments: Vec<ComposerAttachment>,
@@ -253,7 +253,7 @@ impl SessionUiState {
             extension_widgets_above_scroll: ScrollHandle::default(),
             extension_widgets_below_scroll: ScrollHandle::default(),
             status: ChatStatus::Empty,
-            load_generation: 0,
+            load_generation: LoadGeneration(0),
             composer_mode: ComposerMode::Steer,
             draft_key: None,
             attachments: Vec::new(),
@@ -428,6 +428,22 @@ fn tab_state_of(slot: &SessionUiState) -> gpui_pi_ui::SessionTabState {
     }
 }
 
+/// 「按标签重载」类后台任务的代次：历史渲染与文件索引。
+///
+/// 单独一个类型，是因为 `SessionUiState` 上还有一个 `active_generation`（Runtime 代次），
+/// 两者都是 `u64`，混用编译得过、行为却是回填永远对不上——R24 第二轮独立审查抓到的
+/// 正是这个：fresh 会话把 `active_generation` 传给了按 `load_generation` 校验的索引回填，
+/// 于是新标签上永远是 1 对 0，`@` 补全在 fresh 会话里从来没工作过。
+/// 让它们类型不同，这一类错误就编译不过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadGeneration(u64);
+
+impl LoadGeneration {
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 /// 主操作入口的文案。
 ///
 /// 三态各说各的：没登记过是「启动」，登记过没进程是「恢复」，已经在排队则**什么都不用做**
@@ -583,9 +599,14 @@ impl ChatPanel {
     }
 
     /// 这个标签还是干净的吗？干净的标签可以直接复用，不必再开一个。
+    ///
+    /// 附件也算「用过」：空标签上挂着的图片没有 `draft_key` 可存，复用这个标签
+    /// 等于把一张无关的图静默带进新会话。判成不干净就会另开一个标签，
+    /// 图片留在原处——既不串台，也不丢用户已经做过的操作。
     fn is_pristine(slot: &SessionUiState) -> bool {
         slot.session.is_none()
             && slot.draft_key.is_none()
+            && slot.attachments.is_empty()
             && matches!(slot.status, ChatStatus::Empty)
     }
 
@@ -988,7 +1009,13 @@ impl ChatPanel {
     ///
     /// 结果按 `tab_id` 回填：索引是后台任务，回来时用户可能已经切走，
     /// 走 `Deref` 会把 A 的项目索引装进 B 的补全面板。
-    fn start_file_index(&self, tab_id: u64, generation: u64, cwd: PathBuf, cx: &mut Context<Self>) {
+    fn start_file_index(
+        &self,
+        tab_id: u64,
+        generation: LoadGeneration,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor
@@ -1078,7 +1105,7 @@ impl ChatPanel {
         cx: &mut Context<Self>,
     ) {
         let (tab_id, generation) = self.project(index, |panel| {
-            panel.load_generation = panel.load_generation.wrapping_add(1);
+            panel.load_generation = panel.load_generation.next();
             panel.begin_active_generation();
             panel.tab_title = selection.title.clone();
             panel.status = ChatStatus::Loading {
@@ -1124,8 +1151,10 @@ impl ChatPanel {
         // 全叫「新会话」的标签条等于没有标签。
         let index = self.open_tab(fresh_session_title(&cwd), window, cx)?;
         let tab_id = self.sessions[index].tab_id;
-        let generation = self.project(index, |panel| {
+        let load_generation = self.project(index, |panel| {
             let generation = panel.begin_active_generation();
+            // 文件索引按 `load_generation` 校验回填，这里必须一起推进。
+            panel.load_generation = panel.load_generation.next();
             let document = ConversationDocument {
                 session_id: format!("fresh-{tab_id}-{generation}"),
                 source_path: PathBuf::new(),
@@ -1145,7 +1174,7 @@ impl ChatPanel {
             panel.drafts.clear(&draft_key);
             panel.composer_cwd = Some(cwd.clone());
             panel.fresh_session = true;
-            generation
+            panel.load_generation
         });
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1161,7 +1190,7 @@ impl ChatPanel {
             tool_preset: ToolPreset::Inherit,
             agent_dir: pi_data::agent_dir(),
         };
-        self.start_file_index(tab_id, generation, cwd, cx);
+        self.start_file_index(tab_id, load_generation, cwd, cx);
         self.bind_session(index, descriptor, document, window, cx);
         cx.notify();
         Ok(())
@@ -1286,7 +1315,7 @@ impl ChatPanel {
     fn finish_load(
         &mut self,
         tab_id: u64,
-        generation: u64,
+        generation: LoadGeneration,
         title: String,
         result: Result<Arc<ConversationDocument>, String>,
     ) -> bool {
@@ -6829,6 +6858,43 @@ mod tests {
         });
     }
 
+    /// 第二轮独立审查 P2：空标签上挂着的附件不能被静默带进新会话。
+    ///
+    /// 这类附件没有 `draft_key` 可存，复用这个标签就等于把一张无关的图带进新会话；
+    /// 反过来，直接清掉又是在丢用户已经做过的操作。判成「不干净」另开一个标签，两头都不亏。
+    #[gpui::test]
+    fn an_attachment_on_the_empty_tab_keeps_it_from_being_reused(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 干净的空标签会被原地复用，不长出第二个标签。
+                assert!(ChatPanel::is_pristine(&panel.sessions[0]));
+
+                let draft = pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\ncarry".to_vec())
+                    .expect("fixture png");
+                panel
+                    .add_draft_images(vec![draft], cx)
+                    .expect("挂一张图到空标签上");
+                assert_eq!(panel.attachments.len(), 1);
+                assert!(
+                    !ChatPanel::is_pristine(&panel.sessions[0]),
+                    "挂了附件就不算没用过"
+                );
+
+                let opened = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("另开一个标签");
+                assert_eq!(opened, 1, "带着附件的标签不该被复用");
+                assert!(panel.attachments.is_empty(), "新标签不得继承别人的附件");
+                assert_eq!(
+                    panel.sessions[0].attachments.len(),
+                    1,
+                    "原标签的附件也不该被悄悄丢掉"
+                );
+            });
+        });
+    }
+
     #[test]
     fn tab_labels_truncate_by_character_so_multibyte_titles_stay_valid() {
         assert_eq!(truncate_label("短标题", 18), "短标题");
@@ -7373,14 +7439,29 @@ mod tests {
         let panel = captured.borrow().clone().unwrap();
         panel.update(cx, |panel, _| {
             let tab_id = panel.tab_id;
-            panel.load_generation = 2;
+            panel.load_generation = LoadGeneration(2);
             panel.active_generation = 2;
-            assert!(!panel.finish_load(tab_id, 1, "old".to_owned(), Ok(document("old"))));
+            assert!(!panel.finish_load(
+                tab_id,
+                LoadGeneration(1),
+                "old".to_owned(),
+                Ok(document("old"))
+            ));
             assert!(matches!(panel.status, ChatStatus::Empty));
             // 已经关掉的标签不该被任何迟到的渲染结果复活。
-            assert!(!panel.finish_load(tab_id + 999, 2, "gone".to_owned(), Ok(document("gone"))));
+            assert!(!panel.finish_load(
+                tab_id + 999,
+                LoadGeneration(2),
+                "gone".to_owned(),
+                Ok(document("gone"))
+            ));
             assert!(matches!(panel.status, ChatStatus::Empty));
-            assert!(panel.finish_load(tab_id, 2, "new".to_owned(), Ok(document("new"))));
+            assert!(panel.finish_load(
+                tab_id,
+                LoadGeneration(2),
+                "new".to_owned(),
+                Ok(document("new"))
+            ));
             assert!(matches!(panel.status, ChatStatus::Ready(_)));
         });
     }

@@ -260,6 +260,31 @@ Codex thread `01a03809-c451-71a1-b82e-ef46baf1cfce`）。只读、与 writer 隔
 整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **136 passed**
 （较整改前 133 增 3 条 P1 回归用例）。
 
+### 第二轮独立代码审查与整改
+
+首轮 codex 审查只覆盖到 `c5ba550`，之后又落了 4 个 commit（P1/P2 整改、崩溃整改、两轮视觉整改），
+而这些恰恰是最该被独立审的部分——findings 驱动的整改往往自带新假设。
+因此在收口前补跑第二轮，覆盖 `main...HEAD` 的完整 diff。
+
+审查通道：`/codex:review --scope branch --base main --background`，Codex thread
+`01a0392e-eda4-7331-9a91-a4404a4d0ae2`。结论：**2 项 P2**，核对源码后确认**全部成立**。
+
+| 编号 | 问题 | 整改 |
+|---|---|---|
+| P2-1 | fresh 会话把 `active_generation` 传给了按 `load_generation` 校验回填的文件索引。新标签上 `load_generation` 恒为 0 而 `active_generation` 已是 1，索引回来**永远**对不上被丢弃——`@` 文件补全在 fresh 会话里从来没工作过。改造前的实现传的是 `load_generation`，是本轮引入的回归 | 不止改传参：把 `load_generation` 提升为 newtype `LoadGeneration`，`start_file_index` / `finish_load` 一起改签名。两个代次都是 `u64` 时混用编译得过、行为却静默错误；类型不同之后这一类错误**编译不过**，比补一条测试更彻底 |
+| P2-2 | `is_pristine` 不看附件：在初始空标签上挂了图再「新建会话」，该标签被判为干净而原地复用，`start_new_session` 只清了 composer 文本与草稿，那张无关的图被静默带进新会话 | `is_pristine` 增加 `attachments.is_empty()`。判成不干净就另开一个标签，图留在原处——既不串台，也不丢用户已经做过的操作 |
+
+**为什么 P2-1 没有配回归测试**：它的自然测法是跑一次 `start_new_session`，但那条路径会
+`request_run` 真去 spawn `vendor/pi/pi.exe`，并落到真实的 `~/.pi`（红线 5）。为一条测试在生产代码里
+开一个二进制注入口不划算，而 newtype 已经把这一类错误挡在编译期。这一条如实记为「类型约束替代测试」。
+P2-2 有回归测试 `an_attachment_on_the_empty_tab_keeps_it_from_being_reused`（只走 `open_tab`，不启动会话）。
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **140 passed**。
+
+> 过程记录：这轮整改我一度只跑了 `cargo check` + `cargo test` 就准备收口，
+> 漏掉的 `unused_variables` 被 `validate` 的 `clippy -D warnings` 拦下。
+> **`cargo check` 不 deny warnings，不能替代 validate。**
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在
