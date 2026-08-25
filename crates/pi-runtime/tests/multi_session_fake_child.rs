@@ -236,3 +236,65 @@ fn closing_a_running_session_lets_a_queued_one_take_the_slot_immediately() {
         manager.remove_session(*session);
     }
 }
+
+/// R24 视觉验收暴露的崩溃根因：`park` **在调用线程上**完成整套进程交接。
+///
+/// `park` 收尾时会 `tick()` 一次；有会话在排队时，那一下就地把它提升上来，
+/// 连带一次 `switch_session` 往返（复用热进程）或一次冷启动。也就是说 `park`
+/// 返回时新会话已经在跑了——这些工作全部发生在调用者的线程上。
+/// app 因此**绝不能**在 GPUI 主线程上调用它：单会话时 `tick()` 无事可做所以看不出来，
+/// 一旦有排队会话，点一下「挂起」就是整窗口卡死一次进程交接的时间。
+#[test]
+fn park_finishes_a_queued_handoff_on_the_calling_thread() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let limits = SchedulerLimits {
+        warm_idle: 1,
+        ..SchedulerLimits::default()
+    };
+    let manager = test_manager(limits);
+    let sessions: Vec<SessionId> = ["p1", "p2", "p3"]
+        .into_iter()
+        .map(|name| register(&manager, workspace.path(), name))
+        .collect();
+
+    let first = run(&manager, sessions[0], Priority::FOREGROUND);
+    let _second = run(&manager, sessions[1], Priority::FOREGROUND);
+    assert!(
+        manager
+            .request_run(sessions[2], Priority::FOREGROUND)
+            .expect("queueing")
+            .is_none(),
+        "并发上限 2，第三个必须排队"
+    );
+    assert_eq!(
+        manager.session_state(sessions[2]),
+        Some(SchedulerState::Queued)
+    );
+
+    // 等到静止再 Park，否则会退化成优雅停机（那条路同样是同步的，只是不走 warm 交接）。
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !first.is_quiescent() {
+        assert!(Instant::now() < deadline, "Runtime 迟迟没有静止");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    manager
+        .park(sessions[0])
+        .unwrap_or_else(|error| panic!("park failed: {error}"));
+
+    // 关键断言：**没有任何额外的 tick 或等待**，排队会话已经在跑了。
+    // 这证明进程交接确确实实发生在 `park` 的调用线程上。
+    assert_eq!(
+        manager.session_state(sessions[2]),
+        Some(SchedulerState::Running),
+        "park 返回时排队会话已被就地提升——说明交接在调用线程上完成"
+    );
+    assert_eq!(
+        manager.session_state(sessions[0]),
+        Some(SchedulerState::Parked)
+    );
+    assert!(manager.scheduler_report().resident_pi <= limits.total_runtime_slots);
+
+    for session in sessions {
+        manager.remove_session(session);
+    }
+}

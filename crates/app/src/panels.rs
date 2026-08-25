@@ -160,6 +160,10 @@ pub struct SessionUiState {
     scheduler_state: Option<pi_runtime::SchedulerState>,
     /// 最近一次调度失败的原因（`Failed` 态才有值）。
     scheduler_failure: Option<String>,
+    /// 正在后台执行的调度器操作的文案（启动 / 恢复 / 挂起）。
+    ///
+    /// 这些操作会碰进程，必须放后台；期间标签得有个如实的说明，也得挡住重复点击。
+    scheduler_job: Option<&'static str>,
     /// 当前绑定的 Runtime。
     active: Option<SessionHandle>,
     active_generation: u64,
@@ -235,6 +239,7 @@ impl SessionUiState {
             tab_title: "新标签".to_owned(),
             scheduler_state: None,
             scheduler_failure: None,
+            scheduler_job: None,
             active: None,
             active_generation: 0,
             active_epoch: 0,
@@ -621,12 +626,9 @@ impl ChatPanel {
         self.workspace_bounds = None;
         self.message_pane_bounds = None;
         // 排队中的标签被切到前台就该排在前面；`WaitQueue` 只升不降，不会误伤别人。
-        if self.scheduler_state == Some(pi_runtime::SchedulerState::Queued)
-            && let Some(session) = self.session
-        {
-            let _ = self
-                .runtime_manager
-                .request_run(session, pi_runtime::Priority::FOREGROUND);
+        // 走后台：`request_run` 抢到槽就会就地冷启动一个进程。
+        if self.scheduler_state == Some(pi_runtime::SchedulerState::Queued) {
+            self.request_run_in_background(index, "启动中…", window, cx);
         }
         self.sync_scheduler_states();
         self.apply_window_title(window);
@@ -656,10 +658,19 @@ impl ChatPanel {
         // 关标签前先把这个标签欠 pi 的 Extension UI 响应结清；进程一旦回收就再也送不出去。
         self.project(index, |panel| panel.reset_extension_ui(window, cx));
         if let Some(session) = self.sessions[index].session.take() {
-            self.runtime_manager.remove_session(session);
-            // 运行槽刚空出来，立刻推一次调度：不这样做，排队中的会话要等 reaper
-            // 轮询（默认 TTL 下最长 45s）才补位。
-            self.runtime_manager.tick();
+            // 标签立刻从条上摘掉，进程回收放后台：`remove_session` 要等优雅停机，
+            // 随后的 `tick()` 还可能就地拉起一个排队会话，两者都不能占着 UI 线程。
+            // `tick()` 是必须的——不推这一下，排队会话要等 reaper 轮询
+            //（默认 TTL 下最长 45s）才补位。
+            self.spawn_scheduler_job(
+                window,
+                cx,
+                move |manager| {
+                    manager.remove_session(session);
+                    manager.tick();
+                },
+                |_, (), _, _| {},
+            );
         }
         if self.sessions.len() == 1 {
             // 最后一个标签不删除而是重置：`Deref` 必须永远有落点。
@@ -681,31 +692,52 @@ impl ChatPanel {
     }
 
     /// 挂起当前标签的会话：让出 pi 进程，会话保留。
+    ///
+    /// 整个 `park` 都在后台线程做。它会等作业排空、拆 Actor、可能关进程，收尾时还会
+    /// `tick()` 一次把排队会话就地提升上来——在 GPUI 主线程上做这些就是整窗口卡死。
     fn park_active_session(
         &mut self,
         _: &gpui::ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.park_focused_session(window, cx);
+    }
+
+    fn park_focused_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.focused;
         let Some(session) = self.sessions[index].session else {
             return;
         };
-        match self.runtime_manager.park(session) {
-            Ok(()) => {
-                self.runtime_manager.tick();
-                self.project(index, |panel| {
-                    panel.rpc_success = Some("会话已挂起；进程已让出，可随时恢复".to_owned());
-                    panel.clear_rpc_error();
-                });
-            }
-            Err(error) => self.project(index, |panel| {
-                panel.rpc_success = None;
-                panel.rpc_error_protected = true;
-                panel.rpc_error = Some(format!("挂起失败：{error}"));
-            }),
+        if self.sessions[index].scheduler_job.is_some() {
+            return;
         }
-        self.reconcile_scheduler(window, cx);
+        let tab_id = self.sessions[index].tab_id;
+        self.sessions[index].scheduler_job = Some("挂起中…");
+        cx.notify();
+        self.spawn_scheduler_job(
+            window,
+            cx,
+            move |manager| manager.park(session),
+            move |panel, result, _, _| {
+                panel.project_tab(tab_id, |panel| {
+                    panel.scheduler_job = None;
+                    match result {
+                        // 成功不再另出一条绿条：常驻的状态说明已经写着「会话已挂起」，
+                        // 两条并排说同一件事只是把消息区又挤掉一行。
+                        Ok(()) => {
+                            panel.rpc_success = None;
+                            panel.clear_rpc_error();
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error_protected = true;
+                            panel.rpc_error = Some(format!("挂起失败：{error}"));
+                        }
+                    }
+                });
+            },
+        );
     }
 
     /// 一个标签在标签条上的形态。
@@ -730,6 +762,14 @@ impl ChatPanel {
     /// `Starting` / `Stopping` 也不出——它们是放开调度锁前的短暂中间态，闪一下反而是噪声。
     fn session_state_note(&self, cx: &App) -> Option<SessionStateNote> {
         let slot = &self.sessions[self.focused];
+        // 后台正在办的事优先说：这期间调度状态还停在旧值（比如刚点了「恢复运行」，
+        // 会话仍是 `Parked`），照旧值出提示只会让用户以为按钮没生效。
+        if let Some(job) = slot.scheduler_job {
+            return Some(SessionStateNote {
+                dot: cx.theme().warning,
+                text: job.to_owned(),
+            });
+        }
         let state = slot.scheduler_state?;
         let text = match state {
             pi_runtime::SchedulerState::Queued => format!(
@@ -1100,7 +1140,7 @@ impl ChatPanel {
             agent_dir: pi_data::agent_dir(),
         };
         self.start_file_index(tab_id, generation, cwd, cx);
-        self.bind_session(index, descriptor, document, window, cx)?;
+        self.bind_session(index, descriptor, document, window, cx);
         cx.notify();
         Ok(())
     }
@@ -1116,25 +1156,15 @@ impl ChatPanel {
         document: ConversationDocument,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) {
         self.ensure_scheduler_bridge(window.window_handle(), cx);
+        // 登记是纯内存操作（R23 验收：登记 20 个会话零进程），同步做没问题；
+        // 真正会拉起进程的 `request_run` 必须进后台。
         let session = self.runtime_manager.create_session(descriptor, document);
-        let priority = self.priority_for(index);
-        match self.runtime_manager.request_run(session, priority) {
-            Ok(handle) => {
-                self.sessions[index].session = Some(session);
-                self.sessions[index].scheduler_failure = None;
-                if let Some(handle) = handle {
-                    self.attach_runtime(index, handle, window, cx);
-                }
-                self.sync_scheduler_states();
-                Ok(())
-            }
-            Err(error) => {
-                self.runtime_manager.remove_session(session);
-                Err(error)
-            }
-        }
+        self.sessions[index].session = Some(session);
+        self.sessions[index].scheduler_failure = None;
+        self.sync_scheduler_states();
+        self.request_run_in_background(index, "启动中…", window, cx);
     }
 
     /// 标签的调度优先级：只有用户正在看的那个才是前台。
@@ -1144,6 +1174,87 @@ impl ChatPanel {
         } else {
             pi_runtime::Priority::BACKGROUND
         }
+    }
+
+    /// 在后台线程执行一段**会碰进程**的调度器操作，完成后回到 UI 线程收尾并 reconcile。
+    ///
+    /// `RuntimeManager` 的 `park` / `request_run` / `remove_session` / `tick` 都可能同步地
+    /// 关掉一个 pi 进程、做一次 `switch_session` 往返，甚至冷启一个新进程 ——
+    /// `park` 收尾时的那次 `tick()` 就会把排队会话**就地**提升上来
+    /// （`pi-runtime` 的 `park_finishes_a_queued_handoff_on_the_calling_thread` 钉死了这条）。
+    ///
+    /// 这些工作一旦落在 GPUI 主线程上，就是整窗口卡死一次进程交接的时间；多会话之后更糟，
+    /// 因为它同时冻住了**其他会话**的流式渲染。R24 视觉验收里「2 活跃 + 1 排队时点挂起
+    /// 程序崩溃退出、单活跃时正常」正是这条：单会话时 `tick()` 无事可做，所以看不出来。
+    fn spawn_scheduler_job<R: Send + 'static>(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(RuntimeManager) -> R + Send + 'static,
+        settle: impl FnOnce(&mut Self, R, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let manager = self.runtime_manager.clone();
+        cx.spawn_in(window, async move |panel, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { job(manager) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let _ = panel.update(cx, |panel, cx| {
+                    settle(panel, outcome, window, cx);
+                    // 绑定统一交给 reconcile：它按调度器的**当前**状态取句柄，
+                    // 不依赖这次调用恰好返回了什么。
+                    panel.reconcile_scheduler(window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 后台申请运行槽。
+    ///
+    /// 拿到句柄这件事交给 `reconcile_scheduler`，这里只负责把 busy 标记立起来再放下 ——
+    /// 排队会话后来被调度器提升时走的也是同一条 reconcile 路径，两边保持一致。
+    fn request_run_in_background(
+        &mut self,
+        index: usize,
+        label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions[index].session else {
+            return;
+        };
+        if self.sessions[index].scheduler_job.is_some() {
+            return;
+        }
+        let tab_id = self.sessions[index].tab_id;
+        let priority = self.priority_for(index);
+        self.sessions[index].scheduler_job = Some(label);
+        cx.notify();
+        self.spawn_scheduler_job(
+            window,
+            cx,
+            move |manager| manager.request_run(session, priority).map(|_| ()),
+            move |panel, result, _, _| {
+                panel.project_tab(tab_id, |panel| {
+                    panel.scheduler_job = None;
+                    match result {
+                        // 抢到槽和进了队列都不是错误：状态由 reconcile 如实反映。
+                        Ok(()) => {
+                            panel.rpc_success = None;
+                            panel.clear_rpc_error();
+                            panel.scheduler_failure = None;
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error_protected = true;
+                            panel.rpc_error = Some(error);
+                        }
+                    }
+                });
+            },
+        );
     }
 
     /// 历史渲染完成后回填到**发起它的那个标签**。
@@ -1184,8 +1295,8 @@ impl ChatPanel {
         let index = self.focused;
         // 已经登记过（Parked / Failed / Queued）的会话走重跑，不再登记第二遍 ——
         // 再登记一次会把同一段对话变成两个互不相识的会话。
-        if let Some(session) = self.sessions[index].session {
-            self.resume_session(index, session, window, cx);
+        if self.sessions[index].session.is_some() {
+            self.resume_session(index, window, cx);
             return;
         }
         let ChatStatus::Ready(history) = &self.status else {
@@ -1205,45 +1316,13 @@ impl ChatPanel {
         };
         self.rpc_success = None;
         self.rpc_error = None;
-        if let Err(error) = self.bind_session(index, descriptor, (*history).clone(), window, cx) {
-            self.rpc_success = None;
-            self.rpc_error_protected = true;
-            self.rpc_error = Some(error);
-        }
+        self.bind_session(index, descriptor, (*history).clone(), window, cx);
         cx.notify();
     }
 
     /// 重新请求运行一个已登记的会话（Parked / Failed / Queued 都走这里）。
-    fn resume_session(
-        &mut self,
-        index: usize,
-        session: pi_runtime::SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let priority = self.priority_for(index);
-        match self.runtime_manager.request_run(session, priority) {
-            Ok(Some(handle)) => {
-                self.project(index, |panel| {
-                    panel.rpc_success = None;
-                    panel.clear_rpc_error();
-                    panel.scheduler_failure = None;
-                });
-                self.attach_runtime(index, handle, window, cx);
-            }
-            // 没抢到槽：会话进了公平队列，标签显示 `Queued`，等调度器通知再接线。
-            Ok(None) => self.project(index, |panel| {
-                panel.rpc_success = None;
-                panel.clear_rpc_error();
-            }),
-            Err(error) => self.project(index, |panel| {
-                panel.rpc_success = None;
-                panel.rpc_error_protected = true;
-                panel.rpc_error = Some(error);
-            }),
-        }
-        self.sync_scheduler_states();
-        cx.notify();
+    fn resume_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_run_in_background(index, "恢复中…", window, cx);
     }
 
     /// 把一个刚拿到的 Runtime 装到标签上，并为它起一条事件泵。
@@ -1315,9 +1394,16 @@ impl ChatPanel {
                                 let should_stop =
                                     panel.project(index, |panel| panel.pull_runtime_snapshot(cx));
                                 if should_stop {
-                                    // 这个 Runtime 进了终态：立刻推一次调度让 Manager 收回
-                                    // 运行槽，排队中的会话才能马上补位，而不是等 reaper 轮询。
-                                    panel.runtime_manager.tick();
+                                    // 这个 Runtime 进了终态：推一次调度让 Manager 收回运行槽，
+                                    // 排队中的会话才能马上补位，而不是等 reaper 轮询。
+                                    // 放后台——这里正跑在 GPUI 主线程上，而 `tick()` 可能
+                                    // 就地把排队会话拉起来。
+                                    panel.spawn_scheduler_job(
+                                        window,
+                                        cx,
+                                        |manager| manager.tick(),
+                                        |_, (), _, _| {},
+                                    );
                                     panel.reconcile_scheduler(window, cx);
                                 }
                                 if index == panel.focused {
@@ -3365,7 +3451,11 @@ impl Render for ChatPanel {
         let session_state_note = self.session_state_note(cx);
         // 会话已登记但没有进程时，主操作是「恢复运行」而不是「启动活会话」。
         let session_registered = self.session.is_some();
+        // 后台还有调度作业没落地时，两个入口都不接受点击：重复点击会叠出第二次
+        // 进程操作，而第一次的结果还没回来。
+        let scheduler_busy = self.scheduler_job.is_some();
         let can_park = live_started
+            && !scheduler_busy
             && self.control_operation.is_none()
             && self
                 .active
@@ -3964,7 +4054,8 @@ impl Render for ChatPanel {
                                                     "为这份历史启动官方 pi RPC 活会话"
                                                 })
                                                 .disabled(
-                                                    self.control_operation.is_some()
+                                                    scheduler_busy
+                                                        || self.control_operation.is_some()
                                                         || !matches!(
                                                             self.status,
                                                             ChatStatus::Ready(_)
@@ -6206,11 +6297,15 @@ mod tests {
     }
 
     /// T2：关标签才注销会话；关掉最后一个标签是重置而不是删除。
+    ///
+    /// 同时钉住 R24 崩溃整改后的契约：**标签立刻从条上消失，进程回收在后台**。
+    /// `remove_session` 要等优雅停机、随后的 `tick()` 还可能就地拉起一个排队会话，
+    /// 这两件事都不能占着 GPUI 主线程。
     #[gpui::test]
     fn closing_a_tab_unregisters_its_session_and_never_empties_the_strip(cx: &mut TestAppContext) {
         let workspace = tempfile::tempdir().expect("tempdir");
         let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
-        visual.update(|window, cx| {
+        let second = visual.update(|window, cx| {
             panel.update(cx, |panel, cx| {
                 panel.draft_key = Some("one".into());
                 panel
@@ -6221,21 +6316,77 @@ mod tests {
                 let second = panel.sessions[1].session.expect("已登记");
 
                 panel.close_tab(1, window, cx);
+                // UI 是即时的：标签当场没了，不等后台把进程收干净。
                 assert_eq!(panel.sessions.len(), 1);
                 assert_eq!(panel.focused, 0);
-                assert_eq!(
-                    panel.runtime_manager.session_state(second),
-                    None,
-                    "关标签必须注销它的会话"
-                );
+                second
+            })
+        });
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.runtime_manager.session_state(second),
+                None,
+                "后台回收落地后，会话必须已从调度器注销"
+            );
+        });
 
+        let only_tab = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
                 let only_tab = panel.tab_id;
                 panel.close_tab(0, window, cx);
                 assert_eq!(panel.sessions.len(), 1, "标签条永远不为空");
                 assert_ne!(panel.tab_id, only_tab, "最后一个标签是被重置，不是被复用");
                 assert!(matches!(panel.status, ChatStatus::Empty));
                 assert!(panel.draft_key.is_none());
+                only_tab
+            })
+        });
+        assert_ne!(only_tab, u64::MAX);
+    }
+
+    /// R24 视觉验收暴露的崩溃的回归用例：挂起**绝不能**在 GPUI 主线程上做。
+    ///
+    /// `RuntimeManager::park` 会等作业排空、拆 Actor、可能关进程，收尾还会 `tick()`
+    /// 一次把排队会话就地提升上来（见 `pi-runtime` 的
+    /// `park_finishes_a_queued_handoff_on_the_calling_thread`）。这一整套一旦占住主线程，
+    /// 就是整窗口卡死一次进程交接——用户实测「2 活跃 + 1 排队时点挂起程序崩溃退出」。
+    /// 这里钉的是结构：点击**同步返回**，只立起 busy 标记，真正的操作落在后台。
+    #[gpui::test]
+    fn parking_hands_the_process_work_to_a_background_task(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                register_parked_session(panel, 0, workspace.path());
+
+                panel.park_focused_session(window, cx);
+                assert_eq!(
+                    panel.scheduler_job,
+                    Some("挂起中…"),
+                    "点击必须立刻返回并立起 busy 标记"
+                );
+                // 重复点击被挡住：第一次的结果还没回来，再叠一次进程操作只会更糟。
+                panel.park_focused_session(window, cx);
+                assert_eq!(panel.scheduler_job, Some("挂起中…"));
             });
+        });
+        // busy 期间界面照常有话说，且说的是「正在办」而不是旧状态。
+        let note = panel.update(cx, |panel, cx| {
+            panel
+                .session_state_note(cx)
+                .map(|note| note.text)
+                .expect("busy 期间必须有说明")
+        });
+        assert_eq!(note, "挂起中…");
+
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.scheduler_job.is_none(),
+                "后台落地后必须清掉 busy 标记"
+            );
         });
     }
 
