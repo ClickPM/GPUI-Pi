@@ -761,7 +761,14 @@ impl ChatPanel {
             self.suspend_foreground_dialog(window, cx);
         }
         // 关标签前先把这个标签欠 pi 的 Extension UI 响应结清；进程一旦回收就再也送不出去。
-        self.project(index, |panel| panel.reset_extension_ui(window, cx));
+        // 只有关的是前台标签时才动窗口级状态——关后台标签不该影响前台的对话框。
+        if index == self.focused {
+            self.project(index, |panel| {
+                panel.reset_foreground_extension_ui(window, cx)
+            });
+        } else {
+            self.project(index, |panel| panel.reset_extension_ui_slot(cx));
+        }
         // 匿名标签的草稿存在 `tab-{id}` 下，标签一走这个键就再也取不到了。
         // 不清掉就是一条随开关次数增长的泄漏——带图片的草稿可能有几十 MB。
         // 有 `draft_key` 的标签不动：它的草稿按 pi 会话身份存，重新打开还要用。
@@ -2414,20 +2421,34 @@ impl ChatPanel {
         self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
     }
 
-    fn reset_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 结清**这个标签**欠 pi 的 Extension UI 债务。
+    ///
+    /// 只碰标签自己的状态。窗口级的那一半（对话框、焦点句柄、窗口标题）在
+    /// [`ChatPanel::reset_foreground_extension_ui`] 里，两者必须分开：关一个**后台**
+    /// 标签时若把窗口级状态一起清掉，前台正开着的对话框就会失去焦点句柄，
+    /// 从此既认不出它是最上层、也关不掉它——一个关不掉的模态浮在别的会话上，
+    /// 它那条请求也永远回不去。
+    fn reset_extension_ui_slot(&mut self, cx: &mut Context<Self>) {
         let cancelled = self.extension_ui.drain_cancelled_dialogs();
         for response in cancelled {
             self.send_extension_response(response, cx);
         }
-        if self.extension_dialog_open.take().is_some() {
+        self.extension_ui.reset();
+        self.extension_response_sender = None;
+    }
+
+    /// 前台标签的 Extension UI 收尾：标签自己的那份，加上窗口级的那份。
+    fn reset_foreground_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_dialog = self.extension_dialog_open.take().is_some();
+        self.reset_extension_ui_slot(cx);
+        if had_dialog {
             self.request_extension_dialog_close(window, cx);
         } else {
             self.clear_extension_dialog_focus();
         }
-        self.extension_ui.reset();
-        self.extension_response_sender = None;
-        self.window_title = "GPUI-Pi".to_owned();
-        window.set_window_title("GPUI-Pi");
+        // `extension_ui` 刚被清空，标题自然回落到 "GPUI-Pi"；走同一个入口，
+        // 免得这里和别处对「窗口标题该是什么」各写一份。
+        self.apply_window_title(window);
     }
 
     fn apply_runtime_events(&mut self, events: Vec<SessionRuntimeEvent>) {
@@ -5783,7 +5804,9 @@ mod tests {
             body_focus.contains_focused(window, cx) || body_focus.within_focused(window, cx)
         }));
         visual.update(|window, cx| {
-            panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.reset_foreground_extension_ui(window, cx)
+            });
         });
         draw_frames(&mut visual, 3);
         assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
@@ -5813,7 +5836,9 @@ mod tests {
                 footer_focus.contains_focused(window, cx) || footer_focus.within_focused(window, cx)
             }));
             visual.update(|window, cx| {
-                panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.reset_foreground_extension_ui(window, cx)
+                });
             });
             draw_frames(&mut visual, 3);
             assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
@@ -7006,6 +7031,66 @@ mod tests {
                 assert!(panel.active.is_none());
                 panel.apply_runtime_effect(controls_error(3), cx);
                 assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第九轮独立审查 P2：关一个后台标签不得动前台标签的对话框。
+    ///
+    /// 焦点句柄是**窗口级**的（只有前台标签会开对话框）。关后台标签时如果把它们
+    /// 一起清掉，前台那个对话框就再也认不出自己是最上层，于是既关不掉、
+    /// 它那条请求也回不去——一个关不掉的模态浮在别的会话上。
+    #[gpui::test]
+    fn closing_a_background_tab_leaves_the_foreground_dialog_alone(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        // 前台标签开一个 Extension UI 对话框。
+        panel.update(cx, |panel, cx| {
+            panel.draft_key = Some("one".into());
+            panel.extension_ui.apply(
+                "dlg".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "确认".into(),
+                    message: "Continue?".into(),
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.extension_dialog_open.as_deref(), Some("dlg"));
+            assert!(panel.extension_dialog_body_focus.is_some());
+        });
+
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 开第二个标签再切回前台，然后关掉那个后台标签。
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                panel.focus_tab(0, window, cx);
+                assert_eq!(panel.focused, 0);
+
+                panel.close_tab(1, window, cx);
+                assert_eq!(panel.sessions.len(), 1);
+                assert!(
+                    panel.extension_dialog_body_focus.is_some(),
+                    "关后台标签不得清掉前台对话框的焦点句柄"
+                );
+                assert_eq!(
+                    panel.extension_dialog_open.as_deref(),
+                    Some("dlg"),
+                    "前台对话框应原样开着"
+                );
+                assert_eq!(
+                    panel
+                        .extension_ui
+                        .active_dialog()
+                        .map(|dialog| dialog.id.as_str()),
+                    Some("dlg"),
+                    "前台标签的请求不该被别人的关闭流程清掉"
+                );
             });
         });
     }

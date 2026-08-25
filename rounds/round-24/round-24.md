@@ -385,6 +385,21 @@ Codex thread `01a038d2-574e-71b3-8f30-8ec3c496e231`。结论：**1 项 P2 + 1 �
 > P3 这条是第五轮那次拆分的**红利**：`draft_slot_key()` 一旦存在，「给 fresh 会话编一个身份」
 > 这件事就没有必要了，删掉即可。把概念拆对之后，后面的问题往往不是「再修一处」而是「少做一件事」。
 
+### 第九轮独立代码审查与整改
+
+Codex thread `01a038e6-ebbf-75d2-b71f-d2b7658b3a1a`。结论：**1 项 P2**，成立。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P2 | `reset_extension_ui` 里混着两个层级的状态：标签自己的（待回响应、`ExtensionUiState`）和窗口级的（对话框焦点句柄、窗口标题）。关**后台**标签时我把它整个投影进那一槽，于是前台正开着的对话框被清掉了焦点句柄——此后 `extension_dialog_is_topmost` 认不出它是最上层，只置 `needs_close` 却关不掉，一个关不掉的模态浮在别的会话上，它那条请求也永远回不去 | 按层级拆成两个函数：`reset_extension_ui_slot`（只碰标签自己，任何标签都能安全调用）与 `reset_foreground_extension_ui`（前台专用，额外收拾窗口级状态）。`close_tab` 按「关的是不是前台」二选一 | `closing_a_background_tab_leaves_the_foreground_dialog_alone` |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **147 passed**。
+
+> 又一次「一个函数担了两个层级」。与第五轮的 `draft_key`、第七轮的 pristine 判据同源：
+> **多会话把原本只有一份的状态劈成了「每标签一份」和「整窗口一份」两类，
+> 而所有单会话时代写的代码都默认这两类是同一回事。** 本轮的 findings 有相当一部分
+> 就是这条默认假设在各个角落的残留。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在
