@@ -114,4 +114,75 @@
 
 ## 本轮实测
 
-<!-- 完成后回填 -->
+### 门禁与基线
+
+- 新 worktree vendor 门禁（2026-08-25）：`fetch-pi.ps1` / `fetch-pi-source.ps1` / `fetch-pi-web.ps1`
+  全部 cache hit 并自检通过，`check-pins.ps1` 全绿；`vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、
+  `vendor/upstream/pi-web-0.8.9/` 三件齐全。
+- 改动前基线：`.\scripts\validate.ps1 -Logic` → `VALIDATE OK`。
+
+### 关键设计决定与依据
+
+| # | 决定 | 依据 |
+|---|---|---|
+| ① | **按 `SessionId` 隔离，不按 `RuntimeId`** | BACKLOG #18。`RuntimeId` 每次 Park/Resume 换新，照立项文档原字面实现会让一次唤醒丢掉草稿与滚动位置。立项文档 § 七 R24 已改写并附勘误。 |
+| ② | 标签身份分三层：`tab_id` → `SessionId` → `RuntimeId` | 三者生命周期不同：`tab_id` 是 app 内的标签身份（关掉再开必须换新，否则 GPUI 元素 id 复用会串状态）；`SessionId` 是会话；`RuntimeId` 是进程宿主，只用于 stale-snapshot 判定与重绑。合并任意两个都会在某条路径上串台。 |
+| ③ | **投影游标 `cursor` + `project()`，而不是把目标下标逐层传参** | 整套会话态投影（`apply_snapshot` / `apply_runtime_effect` / `sync_list_document` / `apply_control_outcome`…）约一千行都写成 `self.xxx`。改成传参要动遍每一个分支，且此后每加一条分支都可能忘记带下标；投影游标把「写进哪一槽」收敛成一个入口。`render` 第一行无条件 `cursor = focused` 兜底自愈。 |
+| ④ | 调度器通知**电平触发**、容量 1、`try_send` 丢满帧 | 通知不带内容，收到就重新查状态：合并掉的帧不会让 UI 停在旧状态。容量 1 保证 UI 卡顿不会长出一条无界队列（R22 要消灭的正是这个）。发布发生在持调度锁期间，`try_send` 永不阻塞。 |
+| ⑤ | 订阅做成 `SchedulerSubscription` 守卫，**析构即退订** | UI 侧必须把接收端交给一条阻塞线程。如果只靠「通道另一端没人了」收尾，那条线程会一直卡在 `recv` 上直到整个 Manager 析构——关一次窗口漏一条线程。退订当场摘掉名册项并断开通道，阻塞中的 `recv` 立刻返回。 |
+| ⑥ | 桥接线程**只在真的登记了会话之后才起** | 从没启动过活会话的面板不需要监听调度器；顺带避开 GPUI 测试调度器的「检测到其他线程活动」断言——它是确定性测试的一部分，不该为了绕过它给生产代码加 `#[cfg(test)]`。 |
+| ⑦ | 释放运行槽后由 **app 立刻 `tick()`** | R23 的队列提升只发生在 `tick()`，生产 reaper 的轮询间隔是 `clamp(idle_ttl/4, 200ms, 5s)`（默认 TTL 180s ⇒ 45s）。关闭/挂起会话、以及事件泵看到终态时立刻 `tick()`，排队会话才会马上补位。这是 app 侧接线，没有改 R23 的调度语义。 |
+| ⑧ | 终态判定取 `SessionSnapshot.terminal`，**不看 `Stopped` effect** | effect 会被背压淘汰，终态不会（R22 刻意如此）。只看 effect 的话，崩溃的 Runtime 不会再产生 Dirty，事件泵就永远阻塞在下一条通知上，运行槽拖到 reaper 轮询才回收。 |
+| ⑨ | 后台标签照常消费 effect，但**不碰 window** | 不消费 effect，R22 的有界 effect 缓存会把后台会话的增量淘汰掉，用户切回来就少一段。反过来，通知、窗口标题和 Extension UI 对话框是全局资源，后台会话去动它们等于替用户抢屏幕。 |
+| ⑩ | 切换标签**不启动也不停止**任何进程；只有 `Queued` 标签被切到前台时抬一次优先级 | 这是本轮的核心承诺。`WaitQueue::push` 对已排队条目取 `min`，只升不降，抬优先级不会误伤别人。Parked 会话切过去不自动恢复：它可能是用户主动挂起的，也可能是在别处被停掉的，替用户重新拉起一个约 203MB 的进程不是切标签该有的副作用。 |
+| ⑪ | 标签数上限 `MAX_SESSION_TABS = 8`，到顶明确拒绝 | 进程数由调度器兜底，但每个标签常驻一份 `ConversationDocument` + `ListState` + 整套会话态，与进程无关。静默淘汰会让用户正在用的标签凭空消失。8 与队列容量 64 相容：最坏 2 运行 + 6 排队。 |
+| ⑫ | 单个标签只要登记了会话就画标签条 | 状态点是用户唯一能看到会话在不在跑的地方，关闭入口也只在标签上；不画等于把一个活着的 pi 进程藏起来。纯历史预览（没有会话）仍然不画，避免为一条无信息的横条占掉一行消息区。 |
+
+### 与设计的偏离
+
+- 立项文档 § 七 R24 原写「按 `RuntimeId` 多实例隔离」，本轮按 BACKLOG #18 改为 `SessionId`，
+  已同步修订立项文档并在该处附勘误说明，不是静默改语义。
+- `RuntimeManager::start_fresh` / `start_session` / `stop_user`（R21 单会话兼容通道）**在 app 侧全部下线**，
+  改走 `create_session` + `request_run`。三个 API 仍保留供 `pi-runtime` 自身测试使用，未删除，
+  R23 的相关用例不受影响。BACKLOG #21 描述的「单槽回滚导致句柄失效」路径因此在 app 侧不再可达。
+
+### 实测结果
+
+- `cargo test -p pi-runtime --lib` → **80 passed / 0 failed / 1 ignored**（R23 收口时 77，本轮新增 3：
+  电平触发合并、订阅析构退订、发布方不被停滞订阅者阻塞）。
+- `cargo test -p pi-runtime --test multi_session_fake_child` → **3 passed**（新增）。
+- `cargo test -p pi-runtime --test scheduler_fake_child` → 11 passed（R23 既有用例未受影响）。
+- `cargo test -p gpui-pi-ui --lib` → **32 passed**（R23 收口时 30，本轮新增 2：状态文案与标签项）。
+- `cargo test -p gpui-pi` → **133 passed**（R23 收口时 124；净增 9：新增 10 条 R24 用例，
+  删除 1 条已失去被测对象的 `fresh_session_reset_clears_project_scoped_index_and_popup_state`——
+  它测的自由函数 `reset_session_scoped_state` 随「新标签天生干净」一起消失，
+  等价不变量改由 `session_tabs_isolate_draft_expansion_and_scroll_state` 断言）。
+- 真实 pi 零 token：`PI_RUNTIME_TEST_BINARY=<abs>\vendor\pi\pi.exe cargo test -p pi-runtime --test real_pi -- --ignored --test-threads=1`
+  → **4 passed**（R21/R22/R23 原有三项 + 本轮新增
+  `two_real_pi_sessions_run_in_parallel_and_survive_foreground_switches`）。该用例证实：
+  真实 pi 0.84.2 下两个会话同时 `Running`、pid 不同、`resident_pi == 2 <= total_runtime_slots`；
+  第三个会话如实 `Queued`；反复切前台后两个会话的 pid 与 `Running` 状态都不变、`terminal` 仍为 `None`；
+  关掉其中一个后排队会话补位，并唤醒调度器订阅。
+- `.\scripts\validate.ps1 -Logic` → `VALIDATE OK`；完整 `.\scripts\validate.ps1` → **`VALIDATE OK`**
+  （release 构建 2m47s，全部测试目标零失败；仅有既存的 linker stdout 与 `proc-macro-error2` future-incompat 警告）。
+
+### 踩到的坑
+
+- **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在
+  `ChatPanel::new` 里无条件起，线程退出时 `UnboundedSender` 析构唤醒了 GPUI 任务，
+  `test_scheduler` 直接 panic（`Detected activity on thread ...`），一次跑挂 13 个既有用例。
+  改成「只在真的登记了会话之后才起」——既是正确的资源惯例（没有会话就不需要监听调度器），
+  也让测试环境天然不起这条线程，不必给生产代码加 `#[cfg(test)]`。
+- **`ListState` 的滚动回调是 `cx.defer` 之后才执行的**：回调里原本走 `Deref` 写 `tail_attached`，
+  多标签下那一刻投影游标可能正指着别的标签，等于把 A 的滚动状态写进 B。改为按 `tab_id` 找槽，
+  并把两处重复的 `ListState` 构造合并成 `new_list_state(tab_id, weak)`。
+- **同样的问题在两条后台回填路径上各有一份**：历史渲染（`finish_load`）与文件索引
+  （`start_file_index`）都是后台任务，回来时用户可能已经切走。两处都改成按 `tab_id` 定位，
+  且文件索引只在**前台**标签上用 composer 内容重算补全——composer 全窗口只有一个，
+  拿它的内容去刷新后台标签的补全面板等于用别人的输入。
+- **`process_extension_ui` 的标题写入是「与本标签记录值比较」**，换标签时两个值可能恰好相等，
+  而窗口上挂的还是上一个标签的标题。切标签与关标签都必须无条件写一次（`apply_window_title`）。
+- **一次不可复现的 flake**：某一轮完整 validation 里
+  `model_service::tests::timeout_oversize_and_malformed_json_are_bounded` 失败一次
+  （loopback HTTP fixture，与本轮改动无交集）。单独重跑 4 次全过，随后完整 validation 亦全绿。
+  未观察到第二次，暂不登记 BACKLOG；若后续复现再单独立项。
