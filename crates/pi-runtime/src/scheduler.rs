@@ -518,8 +518,18 @@ impl WaitQueue {
 
     /// 只看不取，供报表与测试使用。
     pub fn peek_next(&self, now: Duration) -> Option<SessionId> {
+        self.peek_next_excluding(now, &[])
+    }
+
+    /// 只看不取，并跳过指定的会话。
+    ///
+    /// 给"这一轮已经确认推进不了的条目"让路用：内存水位会挡下后台会话，如果队首正好
+    /// 是这么一条，不跳过它就轮不到后面本该放行的前台会话。**跳过而不是出队再入队**，
+    /// 因为重新入队会重置 `enqueued_at`，把这条条目辛苦攒下的 aging 一次清零。
+    pub fn peek_next_excluding(&self, now: Duration, skip: &[SessionId]) -> Option<SessionId> {
         self.entries
             .iter()
+            .filter(|entry| !skip.contains(&entry.session))
             .min_by_key(|entry| (self.effective_priority(entry, now), entry.sequence))
             .map(|entry| entry.session)
     }
@@ -553,6 +563,8 @@ pub struct SchedulerReport {
     pub warm_parks: u64,
     /// 累计被 Idle TTL 回收的热进程数。
     pub idle_reaped: u64,
+    /// 累计因内存高水位（而非 TTL 到期）被提前回收的热进程数。
+    pub pressure_reclaimed: u64,
     /// 当前槽位占用。
     pub slots: SlotCounts,
 }

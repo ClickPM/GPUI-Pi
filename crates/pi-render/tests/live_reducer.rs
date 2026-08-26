@@ -478,3 +478,400 @@ fn out_of_order_and_burst_updates_degrade_safely() {
     );
     assert!(!document.diagnostics.is_empty());
 }
+
+/// R25：流式段的过程性负载必须有聚合上限。
+///
+/// 逐条上限拦不住"每条都合规、加起来几百 MB"这一类；多会话之后这个数字还要再乘以
+/// 并行会话数。
+#[test]
+fn live_segment_payload_stays_within_budget_and_releases_the_oldest_first() {
+    const OUTPUT: usize = 8 * 1024;
+    // 预算刻意取在"恰好放得下一条、放不下两条"之间：小于单条负载的预算只能证明
+    // "全被释放了"，证明不了释放顺序是从最旧开始的。
+    //
+    // 一条消息实际占**两份** OUTPUT —— 渲染出来的工具输出，加上还留在 `tools[*].result`
+    // 里的那份原始结果。预算算的是实际驻留内存，所以门槛要按 2×OUTPUT 取。
+    const BUDGET: usize = 20 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(BUDGET);
+    for index in 0..3 {
+        finish_tool_turn(&mut reducer, &format!("t{index}"), &"x".repeat(OUTPUT));
+    }
+
+    let document = reducer.document();
+    assert_eq!(document.messages.len(), 3);
+    let retained: usize = document
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(
+        retained <= BUDGET,
+        "流式段保留了 {retained} 字节，超过预算 {BUDGET}"
+    );
+
+    assert!(
+        tool_output_is_released(&document.messages[0]),
+        "最旧的工具输出应先被释放"
+    );
+    assert!(
+        !tool_output_is_released(&document.messages[2]),
+        "预算之内的最新一条必须完整保留"
+    );
+}
+
+/// 工具结果回来会触发整段重渲染 —— 重渲染是从原始 value 重建的，会把释放过的负载
+/// 原样带回来。不在重渲染之后重新压一次，预算就只在"没有工具结果回来"时有效。
+#[test]
+fn re_rendering_completed_tools_does_not_resurrect_released_payload() {
+    const OUTPUT: usize = 8 * 1024;
+    // 预算刻意取在"恰好放得下一条、放不下两条"之间：小于单条负载的预算只能证明
+    // "全被释放了"，证明不了释放顺序是从最旧开始的。
+    //
+    // 一条消息实际占**两份** OUTPUT —— 渲染出来的工具输出，加上还留在 `tools[*].result`
+    // 里的那份原始结果。预算算的是实际驻留内存，所以门槛要按 2×OUTPUT 取。
+    const BUDGET: usize = 20 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(BUDGET);
+    for index in 0..3 {
+        finish_tool_turn(&mut reducer, &format!("t{index}"), &"x".repeat(OUTPUT));
+    }
+    assert!(tool_output_is_released(&reducer.document().messages[0]));
+
+    // 再来一条工具结果：`rerender_completed_tools` 会把所有带工具卡片的完成消息重渲染。
+    reducer.apply(LiveEvent::ToolExecutionEnd {
+        id: "t2".to_owned(),
+        name: "read".to_owned(),
+        result: json!({"content": "y".repeat(OUTPUT)}),
+        is_error: false,
+    });
+
+    let document = reducer.document();
+    let retained: usize = document
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(
+        retained <= BUDGET,
+        "重渲染之后仍须在预算内，实际 {retained} 字节"
+    );
+    assert!(
+        tool_output_is_released(&document.messages[0]),
+        "重渲染不得把已经释放的负载复活"
+    );
+}
+
+fn finish_tool_turn(reducer: &mut LiveSessionReducer, id: &str, output: &str) {
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::ToolExecutionEnd {
+        id: id.to_owned(),
+        // 刻意不用 "bash"：那条路径会把输出解析成 ANSI，本用例只关心体积。
+        name: "read".to_owned(),
+        result: json!({ "content": output }),
+        is_error: false,
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id": id,
+            "role": "assistant",
+            "content": [{"type":"toolCall","id": id, "name":"read","arguments":{"path": id}}]
+        }),
+    });
+}
+
+fn tool_output_is_released(message: &Message) -> bool {
+    message.blocks.iter().any(|block| match block {
+        Block::Tool(tool) => {
+            tool.output.len() == 1
+                && matches!(&tool.output[0], ToolOutput::Text(text) if text.contains("已释放以控制内存占用"))
+        }
+        _ => false,
+    })
+}
+
+/// R25 整改（codex P1）：只裁渲染结果等于只把统计做小。
+///
+/// 最尖锐的一格是「渲染后根本没有 bytes」的图片：无效、超限或已脱敏的图片经
+/// `parse_image` 出来 `bytes` 是 `None`，`payload_bytes` 一律记 0 —— 可那一大坨 base64
+/// 还完整躺在 `CompletedMessage.value` 里。只按渲染侧记账的话，一串这样的消息能让
+/// 预算永远触发不了，而内存一路涨上去。
+#[test]
+fn raw_image_payload_alone_is_enough_to_trigger_a_release() {
+    const IMAGE_DATA: usize = 16 * 1024;
+    const BUDGET: usize = 4 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    // 先用大预算收下它，确保这坨数据确实被完整留了下来。
+    reducer.set_payload_budget(1024 * 1024);
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id": "shot",
+            "role": "user",
+            "content": [{
+                "type": "image",
+                // 不是合法 PNG：`parse_image` 会给出一个没有 bytes 的占位块。
+                "source": {"type":"base64","media_type":"image/png","data": "A".repeat(IMAGE_DATA)}
+            }]
+        }),
+    });
+
+    let rendered: usize = reducer
+        .document()
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert_eq!(
+        rendered, 0,
+        "渲染侧看不到任何负载 —— 这正是只按渲染结果记账会漏掉这坨内存的原因"
+    );
+    let raw_before = reducer.live_raw_bytes();
+    assert!(
+        raw_before >= IMAGE_DATA,
+        "原始副本里应当确实存着那坨图片数据，实际 {raw_before}"
+    );
+
+    // 收紧预算：光凭原始副本就必须触发释放，不需要任何工具输出来把它顶穿。
+    reducer.set_payload_budget(BUDGET);
+    let raw_after = reducer.live_raw_bytes();
+    assert!(
+        raw_after < raw_before,
+        "原始副本必须跟着缩小，实际从 {raw_before} 变成 {raw_after}"
+    );
+    assert!(
+        raw_after <= BUDGET,
+        "原始副本仍然超预算（{raw_after} 字节）—— 内存并没有真的有界"
+    );
+}
+
+/// 工具结果的原始副本同样要跟着释放。
+#[test]
+fn releasing_payload_also_drops_the_raw_tool_results_behind_it() {
+    const OUTPUT: usize = 8 * 1024;
+    const BUDGET: usize = 12 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(1024 * 1024);
+    for index in 0..3 {
+        finish_tool_turn(&mut reducer, &format!("t{index}"), &"x".repeat(OUTPUT));
+    }
+    let raw_before = reducer.live_raw_bytes();
+    assert!(
+        raw_before >= 3 * OUTPUT,
+        "三条大输出应当都还在原始副本里，实际 {raw_before}"
+    );
+
+    reducer.set_payload_budget(BUDGET);
+    let rendered: usize = reducer
+        .document()
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(rendered <= BUDGET, "渲染结果应在预算内，实际 {rendered}");
+    let raw_after = reducer.live_raw_bytes();
+    assert!(
+        raw_after <= BUDGET,
+        "原始工具结果仍然超预算（{raw_after} 字节）—— 只裁了渲染结果"
+    );
+}
+
+/// R25 三轮整改（codex P2）：一堆"单条都很短"的输出，加起来照样要能压回预算内。
+///
+/// 逐条比大小的判据会把每条短输出都跳过，几万条的总量于是永远超预算而一条都释放不掉，
+/// 聚合上限直接失效 —— 判据必须落在整条消息上。
+#[test]
+fn many_short_tool_outputs_are_still_released_in_aggregate() {
+    const PIECES: usize = 60;
+    const PIECE: usize = 90;
+    const BUDGET: usize = 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(1024 * 1024);
+    let content: Vec<_> = (0..PIECES)
+        .map(|index| json!({"type":"text","text": format!("{index}{}", "y".repeat(PIECE))}))
+        .collect();
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::ToolExecutionEnd {
+        id: "many".to_owned(),
+        name: "read".to_owned(),
+        result: json!({ "content": content }),
+        is_error: false,
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id": "many",
+            "role": "assistant",
+            "content": [{"type":"toolCall","id":"many","name":"read","arguments":{}}]
+        }),
+    });
+    // 再来一条，好让最旧那条落进"该释放"的范围。
+    finish_tool_turn(&mut reducer, "tail", "z");
+
+    reducer.set_payload_budget(BUDGET);
+    let rendered: usize = reducer
+        .document()
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(
+        rendered <= BUDGET,
+        "{PIECES} 条短输出加起来仍超预算（{rendered} 字节）—— 逐条比大小把它们全跳过了"
+    );
+}
+
+/// R25 三轮整改（codex P2）：纯文本会话不该被拖进预算。
+///
+/// 预算从来不释放用户 Query 与最终 Answer 的正文。把它们算进来只会让长文本会话永远
+/// "超预算"，于是每插一条消息都全量重扫一遍却一个字节也释放不掉。
+#[test]
+fn text_only_conversations_do_not_drag_the_budget_over() {
+    const TEXT: usize = 32 * 1024;
+    const BUDGET: usize = 4 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(BUDGET);
+    for index in 0..3 {
+        reducer.apply(LiveEvent::AgentStart);
+        reducer.apply(LiveEvent::MessageEnd {
+            message: json!({
+                "id": format!("m{index}"),
+                "role": "assistant",
+                "content": [{"type":"text","text": format!("{index}{}", "答".repeat(TEXT))}]
+            }),
+        });
+    }
+
+    let document = reducer.document();
+    assert_eq!(document.messages.len(), 3);
+    for (index, message) in document.messages.iter().enumerate() {
+        let Block::Markdown(markdown) = &message.blocks[0] else {
+            panic!("第 {index} 条应仍是正文块");
+        };
+        assert!(
+            markdown.source.chars().count() > TEXT,
+            "对话正文必须原样保留，第 {index} 条实际只剩 {} 字",
+            markdown.source.chars().count()
+        );
+    }
+}
+
+/// R25 五轮整改（codex P2）：短输出不该被换成更长的占位。
+///
+/// 流式段的释放此前直接调 `release_payload`，绕过了整条消息的大小判据 —— 一条 `"ok"`
+/// 被换成一整句更长的说明：有用的输出丢了，内存一个字节没省，对应的原始结果那边还会
+/// 因为"换了不划算"而拒绝替换，两头落空。
+#[test]
+fn short_live_outputs_survive_when_releasing_them_would_not_save_anything() {
+    const BUDGET: usize = 4 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(1024 * 1024);
+    // 最旧一条只有两个字节的输出；随后一条巨大的把预算顶穿。
+    finish_tool_turn(&mut reducer, "tiny", "ok");
+    finish_tool_turn(&mut reducer, "huge", &"x".repeat(32 * 1024));
+
+    reducer.set_payload_budget(BUDGET);
+    let document = reducer.document();
+    let Block::Tool(tiny) = &document.messages[0].blocks[0] else {
+        panic!("最旧一条应仍是工具卡片");
+    };
+    assert!(
+        matches!(&tiny.output[0], ToolOutput::Text(text) if text == "ok"),
+        "换掉它是净亏 —— 短输出必须原样留着，实际是 {:?}",
+        tiny.output[0]
+    );
+}
+
+/// 结构化 `details`（编辑类工具的整份 patch）也要计入并跟着释放。
+///
+/// 它常常比输出本身还大，而 `crates/ui` / `crates/app` 对它零引用 —— 不算不放，
+/// 一篇满是编辑结果的历史能在"预算通过"的同时大幅超出上限。
+#[test]
+fn tool_details_are_counted_and_released_with_the_output() {
+    const PATCH: usize = 24 * 1024;
+    const BUDGET: usize = 4 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.set_payload_budget(1024 * 1024);
+    reducer.apply(LiveEvent::AgentStart);
+    reducer.apply(LiveEvent::ToolExecutionEnd {
+        id: "edit".to_owned(),
+        name: "edit".to_owned(),
+        result: json!({
+            "content": "done",
+            "details": {"patch": "@@ -1 +1 @@\n".to_owned() + &"+line\n".repeat(PATCH / 6)}
+        }),
+        is_error: false,
+    });
+    reducer.apply(LiveEvent::MessageEnd {
+        message: json!({
+            "id": "edit",
+            "role": "assistant",
+            "content": [{"type":"toolCall","id":"edit","name":"edit","arguments":{}}]
+        }),
+    });
+    finish_tool_turn(&mut reducer, "tail", "z");
+
+    let before: usize = reducer
+        .document()
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(
+        before >= PATCH,
+        "patch 应当被计入过程性负载，实际只数出 {before}"
+    );
+
+    reducer.set_payload_budget(BUDGET);
+    let document = reducer.document();
+    let after: usize = document
+        .messages
+        .iter()
+        .map(|message| pi_render::payload_bytes(message))
+        .sum();
+    assert!(after <= BUDGET, "释放后仍超预算：{after} 字节");
+    let Block::Tool(edit) = &document.messages[0].blocks[0] else {
+        panic!("应仍是工具卡片");
+    };
+    assert!(edit.details.is_none(), "结构化详情应当跟着输出一起放掉");
+}
+
+/// R25 七轮整改（codex P1）：没有对应完成消息的工具结果也要被计入并释放。
+///
+/// 工具结果常常先于 `MessageEnd` 到达，消息也可能永远不来（run 被取消）。那些结果
+/// 一直挂在 `tools` 里，既不被计入也永远释放不掉 —— 足够让 reducer 在"预算通过"的
+/// 同时一路涨上去。
+#[test]
+fn orphan_tool_results_are_counted_and_released() {
+    const RESULT: usize = 16 * 1024;
+    const BUDGET: usize = 4 * 1024;
+
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    // 预算**一开始就设好**，之后不再碰它：这条用例要证的是孤儿结果到达时能自己
+    // 触发压制，而不是"外部又调了一次 set_payload_budget 才顺带被裁掉"。
+    reducer.set_payload_budget(BUDGET);
+    reducer.apply(LiveEvent::AgentStart);
+    // 只发工具结果，**不发** MessageEnd：这些结果没有任何完成消息引用它们，
+    // 因此 `rerender_completed_tools` 里没有任何卡片会被重渲染。
+    for index in 0..4 {
+        reducer.apply(LiveEvent::ToolExecutionEnd {
+            id: format!("orphan-{index}"),
+            name: "read".to_owned(),
+            result: json!({ "content": "o".repeat(RESULT) }),
+            is_error: false,
+        });
+    }
+
+    let after = reducer.live_raw_bytes();
+    assert!(
+        after <= BUDGET,
+        "孤儿工具结果仍然超预算（{after} 字节）—— 计入了却没人触发压制，等于没有上界"
+    );
+}

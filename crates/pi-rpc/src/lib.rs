@@ -5,10 +5,12 @@
 //!
 pub mod host_extension;
 pub mod jsonl;
+pub mod platform;
 pub mod process;
 pub mod protocol;
 
 pub use host_extension::materialize_host_extension;
+pub use platform::{JobLimits, JobObject, JobStats, SystemMemory, job_objects_supported};
 pub use process::{
     Client, ClientConfig, ClientError, ClientEvent, DEFAULT_EVENT_BACKLOG_BYTES, EventDetach,
     EventStream, LifecycleEvent, SessionRebindOutcome, kill_process_tree,

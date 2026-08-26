@@ -30,7 +30,7 @@
 | **R22** | 单 Runtime 有界 Actor 与事件背压 | Windows | ✅ 已完成（代码审查 PASS；视觉审查 `CODE_ONLY_PASS`，未验证真实渲染，见 [`rounds/round-22/round-22.md`](rounds/round-22/round-22.md)） | [#32](https://github.com/cking000bigdemon/GPUI-Pi/pull/32) | 2026-08-24 |
 | **R23** | Scheduler / 状态机 / Park-Resume / Idle TTL | Windows | ✅ 已完成（纯逻辑轮，`crates/app` / `crates/ui` 零 diff；四轮 codex 独立审查共 21 条 findings 全部整改，见 [`rounds/round-23/round-23.md`](rounds/round-23/round-23.md)） | [#33](https://github.com/cking000bigdemon/GPUI-Pi/pull/33) | 2026-08-25 |
 | **R24** | 有界多用户 Session UI 接线 | Windows | ✅ 已完成（14 轮 codex 独立审查共 30 条 findings，29 条成立并全部整改、1 条经核对不成立且已记明理由；人工验收暴露的挂起崩溃已定位到「进程交接跑在 GPUI 主线程上」并修复；视觉审查 `PASS`，见 [`rounds/round-24/round-24.md`](rounds/round-24/round-24.md)） | [#34](https://github.com/cking000bigdemon/GPUI-Pi/pull/34) | 2026-08-26 |
-| **R25** | Windows Job Object + 进程树与内存治理 | Windows | ⬜ | — | — |
+| **R25** | Windows Job Object + 进程树与内存治理 | Windows | ✅ 已完成（codex 独立审查**十一轮**共 32 条 findings：30 条成立并整改、1 条涉及红线 2 文档口径由所有者裁定、1 条经核算为结构性下界部分不采纳并写明论证；视觉审查 `CODE_ONLY_PASS`，**非独立**，见 [`rounds/round-25/round-25.md`](rounds/round-25/round-25.md)） | 待创建 | 2026-08-26 |
 | **R26** | 内建只读子代理任务与配额调度 | Windows | ⬜ | — | — |
 | **R27** | mutating 子代理 + worktree writer 隔离 | Windows | ⬜ | — | — |
 

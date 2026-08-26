@@ -852,3 +852,134 @@ fn two_real_pi_sessions_run_in_parallel_and_survive_foreground_switches() {
         "zero-token multi-session test wrote into the temporary cwd"
     );
 }
+
+/// R25 T3：真实 pi 进程树被 Job Object 纳管，显式关停之后一个都不剩。
+///
+/// 零 token：只做冷启动与元数据刷新，不发任何 prompt。
+#[test]
+#[ignore = "requires PI_RUNTIME_TEST_BINARY=official pi 0.84.2"]
+fn real_pi_trees_are_governed_and_shutdown_all_leaves_no_survivors() {
+    let binary = configured_binary();
+    assert_pinned_version(&binary);
+    assert!(
+        env::var_os("PI_CODING_AGENT_SESSION_DIR").is_none(),
+        "unset PI_CODING_AGENT_SESSION_DIR before running this isolation test"
+    );
+
+    let temp = tempfile::tempdir().expect("failed to create isolated runtime test root");
+    let agent_dir = temp.path().join("agent");
+    let cwd = temp.path().join("project");
+    let sessions_dir = agent_dir.join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+
+    let manager = RuntimeManager::new(RuntimeLimits {
+        scheduler: SchedulerLimits {
+            user_session_slots: 2,
+            total_runtime_slots: 3,
+            warm_idle: 0,
+            idle_ttl: Duration::from_secs(180),
+            queue_capacity: 8,
+            aging_step: Duration::from_secs(5),
+        },
+        ..RuntimeLimits::default()
+    });
+
+    let mut handles = Vec::new();
+    let mut tree_pids: Vec<u32> = Vec::new();
+    for name in ["r25-a", "r25-b"] {
+        let path = sessions_dir.join(format!("{name}.jsonl"));
+        fs::write(&path, "").unwrap();
+        let session = manager.create_session(
+            SessionDescriptor {
+                binary: binary.clone(),
+                cwd: cwd.clone(),
+                session_path: Some(path),
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: Some(agent_dir.clone()),
+            },
+            empty_document(name, &cwd),
+        );
+        let handle = manager
+            .request_run(session, Priority::FOREGROUND)
+            .unwrap_or_else(|error| panic!("{name} cold start failed: {error}"))
+            .expect("a free run slot must be available");
+        wait_for_quiescence(&handle, name);
+
+        let stats = handle
+            .process_tree_stats()
+            .expect("Windows 上真实 Runtime 必须能拿到整树统计");
+        assert!(
+            stats.active_processes >= 1,
+            "{name} 的 job 里应至少有 pi 自己"
+        );
+        assert!(
+            stats.private_bytes > 0,
+            "{name} 的整树私有内存不应为 0（采样到 {} 个进程）",
+            stats.sampled_processes
+        );
+        // 数字回填任务卡「本轮实测」：这是水位阈值调参的依据。
+        println!(
+            "[r25] {name}: active={} private={:.1}MiB peak_job={:.1}MiB sampled={}",
+            stats.active_processes,
+            stats.private_bytes as f64 / (1024.0 * 1024.0),
+            stats.peak_job_memory_bytes as f64 / (1024.0 * 1024.0),
+            stats.sampled_processes,
+        );
+
+        let pids = handle
+            .process_tree_pids()
+            .expect("Windows 上真实 Runtime 必须能枚举整树 pid");
+        assert!(!pids.is_empty());
+        tree_pids.extend(pids);
+        handles.push(handle);
+    }
+
+    if let Some(memory) = pi_runtime::ResourceProbe::system_memory(&pi_runtime::SystemResourceProbe)
+    {
+        println!(
+            "[r25] system: total={:.1}GiB available={:.1}GiB load={}%",
+            memory.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            memory.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            memory.load_percent,
+        );
+    }
+
+    for pid in &tree_pids {
+        assert!(process_is_alive(*pid), "关停之前进程 {pid} 应当活着");
+    }
+
+    // **句柄仍被持有**：这正是靠 Drop 链回收会失效的那一格。
+    let report = manager.shutdown_all();
+    assert_eq!(report.sessions, 2);
+    assert_eq!(manager.scheduler_report().resident_pi, 0);
+    for handle in &handles {
+        assert_eq!(handle.snapshot().terminal, Some(TerminalState::Stopped));
+    }
+    for pid in tree_pids {
+        assert!(
+            wait_until_dead(pid, TIMEOUT),
+            "显式关停之后真实 pi 进程树里的 {pid} 仍然存活"
+        );
+    }
+}
+
+/// 进程是否仍然存活。用 CSV 输出里带引号的 pid 判定，避开 `tasklist` 提示语的本地化差异。
+fn process_is_alive(pid: u32) -> bool {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .expect("tasklist 应可执行");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}

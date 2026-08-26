@@ -1,11 +1,16 @@
 mod actor;
 pub mod clock;
 mod effects;
+pub mod resource;
 pub mod scheduler;
 
 pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use effects::{BackpressureStats, EffectLimits};
+pub use resource::{
+    FakeResourceProbe, JobStats, MemoryLimits, MemoryPressureReport, ResourceProbe, SystemMemory,
+    SystemResourceProbe,
+};
 pub use scheduler::{
     IllegalTransition, Priority, QueueFull, SchedulerLimits, SchedulerReport, SchedulerState,
     SessionId, SlotCounts, SlotKind,
@@ -13,6 +18,7 @@ pub use scheduler::{
 
 use actor::{Actor, Channel, JobKey, QueueError};
 use effects::EffectBuffer;
+use resource::MemoryGovernor;
 use scheduler::{SlotLease, SlotPool, WaitQueue};
 
 use pi_render::{
@@ -27,14 +33,15 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use pi_rpc::{
     AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
     Command, CommandsData, CompactionResult, EventDetach, EventStream, ExportPathData,
-    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType,
-    RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
+    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, JobLimits, Model,
+    NotifyType, RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
     ThinkingLevelsData, TreeData, WidgetPlacement,
 };
 
@@ -806,6 +813,8 @@ pub struct RuntimeLimits {
     pub event_frame: Duration,
     /// 单订阅事件积压字节上限，透传给 `pi-rpc`。
     pub event_backlog_bytes: usize,
+    /// 内存水位与 Job Object 硬上限。
+    pub memory: MemoryLimits,
 }
 
 impl Default for RuntimeLimits {
@@ -817,6 +826,7 @@ impl Default for RuntimeLimits {
             effects: EffectLimits::default(),
             event_frame: DEFAULT_EVENT_FRAME,
             event_backlog_bytes: pi_rpc::DEFAULT_EVENT_BACKLOG_BYTES,
+            memory: MemoryLimits::default(),
         }
     }
 }
@@ -828,6 +838,8 @@ struct RuntimeTuning {
     effects: EffectLimits,
     event_frame: Duration,
     event_backlog_bytes: usize,
+    /// 进程树硬上限；随 Runtime 创建固化，经 `clamp_manager_config` 透传给 `pi-rpc`。
+    job: JobLimits,
 }
 
 impl RuntimeTuning {
@@ -838,6 +850,7 @@ impl RuntimeTuning {
             effects: limits.effects.sanitized(),
             event_frame: clamp_event_frame(limits.event_frame),
             event_backlog_bytes: limits.event_backlog_bytes.max(1),
+            job: limits.memory.sanitized().job_limits(),
         }
     }
 }
@@ -903,6 +916,20 @@ struct WarmRuntime {
     idle_since: Duration,
     /// 常驻槽凭证：热进程也占内存，必须一直占着名额直到真正退出。
     lease: SlotLease,
+}
+
+/// 一次显式关停实际停掉了什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShutdownReport {
+    /// 被注销的会话数（含 Parked —— 它们本来就没有进程）。
+    pub sessions: usize,
+    /// 被关掉的 warm pool 热进程数。
+    pub warm: usize,
+    /// 是否在预算内等到全部在途作业交还进程。
+    ///
+    /// `false` 表示还有作业攥着 `Client` 没放手：进程仍会被 `KILL_ON_JOB_CLOSE`
+    /// 在本进程退出时收走，但少了一次优雅收尾（pi 来不及把会话文件写完）。
+    pub drained: bool,
 }
 
 /// 调度器状态发生了变化。
@@ -1036,6 +1063,7 @@ struct SchedulerCounters {
     warm_resumes: u64,
     warm_parks: u64,
     idle_reaped: u64,
+    pressure_reclaimed: u64,
 }
 
 /// 调度器的全部可变状态，统一由一把锁保护。
@@ -1074,10 +1102,38 @@ struct ManagerInner {
     limits: SchedulerLimits,
     slots: SlotPool,
     clock: Arc<dyn Clock>,
+    /// 资源采样口。`MemoryGovernor` 用它做水位判定，`RuntimeEntry` 用它做进程树采样。
+    probe: Arc<dyn ResourceProbe>,
+    /// 内存水位治理器；采样口可注入，策略因此可确定性测试。
+    memory: MemoryGovernor,
     core: Mutex<SchedulerCore>,
     /// `None` 表示测试构造：TTL 与队列推进完全由显式 `tick()` 驱动，避免后台线程
     /// 抢在断言之前改状态。
     reaper: Option<Arc<Reaper>>,
+    /// 关停互斥量：`shutdown_all` 全程持有。
+    ///
+    /// `shutting_down` 是**标志不是所有权令牌**：两个 Manager clone 并发关停时，先跑完的
+    /// 那个会把标志清掉，而后一个还在关停途中 —— 闸门被提前打开，`request_run` 于是能在
+    /// 它快照完会话表之后起一个新 Runtime。串行化一次性消掉这一类，也顺带覆盖
+    /// `MaintenanceGate` 的开合竞态。
+    shutdown_lock: Mutex<()>,
+    /// 正在执行 `shutdown_all`。
+    ///
+    /// 置位期间 `promote_queued` 直接返回：`stop_session` 收尾会调 `tick()`，批量关停
+    /// 时若还照常提升队列，就会在退出途中把排队会话一个个冷启动起来、再一个个关掉，
+    /// 每个都要付一次 grace period。
+    shutting_down: AtomicBool,
+    /// 已经拿到运行槽、但 `finish_start` 还没把 `RuntimeEntry` 挂进调度器的启动数。
+    ///
+    /// 这段窗口里 entry 与 lease 只活在调用栈的局部 `Admission` 里，`core.draining`
+    /// 看不到它 —— 关停屏障不额外等这个计数，就会在一个刚 spawn 出来的进程还活着时
+    /// 宣布"已排空"。
+    pending_starts: AtomicUsize,
+    /// 正在做 Park/交接、进程句柄暂时只活在调用栈上的操作数。
+    ///
+    /// Park 的第 ③ 步之后 entry 与 lease 已从 `SchedulerCore` 摘走，client 还没进
+    /// warm pool —— 这一刻谁也看不见它。
+    pending_handoffs: AtomicUsize,
 }
 
 impl Drop for ManagerInner {
@@ -1092,7 +1148,11 @@ impl Drop for ManagerInner {
 
 struct MaintenanceGate {
     limit: usize,
-    state: Mutex<usize>,
+    /// `(在跑的作业数, 是否已关闭)`。
+    ///
+    /// 两者必须在**同一把锁**下：分开放的话，「查关停标志」与「记上在跑数」之间有缝，
+    /// 一次导出能在关停屏障采完样之后才真正开工，随后被 `cx.quit()` 拦腰砍断。
+    state: Mutex<(usize, bool)>,
     ready: Condvar,
 }
 
@@ -1104,25 +1164,49 @@ impl MaintenanceGate {
     fn new(limit: usize) -> Self {
         Self {
             limit: limit.max(1),
-            state: Mutex::new(0),
+            state: Mutex::new((0, false)),
             ready: Condvar::new(),
         }
     }
 
-    fn acquire(&self) -> MaintenancePermit<'_> {
-        let mut active = self.state.lock().unwrap();
-        while *active >= self.limit {
-            active = self.ready.wait(active).unwrap();
+    /// 当前在跑的 maintenance 作业数。
+    ///
+    /// 关停屏障要用：这类 Runtime 既不属于任何会话、也不在 warm pool 或 `draining` 里，
+    /// 不单独问一句就会在导出还在写盘时宣布"已排空"。
+    fn in_flight(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
+
+    /// 开/关"不再受理新作业"。在锁内改，与 `acquire` 的判定同步。
+    fn set_closed(&self, closed: bool) {
+        self.state.lock().unwrap().1 = closed;
+        self.ready.notify_all();
+    }
+
+    /// 取一个 permit；关停期返回 `None`。
+    ///
+    /// 判定与计数在同一把锁下完成：一旦这里返回了 `Some`，在跑数就**已经**加过了，
+    /// 之后任何 `in_flight()` 都看得见它。
+    fn acquire(&self) -> Option<MaintenancePermit<'_>> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.1 {
+                return None;
+            }
+            if state.0 < self.limit {
+                break;
+            }
+            state = self.ready.wait(state).unwrap();
         }
-        *active += 1;
-        MaintenancePermit { gate: self }
+        state.0 += 1;
+        Some(MaintenancePermit { gate: self })
     }
 }
 
 impl Drop for MaintenancePermit<'_> {
     fn drop(&mut self) {
         let mut active = self.gate.state.lock().unwrap();
-        *active -= 1;
+        active.0 -= 1;
         self.gate.ready.notify_one();
     }
 }
@@ -1145,6 +1229,9 @@ struct RuntimeState {
 
 struct RuntimeEntry {
     id: RuntimeId,
+    /// 资源采样口。进程树统计经它转发，好让依赖进程数的策略也能确定性验收
+    /// （立项文档 § 七 R25：「内存与进程数采样经可注入的 `ResourceProbe` 抽象」）。
+    probe: Arc<dyn ResourceProbe>,
     /// 拥有本 Runtime 的会话。`RuntimeId` 每次 Resume 都会变，`SessionId` 不会。
     session: SessionId,
     state: Mutex<RuntimeState>,
@@ -1235,6 +1322,7 @@ impl RuntimeEntry {
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            probe: Arc::new(SystemResourceProbe),
             session: SessionId(0),
             state: Mutex::new(Self::new_state(
                 history,
@@ -1448,6 +1536,36 @@ impl SessionHandle {
             .client
             .as_ref()
             .and_then(Client::pid)
+    }
+
+    /// 本 Runtime 整棵进程树的一次采样（含 pi 自身、工具子进程与 extension 自行
+    /// spawn 的孙进程）。
+    ///
+    /// 平台不支持 Job Object、或进程已经停掉时返回 `None` —— 拿不到就是拿不到，
+    /// 不用 0 冒充。
+    pub fn process_tree_stats(&self) -> Option<JobStats> {
+        // 经 probe 转发而不是直连 `Client`：进程数与整树内存的采样口必须是可注入的，
+        // 否则依赖它的策略只能"跑起来看看"（立项文档 § 七 R25）。
+        self.entry.probe.process_tree(&|| {
+            self.entry
+                .state
+                .lock()
+                .unwrap()
+                .client
+                .as_ref()
+                .and_then(|client| client.process_tree_stats().ok())
+        })
+    }
+
+    /// 本 Runtime 整棵进程树当前的 pid 列表；语义同 [`SessionHandle::process_tree_stats`]。
+    pub fn process_tree_pids(&self) -> Option<Vec<u32>> {
+        self.entry
+            .state
+            .lock()
+            .unwrap()
+            .client
+            .as_ref()
+            .and_then(|client| client.process_tree_pids().ok())
     }
 
     /// 本 Runtime 固化后的命令队列参数（已收敛为生效值）。
@@ -1785,7 +1903,12 @@ fn reaper_interval(idle_ttl: Duration) -> Duration {
 
 impl RuntimeManager {
     pub fn new(limits: RuntimeLimits) -> Self {
-        Self::build(limits, Arc::new(SystemClock::new()), true)
+        Self::build(
+            limits,
+            Arc::new(SystemClock::new()),
+            Arc::new(SystemResourceProbe),
+            true,
+        )
     }
 
     /// 注入时钟的测试构造。
@@ -1794,10 +1917,38 @@ impl RuntimeManager {
     /// 驱动。否则后台线程会抢在断言之前改状态，「推进到 TTL 前一格仍在池中」这类
     /// 确定性验收就无从写起。
     pub fn with_test_clock(limits: RuntimeLimits, clock: Arc<dyn Clock>) -> Self {
-        Self::build(limits, clock, false)
+        // 采样一律报"拿不到数据"，水位策略因此恒不生效（见 `ResourceProbe::system_memory`）。
+        //
+        // 这里**不能**挂真实探针：注入时钟的用例本意是只依赖 fake clock，挂上真机内存
+        // 之后，一台恰好只剩不到 1.5GiB 可用内存的宿主会让所有 BACKGROUND 会话排队，
+        // R23/R24 那批既有调度用例就变成看宿主脸色的 flake。要测水位请用
+        // [`RuntimeManager::with_test_clock_and_probe`] 显式注入。
+        Self::build(
+            limits,
+            clock,
+            Arc::new(resource::FakeResourceProbe::unavailable()),
+            false,
+        )
     }
 
-    fn build(limits: RuntimeLimits, clock: Arc<dyn Clock>, reap: bool) -> Self {
+    /// 同时注入时钟与资源采样口的测试构造。
+    ///
+    /// 内存水位策略必须能脱离真机内存曲线验收 —— 否则同一条断言在忙机器上翻红、
+    /// 闲机器上翻绿，正是 CLAUDE.md 红线 4 要防的那种"反复不过"。
+    pub fn with_test_clock_and_probe(
+        limits: RuntimeLimits,
+        clock: Arc<dyn Clock>,
+        probe: Arc<dyn ResourceProbe>,
+    ) -> Self {
+        Self::build(limits, clock, probe, false)
+    }
+
+    fn build(
+        limits: RuntimeLimits,
+        clock: Arc<dyn Clock>,
+        probe: Arc<dyn ResourceProbe>,
+        reap: bool,
+    ) -> Self {
         let scheduler = limits.scheduler.sanitized();
         let manager = Self {
             inner: Arc::new(ManagerInner {
@@ -1809,6 +1960,8 @@ impl RuntimeManager {
                 limits: scheduler,
                 slots: SlotPool::new(scheduler),
                 clock,
+                probe: Arc::clone(&probe),
+                memory: MemoryGovernor::new(probe, limits.memory.sanitized()),
                 core: Mutex::new(SchedulerCore {
                     sessions: BTreeMap::new(),
                     queue: WaitQueue::new(scheduler),
@@ -1823,6 +1976,10 @@ impl RuntimeManager {
                         wake: Condvar::new(),
                     })
                 }),
+                shutdown_lock: Mutex::new(()),
+                shutting_down: AtomicBool::new(false),
+                pending_starts: AtomicUsize::new(0),
+                pending_handoffs: AtomicUsize::new(0),
             }),
         };
         manager.spawn_reaper();
@@ -1864,6 +2021,18 @@ impl RuntimeManager {
     /// 当前调度器有界参数（已收敛为生效值）。
     pub fn scheduler_limits(&self) -> SchedulerLimits {
         self.inner.limits
+    }
+
+    /// 当前内存水位有界参数（已收敛为生效值）。
+    pub fn memory_limits(&self) -> MemoryLimits {
+        self.inner.memory.limits()
+    }
+
+    /// 最近一次水位判定与采样，供 UI 与验收读取。
+    ///
+    /// 这里**不触发**新采样：观测不该改变被观测的节流状态。
+    pub fn memory_pressure(&self) -> MemoryPressureReport {
+        self.inner.memory.report()
     }
 
     /// 登记一个会话，**不启动任何进程**：新会话直接是 `Parked`。
@@ -1985,6 +2154,7 @@ impl RuntimeManager {
             warm_resumes: core.counters.warm_resumes,
             warm_parks: core.counters.warm_parks,
             idle_reaped: core.counters.idle_reaped,
+            pressure_reclaimed: core.counters.pressure_reclaimed,
             ..SchedulerReport::default()
         };
         for slot in core.sessions.values() {
@@ -2018,7 +2188,8 @@ impl RuntimeManager {
         session: SessionId,
         priority: Priority,
     ) -> Result<Option<SessionHandle>, String> {
-        self.tick();
+        // 不回收热进程：马上要走的 `admit` 第一步就是复用它们（见 [`Self::tick_inner`]）。
+        self.tick_inner(false);
         self.admit_and_start(session, priority)
     }
 
@@ -2049,16 +2220,37 @@ impl RuntimeManager {
         session: SessionId,
         priority: Priority,
     ) -> Result<Option<SessionHandle>, String> {
+        // 次序要紧：**先记账、再看关停标志**。
+        //
+        // 反过来的话，「查完标志」到「记上账」之间有一道缝：`shutdown_all` 恰好在这道缝里
+        // 跑完，会同时看到 `draining` 与 `pending_starts` 都是空的，于是宣布已排空 ——
+        // 而这次准入手里还攥着常驻 lease，`finish_start` 随后照样会 spawn 出进程。
+        // 先记账就不存在这道缝：要么关停看得见我们、等我们交还，要么我们看得见关停、
+        // 立刻退出。
+        let pending = PendingStartGuard::acquire(&self.inner);
+        // 关停期一律不准入。只拦队列提升是不够的：一次并发的 `request_run` 能赶在
+        // `shutdown_all` 快照完会话表之后把新 Runtime 起来，那个进程不在关停循环的
+        // 名单里，方法返回时它还活着 —— 这个 API 宣称的保证就成了假的。
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err("运行时正在关停，暂不受理新的会话运行请求".to_owned());
+        }
         // 每一轮要么给出结论，要么淘汰掉一个热进程；因此最多「池容量 + 1」轮。
         for _ in 0..=self.inner.limits.warm_idle.saturating_add(1) {
+            // 采样放在**锁外**：`GlobalMemoryStatusEx` 虽快，也不该挂在调度锁上，
+            // 否则每一次 admit 都把一次系统调用串进所有会话的临界区。
+            let pressured = self.inner.memory.under_pressure(self.inner.clock.now());
             let admitted = {
                 let mut core = self.inner.core.lock().unwrap();
-                self.admit(&mut core, session, priority)?
+                self.admit(&mut core, session, priority, pressured)?
             };
             match admitted {
                 Admitted::AlreadyRunning(handle) => return Ok(Some(handle)),
                 Admitted::Queued => return Ok(None),
                 Admitted::Start(admission) => {
+                    // 守卫一路持有到 `finish_start` 返回：这段窗口里 entry 与 lease 只活在
+                    // 局部 `Admission` 里，`core.draining` 看不到，关停屏障得靠这个计数
+                    // 才知道"还有一个进程正在起来"。
+                    let _pending = pending;
                     return self.finish_start(session, admission).map(Some);
                 }
                 // 已经出了锁，关进程不会卡住调度器；`WarmRuntime` 落地时归还常驻槽。
@@ -2075,6 +2267,7 @@ impl RuntimeManager {
         core: &mut SchedulerCore,
         session: SessionId,
         priority: Priority,
+        memory_pressure: bool,
     ) -> Result<Admitted, String> {
         let slot = core
             .sessions
@@ -2137,6 +2330,26 @@ impl RuntimeManager {
             }
         }
 
+        // ①-b 内存水位。放在热进程复用**之后**：复用不新增进程，压力再大也该放行，
+        //      拦下来只会让用户白等一次冷启动。真正要拦的是下面那条会多出一个约 203MB
+        //      常驻进程的冷启动路径。
+        if memory_pressure {
+            // 先回收热进程：它们是「为了省一次冷启动」而占着内存的投机缓存，
+            // 压力面前第一个让位。回收一个就返回，由 `admit_and_start` 再跑一轮。
+            if let Some(evicted) = Self::take_oldest_warm(core) {
+                // 这条路径淘汰热进程的**原因就是水位**，得记在水位账上；只在周期性
+                // 回收里加计数，请求驱动的这一路就永远报 0，统计口径是错的。
+                core.counters.pressure_reclaimed = core.counters.pressure_reclaimed.wrapping_add(1);
+                return Ok(Admitted::Evict(evicted));
+            }
+            // 没有热进程可回收了：后台会话转入排队，等水位回落由 `promote_queued` 放行。
+            // 前台会话仍然放行 —— 用户正盯着它等结果，卡住前台比紧一点内存更糟，
+            // 何况每棵进程树还有 Job Object 的内存硬上限兜底。
+            if priority > Priority::FOREGROUND {
+                return self.enqueue(core, session, priority);
+            }
+        }
+
         // ② 回退：冷启动。
         if let Some(lease) = self.inner.slots.try_acquire_user() {
             Self::mark_starting(core, session)?;
@@ -2151,21 +2364,37 @@ impl RuntimeManager {
         // ③ 常驻槽被「用不上的」热进程占满，而用户并发还有余量：热进程必须给真实需求让路。
         //    淘汰**最久没被用过**的那一个，而不是队首 —— 复用失败时热进程会被原样放回
         //    队尾，池内顺序因此不能当成空闲时长顺序。
-        if self.inner.slots.counts().user < self.inner.limits.user_session_slots {
-            let oldest = core
-                .warm
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, warm)| warm.idle_since)
-                .map(|(index, _)| index);
-            if let Some(index) = oldest
-                && let Some(evicted) = core.warm.remove(index)
-            {
-                return Ok(Admitted::Evict(evicted));
-            }
+        if self.inner.slots.counts().user < self.inner.limits.user_session_slots
+            && let Some(evicted) = Self::take_oldest_warm(core)
+        {
+            return Ok(Admitted::Evict(evicted));
         }
 
         // ④ 确实没有槽：入队等待。
+        self.enqueue(core, session, priority)
+    }
+
+    /// 摘走池里**最久没被用过**的热进程。
+    ///
+    /// 取最小 `idle_since` 而不是队首：复用失败时热进程会被原样放回队尾，池内顺序
+    /// 因此不能当成空闲时长顺序。
+    fn take_oldest_warm(core: &mut SchedulerCore) -> Option<WarmRuntime> {
+        let index = core
+            .warm
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, warm)| warm.idle_since)
+            .map(|(index, _)| index)?;
+        core.warm.remove(index)
+    }
+
+    /// 把会话放进公平队列并转入 `Queued`；队列满时**不改动**会话状态。
+    fn enqueue(
+        &self,
+        core: &mut SchedulerCore,
+        session: SessionId,
+        priority: Priority,
+    ) -> Result<Admitted, String> {
         let now = self.inner.clock.now();
         core.queue
             .push(session, priority, now)
@@ -2357,6 +2586,7 @@ impl RuntimeManager {
         let agent_dir = descriptor.agent_dir.clone();
         Arc::new(RuntimeEntry {
             id,
+            probe: Arc::clone(&self.inner.probe),
             session,
             state: Mutex::new(RuntimeEntry::new_state(
                 history,
@@ -2397,6 +2627,10 @@ impl RuntimeManager {
     /// 会话正在执行请求时返回 `Err` 且**不改动任何状态** —— Park 是「让出进程」，
     /// 不是「打断请求」；想强行结束请用 [`RuntimeManager::stop_session`]。
     pub fn park(&self, session: SessionId) -> Result<(), String> {
+        // 整个 Park 期间记账。第 ③ 步之后，entry 与 lease 已经从 `SchedulerCore` 上摘走，
+        // 而 client 还攥在本地栈上 —— 这一刻 `draining` 和会话表都看不见它。关停屏障若
+        // 恰在此时采样，会宣布已排空，随后我们把一个活着的 client 塞进 warm pool。
+        let _pending = PendingHandoffGuard::acquire(&self.inner);
         // ① 只读地看一眼 Runtime。这一步刻意不改任何状态：下面可能因为会话正忙而拒绝，
         //    那时必须原样返回，不能留下一个已经被改成 Stopping 的半截会话。
         let entry = {
@@ -2527,6 +2761,11 @@ impl RuntimeManager {
 
     /// 停止会话：关掉进程，会话保留在注册表里（转 `Parked`，可再次 `request_run`）。
     pub fn stop_session(&self, session: SessionId) {
+        // 整个拆除期间记账：`slot.entry` 一旦被摘走，进程句柄就只活在这个调用栈上 ——
+        // 会话表看不见它，`core.draining` 也要等 `shutdown_entry` 返回之后才收到 lease。
+        // 中间这段窗口不记账，关停屏障会在进程还活着时宣布已排空，退出于是跳过优雅收尾、
+        // 改由 Job Object 直接终止，pi 可能来不及把会话文件写完。
+        let _pending = PendingHandoffGuard::acquire(&self.inner);
         let (owns_teardown, entry) = {
             let mut core = self.inner.core.lock().unwrap();
             core.queue.remove(session);
@@ -2600,11 +2839,131 @@ impl RuntimeManager {
         }
     }
 
+    /// 显式关停本 Manager 名下的**全部** Runtime，包括 warm pool 里的热进程。
+    ///
+    /// 为什么必须有这条入口（BACKLOG #19 / #25）：app 退出时标签往往仍持有
+    /// `SessionHandle`，那些 `RuntimeEntry` 会比 `ManagerInner` 活得久，pi 进程随之
+    /// 拖到最后一个句柄被 drop 才退。单会话时代这最多拖住一个进程；R24 开放多会话后
+    /// 同一条链路被放大到 `total_runtime_slots` 个。靠 Drop 链"最终会关掉"不是关停策略。
+    ///
+    /// 返回之后本 Manager 名下不再有 pi 进程在跑。**幂等**：重复调用无副作用，
+    /// 调用后 Manager 仍可继续登记新会话。
+    ///
+    /// 停机沿用 [`RuntimeManager::remove_session`] 这条既有路径，而不是新开一条把
+    /// client 交给在途作业、同时把 `state.client` 置空的捷径 —— 那种路径必须用闭包
+    /// 捕获的 `ClientOwnerGuard` 记账（BACKLOG #23），漏一处就是运行槽永久泄漏。
+    pub fn shutdown_all(&self) -> ShutdownReport {
+        // 整个关停串行化：并发关停时，标志与 maintenance 闸门的"关—开"会互相穿插，
+        // 先跑完的那个把闸门提前打开，后一个还在关停途中就又能进新 Runtime 了。
+        let _serialized = self
+            .inner
+            .shutdown_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 置位 + 清空队列，必须在动任何会话之前：`stop_session` 收尾会 `tick()`，
+        // 不先拦住提升，批量关停会在退出途中把排队会话一个个拉起来再关掉。
+        // 置位同时也让 `admit_and_start` 拒绝并发准入（见那里的注释）。
+        self.inner.shutting_down.store(true, Ordering::Release);
+        // maintenance 的闸门单独关一次：它的判定在自己的锁内，不看这个原子标志。
+        self.inner.maintenance.set_closed(true);
+        let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
+        let mut report = ShutdownReport::default();
+        // 循环而不是走一遍：`shutting_down` 置位与快照之间仍可能挤进一次准入，
+        // 那条会话不在第一轮名单里。再看一眼比祈祷没人插队可靠。
+        loop {
+            let sessions: Vec<SessionId> = {
+                let mut core = self.inner.core.lock().unwrap();
+                let present: Vec<SessionId> = core.sessions.keys().copied().collect();
+                core.queue = WaitQueue::new(self.inner.limits);
+                present
+            };
+            for session in sessions {
+                self.remove_session(session);
+                report.sessions += 1;
+            }
+            // 热进程不属于任何会话，`remove_session` 碰不到它们；不单独收就会漏掉一整个
+            // warm pool 的常驻内存。摘出来之后到锁外关，避免在调度锁上串行等进程退出。
+            let warm: Vec<WarmRuntime> = {
+                let mut core = self.inner.core.lock().unwrap();
+                core.warm.drain(..).collect()
+            };
+            report.warm += warm.len();
+            {
+                let _pending = PendingHandoffGuard::acquire(&self.inner);
+                for entry in warm {
+                    let _ = entry.client.shutdown();
+                }
+            }
+            // 等在途作业把进程交还，否则这个 API 宣称的保证是假的（见下）。
+            report.drained = self.wait_until_drained(deadline);
+            let settled = {
+                let core = self.inner.core.lock().unwrap();
+                core.sessions.is_empty() && core.warm.is_empty()
+            };
+            if (report.drained && settled) || Instant::now() >= deadline {
+                break;
+            }
+        }
+        // 关停不是一次性的：Manager 之后仍可继续登记与启动会话。
+        self.inner.maintenance.set_closed(false);
+        self.inner.shutting_down.store(false, Ordering::Release);
+        self.inner.watch.publish();
+        report
+    }
+
+    /// 等到拆除窗口里的运行槽全部归还。
+    ///
+    /// `Actor::close()` 只关队列，**不等**正在执行的作业。`restart_with_tools` 这类
+    /// 换进程作业执行期间攥着 `Client`、而 `state.client` 已经是 `None` —— 不等它交还，
+    /// `shutdown_all` 就可能在一个 pi 进程（甚至一个刚被它拉起来的新进程）还活着的
+    /// 时候宣布关停完成，紧接着 app 就 `cx.quit()` 了。
+    ///
+    /// 用真实时钟而不是注入时钟：这里等的是别的线程干完活，不是逻辑时间推进。
+    /// 超时返回 `false` 而不是死等 —— 退出路径卡死比晚几秒回收更糟，而且每棵进程树
+    /// 都有 `KILL_ON_JOB_CLOSE` 兜底，本进程一退它们必然消失，只是少了一次优雅收尾。
+    fn wait_until_drained(&self, deadline: Instant) -> bool {
+        loop {
+            // `tick` 会把已经释放的条目从 `draining` 里摘掉，顺带归还运行槽。
+            self.tick();
+            // 三类在途进程都要等，少问一类就会在它还活着时宣布"已排空"：
+            //   · `draining`         —— 已摘下会话、进程还没退干净的；
+            //   · `pending_starts`   —— 抢到槽了但 `finish_start` 还没把 entry 挂进调度器的；
+            //   · `pending_handoffs` —— 正在 Park，进程句柄只活在调用栈上的；
+            //   · maintenance        —— 历史 HTML 导出这类，压根不属于任何会话。
+            let drained = self.inner.core.lock().unwrap().draining.is_empty()
+                && self.inner.pending_starts.load(Ordering::Acquire) == 0
+                && self.inner.pending_handoffs.load(Ordering::Acquire) == 0
+                && self.inner.maintenance.in_flight() == 0;
+            if drained {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(SHUTDOWN_DRAIN_POLL);
+        }
+    }
+
     /// 推进调度器：回收崩溃的 Runtime、按 Idle TTL 回收热进程、提升排队会话。
     ///
     /// 所有耗时动作（关进程、启动进程）都在放开调度锁之后进行。
     pub fn tick(&self) {
+        self.tick_inner(true);
+    }
+
+    /// `reclaim_under_pressure` 控制这一趟要不要顺手把热进程还给系统。
+    ///
+    /// **`request_run` 之前那一趟必须传 `false`**：热进程回收会清空 warm pool，而紧接着
+    /// 的 `admit` 第一步正是"复用参数一致的热进程"。先清后用等于把「Resume 优先复用
+    /// `switch_session`」整条路径打掉 —— 复用本来就不新增常驻进程，压力再大也该走。
+    /// 非匹配的热进程仍会在 `admit` 的水位分支里被淘汰，一格都不会漏。
+    fn tick_inner(&self, reclaim_under_pressure: bool) {
         let now = self.inner.clock.now();
+        // 水位采样必须**每一趟周期性 tick 都做**，而不是只在 admit 时做：内存不是只有
+        // 我们自己会吃。外部负载把系统压到高水位时根本不会发生任何 admission，只靠
+        // admit 采样的话，热进程会一直占着内存等到 TTL，`memory_pressure()` 也停在旧值上。
+        // 采样在锁外完成。
+        let pressured = reclaim_under_pressure && self.inner.memory.under_pressure(now);
         let expired = {
             let mut core = self.inner.core.lock().unwrap();
             // 先收已经退干净的进程的运行槽，再判断谁能开跑。
@@ -2612,10 +2971,32 @@ impl RuntimeManager {
             Self::reap_terminated(&mut core);
             Self::reap_idle_warm(&mut core, now, self.inner.limits.idle_ttl)
         };
-        for warm in expired {
+        {
+            // 同一个盲区：热进程已经从池里摘走、`shutdown()` 还没返回，此刻谁也看不见它。
+            let _pending = PendingHandoffGuard::acquire(&self.inner);
+            for warm in expired {
+                let _ = warm.client.shutdown();
+            }
+        }
+        // 先让排队的会话有机会**复用**热进程，再把剩下没人要的还给系统。次序反过来，
+        // 一次周期性 tick 就会把队列里那个本可以热复用的会话逼成冷启动。
+        self.promote_queued(now);
+        if !pressured {
+            return;
+        }
+        let reclaimed = {
+            let mut core = self.inner.core.lock().unwrap();
+            let drained: Vec<WarmRuntime> = core.warm.drain(..).collect();
+            core.counters.pressure_reclaimed = core
+                .counters
+                .pressure_reclaimed
+                .wrapping_add(drained.len() as u64);
+            drained
+        };
+        let _pending = PendingHandoffGuard::acquire(&self.inner);
+        for warm in reclaimed {
             let _ = warm.client.shutdown();
         }
-        self.promote_queued(now);
     }
 
     /// 把已经进入终态的 Runtime 从运行槽上摘下来。
@@ -2690,7 +3071,16 @@ impl RuntimeManager {
     }
 
     fn promote_queued(&self, now: Duration) {
+        // 关停期不提升队列：`stop_session` 收尾会 `tick()`，批量关停时照常提升等于在
+        // 退出途中把排队会话一个个冷启动、再一个个关掉，每个都要付一次 grace period。
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let budget = self.inner.core.lock().unwrap().queue.len();
+        // 这一轮已经确认推进不了的条目。**跳过而不是就此收手**：内存水位会挡下后台
+        // 会话，队首正好是这么一条时，收手就意味着本该绕过水位的前台会话跟着一起饿死，
+        // 运行槽空在那儿没人用。
+        let mut blocked: Vec<SessionId> = Vec::new();
         for _ in 0..budget {
             // 只 peek 不 pop：真正的出队由 `admit` 在抢到运行槽之后做。先 pop 再放回
             // 会重置 `enqueued_at`，把这条条目辛苦攒下的 aging 一次清零 —— 恰好惩罚
@@ -2700,7 +3090,7 @@ impl RuntimeManager {
                 if self.inner.slots.counts().user >= self.inner.limits.user_session_slots {
                     return;
                 }
-                core.queue.peek_next(now)
+                core.queue.peek_next_excluding(now, &blocked)
             };
             let Some(session) = candidate else {
                 return;
@@ -2715,9 +3105,10 @@ impl RuntimeManager {
                 .map(|slot| slot.priority)
                 .unwrap_or_default();
             let _ = self.admit_and_start(session, priority);
-            // 没能推进（仍在队列里）就停手，否则同一条目会被反复重试到 budget 用尽。
+            // 没能推进（仍在队列里）就把它记下来跳过，让下一条候选有机会 —— 但绝不
+            // 反复重试同一条，否则 budget 会被一条推不动的条目耗光。
             if self.session_state(session) == Some(SchedulerState::Queued) {
-                return;
+                blocked.push(session);
             }
         }
     }
@@ -2891,7 +3282,12 @@ impl RuntimeManager {
         &self,
         request: HistoricalHtmlExportRequest,
     ) -> Result<HistoricalHtmlExport, String> {
-        let _permit = self.inner.maintenance.acquire();
+        // 关停期一律不受理新的 maintenance 作业。判定就在 gate 的锁内完成 ——
+        // 「先查标志、再去 acquire」中间那道缝，足够让一次导出在屏障采完样之后才开工，
+        // 随后被 `cx.quit()` 拦腰砍断。
+        let Some(_permit) = self.inner.maintenance.acquire() else {
+            return Err("运行时正在关停，暂不受理历史导出".to_owned());
+        };
         export_historical_html_impl(request, self.inner.tuning)
     }
 }
@@ -2903,6 +3299,13 @@ impl RuntimeManager {
 /// 一次偶发的慢 RPC 把 Park 变成秒级卡顿。
 const PARK_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 const PARK_SETTLE_POLL: Duration = Duration::from_millis(5);
+
+/// [`RuntimeManager::shutdown_all`] 等在途作业交还进程的上限。
+///
+/// 取 10s：`pi-rpc` 的 `shutdown_grace_period` 是 2s，一次换进程作业最坏要走完
+/// 「关旧进程 + 起新进程 + 再关掉」，10s 足够覆盖，又不至于让退出看起来卡死。
+const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// 一次 Park 从 Runtime 手里拿到的全部东西。
 struct ParkedRuntime {
@@ -3043,6 +3446,51 @@ fn apply_captured_state(
 /// 必须由作业闭包**捕获**（而不是在闭包体内创建）：作业还在队列里就被 `close()` 丢掉时，
 /// 闭包连同守卫一起 drop，计数照样归零。R23 第三轮审查整改时先写成「闭包体内创建」，
 /// 结果恰恰漏掉这条路，运行槽被永久扣住。
+/// 在途 Park/交接记账守卫。
+///
+/// 与 [`PendingStartGuard`] 同构，分开计数只为诊断时能一眼看出卡在哪一边。
+struct PendingHandoffGuard {
+    inner: Arc<ManagerInner>,
+}
+
+impl PendingHandoffGuard {
+    fn acquire(inner: &Arc<ManagerInner>) -> Self {
+        inner.pending_handoffs.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+}
+
+impl Drop for PendingHandoffGuard {
+    fn drop(&mut self) {
+        self.inner.pending_handoffs.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 在途启动记账守卫。
+///
+/// 与 `ClientOwnerGuard` 同构：**必须在调用点持有**，不能写进被调函数体内 ——
+/// 那样会漏掉"还没进到函数体就提前返回"的路径（BACKLOG #23 记的就是这个坑）。
+struct PendingStartGuard {
+    inner: Arc<ManagerInner>,
+}
+
+impl PendingStartGuard {
+    fn acquire(inner: &Arc<ManagerInner>) -> Self {
+        inner.pending_starts.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+}
+
+impl Drop for PendingStartGuard {
+    fn drop(&mut self) {
+        self.inner.pending_starts.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ClientOwnerGuard {
     owners: Arc<AtomicUsize>,
 }
@@ -3089,6 +3537,10 @@ fn shutdown_entry(entry: &RuntimeEntry) {
 fn clamp_manager_config(config: &mut ClientConfig, tuning: RuntimeTuning) {
     config.max_restarts = 0;
     config.event_backlog_bytes = tuning.event_backlog_bytes;
+    // R25：经 Manager 创建的每一个 Runtime 都带自己的 Job Object 硬上限 —— 用户会话、
+    // 内建子代理、maintenance 导出一视同仁。这里是唯一落点，新增创建路径只要走
+    // `clamp_manager_config` 就自动被纳管，不会漏掉一棵没人管的进程树。
+    config.job_limits = tuning.job;
 }
 
 fn publish_if_current(entry: &RuntimeEntry, epoch: u64, kind: RuntimeEffectKind) {
