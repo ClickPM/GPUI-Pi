@@ -89,6 +89,12 @@ pub struct ChatPanel {
     message_pane_bounds: Option<Bounds<Pixels>>,
     extension_dialog_body_focus: Option<FocusHandle>,
     extension_dialog_footer_focus: Option<FocusHandle>,
+    /// 已经从标签条上摘掉、但进程还没回收完的会话文件（按 `tab_id` 记账）。
+    ///
+    /// `close_tab` 立刻摘标签，`remove_session` 放后台（它要等优雅停机）。这段时间里
+    /// 那份 JSONL 仍被一个活着的 pi 进程写着；不挂个墓碑，用户马上重新打开同一段历史
+    /// 再点「启动活会话」就会起第二个进程写同一份文件。后台作业落地即摘除。
+    closing_session_files: Vec<(u64, PathBuf)>,
     /// 调度器订阅本体。存在这里就是为了让它随面板一起析构 —— 析构即退订，
     /// 桥接线程随之退出。
     scheduler_subscription: Option<pi_runtime::SchedulerSubscription>,
@@ -202,6 +208,12 @@ pub struct SessionUiState {
     controls: Option<SessionControls>,
     tool_preset: ToolPreset,
     control_operation: Option<ControlOperation>,
+    /// 正在切过去的会话文件。
+    ///
+    /// 只在 `control_operation == Some(SwitchSession)` 期间有意义，因此**不需要单独清理**：
+    /// `control_operation` 的三条清空路径（`ControlFinished` / `ToolRestartFinished` /
+    /// `Stopped`）自动让这条主张失效，不会多出一份要跟着同步的生命周期。
+    pending_switch_target: Option<PathBuf>,
     branch_tree: Option<pi_data::SessionBranchTree>,
     branch_preview_leaf: Option<String>,
     branch_preview_document: Option<Arc<ConversationDocument>>,
@@ -276,6 +288,7 @@ impl SessionUiState {
             controls: None,
             tool_preset: ToolPreset::Inherit,
             control_operation: None,
+            pending_switch_target: None,
             branch_tree: None,
             branch_preview_leaf: None,
             branch_preview_document: None,
@@ -350,6 +363,29 @@ impl SessionUiState {
                 _ => None,
             })
             .filter(|path| !path.as_os_str().is_empty())
+    }
+
+    /// 这个标签此刻主张拥有的会话文件——可能不止一份。
+    ///
+    /// 已经绑上的那份要算：进程正写着它。正在切过去的那份也要算——切换落地前
+    /// `bound_session_file` 报的还是**旧**文件，只看它，第二个标签就能同时切到同一份
+    /// JSONL 上；而切换万一失败，进程还留在旧文件上，所以切换期间两份都不能被别人抢。
+    ///
+    /// 注意这里**不问「有没有登记成会话」**：一个只读历史标签同样占着那份 JSONL。
+    /// 让别人切进去，两个标签就共用同一个 `draft_key`（草稿互相覆盖），
+    /// 随后把历史标签启起来就是两个 pi 进程写同一份文件。
+    fn claimed_session_files(&self) -> Vec<PathBuf> {
+        let mut claims = Vec::new();
+        if let Some(bound) = self.bound_session_file() {
+            claims.push(bound);
+        }
+        if self.control_operation == Some(ControlOperation::SwitchSession)
+            && let Some(target) = self.pending_switch_target.clone()
+            && !claims.iter().any(|claim| same_session_file(claim, &target))
+        {
+            claims.push(target);
+        }
+        claims
     }
 }
 
@@ -618,6 +654,7 @@ impl ChatPanel {
             message_pane_bounds: None,
             extension_dialog_body_focus: None,
             extension_dialog_footer_focus: None,
+            closing_session_files: Vec::new(),
             scheduler_subscription: None,
             _composer_subscription: subscription,
             probe: None,
@@ -654,6 +691,34 @@ impl ChatPanel {
 
     fn slot_index_for_tab(&self, tab_id: u64) -> Option<usize> {
         self.sessions.iter().position(|slot| slot.tab_id == tab_id)
+    }
+
+    /// 这份会话文件此刻归谁 —— 返回占着它的那个标签的标题（`except` 是提问者自己）。
+    ///
+    /// 「归谁」的判据集中在这一个函数里，所有会让 pi 进程绑上一份 JSONL 的入口
+    /// （启动活会话、切换会话）都问它。判据式地在各入口各写一份，就是第七轮那条
+    /// 「永远漏一个」——第十一轮的切换守卫只查了 `session.is_some()` 的标签，
+    /// 于是漏掉了只读历史标签和正在关闭的标签两类占用者。
+    fn session_file_owner(&self, path: &Path, except: usize) -> Option<String> {
+        if let Some(owner) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(index, slot)| {
+                *index != except
+                    && slot
+                        .claimed_session_files()
+                        .iter()
+                        .any(|owned| same_session_file(owned, path))
+            })
+            .map(|(_, slot)| slot.tab_title.clone())
+        {
+            return Some(owner);
+        }
+        self.closing_session_files
+            .iter()
+            .any(|(_, owned)| same_session_file(owned, path))
+            .then(|| "正在关闭的会话".to_owned())
     }
 
     /// 把一段**延后执行**的投影逻辑钉回发起它的那个标签。
@@ -823,6 +888,18 @@ impl ChatPanel {
             // 随后的 `tick()` 还可能就地拉起一个排队会话，两者都不能占着 UI 线程。
             // `tick()` 是必须的——不推这一下，排队会话要等 reaper 轮询
             //（默认 TTL 下最长 45s）才补位。
+            //
+            // 但标签一摘，它对那份 JSONL 的主张也跟着没了，而进程还活着。留个墓碑到
+            // 后台作业落地为止，否则「关掉 → 重新打开同一段历史 → 启动活会话」
+            // 会在旧进程退干净之前起第二个进程写同一份文件。
+            let tab_id = self.sessions[index].tab_id;
+            if let Some(claimed) = self.sessions[index]
+                .claimed_session_files()
+                .into_iter()
+                .next()
+            {
+                self.closing_session_files.push((tab_id, claimed));
+            }
             self.spawn_scheduler_job(
                 window,
                 cx,
@@ -830,7 +907,11 @@ impl ChatPanel {
                     manager.remove_session(session);
                     manager.tick();
                 },
-                |_, (), _, _| {},
+                move |panel, (), _, _| {
+                    panel
+                        .closing_session_files
+                        .retain(|(owner, _)| *owner != tab_id);
+                },
             );
         }
         if self.sessions.len() == 1 {
@@ -1442,7 +1523,13 @@ impl ChatPanel {
         self.spawn_scheduler_job(
             window,
             cx,
-            move |manager| manager.request_run(session, priority).map(|_| ()),
+            move |manager| {
+                // 先把优先级落到调度器上再申请：`request_run` 内部第一件事是 `tick()`，
+                // 而 `promote_queued` 按队列里**现有的**优先级挑人。少了这一步，
+                // 「切到一个排队标签」会先用旧优先级把刚空出来的槽让给别的后台会话。
+                manager.reprioritize(session, priority);
+                manager.request_run(session, priority).map(|_| ())
+            },
             move |panel, result, _, _| {
                 panel.project_tab(tab_id, |panel| {
                     panel.scheduler_job = None;
@@ -1510,6 +1597,16 @@ impl ChatPanel {
             return;
         };
         let history = history.clone();
+        // 真正会起进程的另一条入口。只读历史标签可以有两个开在同一份 JSONL 上
+        // （例如另一个标签刚切过去），但**起进程**只能有一个，否则两个 pi 各自往
+        // 同一份文件追加。正在关闭、进程还没回收完的那份同样不能抢。
+        if let Some(owner) = self.session_file_owner(&history.source_path, index) {
+            self.rpc_success = None;
+            self.rpc_error_protected = true;
+            self.rpc_error = Some(format!("该会话已在标签「{owner}」中打开，请直接切过去"));
+            cx.notify();
+            return;
+        }
         let tool_preset = self.tool_preset;
         self.begin_active_generation();
         let session_path = history.source_path.clone();
@@ -2909,22 +3006,10 @@ impl ChatPanel {
         let Some(index) = self.slot_index_for_tab(tab_id) else {
             return;
         };
-        // 不能切进另一个标签已经登记的会话文件：那会让**两个** pi 进程绑同一份
+        // 不能切进另一个标签已经占着的会话文件：那会让**两个** pi 进程绑同一份
         // JSONL，各自往里追加，落盘历史交错甚至写坏。这条路径绕开了侧栏选择时的
         // `slot_index_for_key` 去重，必须自己查一次。
-        if let Some(owner) = self
-            .sessions
-            .iter()
-            .enumerate()
-            .find(|(other, slot)| {
-                *other != index
-                    && slot.session.is_some()
-                    && slot
-                        .bound_session_file()
-                        .is_some_and(|owned| same_session_file(&owned, &path))
-            })
-            .map(|(_, slot)| slot.tab_title.clone())
-        {
+        if let Some(owner) = self.session_file_owner(&path, index) {
             self.project(index, |panel| {
                 panel.rpc_success = None;
                 panel.rpc_error_protected = true;
@@ -2938,6 +3023,9 @@ impl ChatPanel {
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
+                // 先立主张再发请求：切换落地前 `bound_session_file` 报的还是旧文件，
+                // 不登记目标，另一个标签同一时刻也能通过上面那道守卫切到同一份 JSONL。
+                panel.pending_switch_target = Some(path.clone());
                 panel.begin_control(
                     ControlOperation::SwitchSession,
                     ControlRequest::SwitchSession { path },
@@ -4970,6 +5058,20 @@ mod tests {
         let path = dir.path().join("fixture.jsonl");
         std::fs::write(
             &path,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/fixture\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        Arc::new(pi_render::render_path(path).unwrap())
+    }
+
+    /// 落在**指定路径**上的历史 fixture。
+    ///
+    /// `document()` 用的是临时目录里的随机路径，钉不住「谁占着哪份 JSONL」。
+    fn document_at(path: &std::path::Path, message: &str) -> Arc<ConversationDocument> {
+        std::fs::write(
+            path,
             format!(
                 "{{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/fixture\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}}}}\n"
             ),
@@ -8347,6 +8449,141 @@ mod tests {
                 panel.set_tool_preset(ToolPreset::ReadOnly, cx);
                 assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
                 assert_eq!(preset_in_manager(panel), Some(ToolPreset::ReadOnly));
+            });
+        });
+    }
+
+    /// 第十二轮独立审查 P1：只读历史标签同样占着它那份 JSONL。
+    ///
+    /// 第十一轮的守卫只查 `session.is_some()` 的标签，于是一个还没启动的历史标签
+    /// 不算占用者：别的标签可以切进它显示的那份文件，两个标签共用同一个 `draft_key`
+    /// （草稿互相覆盖），随后把历史标签启起来就是两个 pi 进程写同一份 JSONL。
+    #[gpui::test]
+    fn a_history_only_tab_still_owns_its_session_file(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 一号只是把 owned.jsonl 渲染出来看，没有登记会话、没有进程。
+                panel.tab_title = "历史".to_owned();
+                panel.status = ChatStatus::Ready(document_at(&owned, "历史"));
+                assert!(panel.session.is_none());
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+                panel.status = ChatStatus::Ready(document_at(&owned, "历史"));
+
+                // ① 切换会话这条入口必须拒绝。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("历史")),
+                    "拒绝理由要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none(), "被拒时不得发起控制操作");
+                assert!(panel.pending_switch_target.is_none(), "被拒时不得留下主张");
+
+                // ② 真正会起进程的那条入口（启动活会话）同样必须拒绝。
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.start_live(&gpui::ClickEvent::default(), window, cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("历史")),
+                    "启动活会话也要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.session.is_none(), "被拒时不得登记会话");
+                assert!(
+                    panel.sessions[0].rpc_error.is_none(),
+                    "错误只属于发起操作的标签"
+                );
+            });
+        });
+    }
+
+    /// 第十二轮独立审查 P2：标签摘掉了，进程还没退干净，那份 JSONL 仍不能被别人抢。
+    ///
+    /// `close_tab` 立刻摘标签、把 `remove_session` 放后台（它要等优雅停机）。这段时间里
+    /// 主张随标签一起消失，而进程还活着——「关掉 → 重新打开同一段历史 → 启动活会话」
+    /// 就会在旧进程退干净之前起第二个进程写同一份文件。
+    #[gpui::test]
+    fn a_closing_tab_keeps_its_session_file_claimed_until_the_process_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        std::fs::write(&owned, "").expect("write session file");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        let second_tab = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(owned.clone())));
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+
+                panel.close_tab(0, window, cx);
+                assert_eq!(panel.sessions.len(), 1, "一号已经从标签条上摘掉");
+                assert_eq!(
+                    panel.session_file_owner(&owned, usize::MAX).as_deref(),
+                    Some("正在关闭的会话"),
+                    "进程还没回收完，主张必须留着"
+                );
+
+                // 走真实入口再确认一次：这时候切进去就是两个进程写同一份文件。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("正在关闭")),
+                    "{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none());
+                second_tab
+            })
+        });
+
+        // 后台注销落地（`remove_session` 内部已经等过优雅停机）：墓碑必须摘掉，
+        // 否则那份会话文件就永远打不开了。
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                assert!(
+                    panel.closing_session_files.is_empty(),
+                    "作业落地后必须摘除墓碑"
+                );
+                assert!(panel.session_file_owner(&owned, usize::MAX).is_none());
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    !panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("已在标签")),
+                    "墓碑摘掉后不得再按「被别人占着」拒绝：{:?}",
+                    panel.rpc_error
+                );
+                assert_eq!(
+                    panel.pending_switch_target.as_deref(),
+                    Some(owned.as_path()),
+                    "放行时必须立起自己的主张，挡住同一时刻的第二次切换"
+                );
             });
         });
     }

@@ -2022,6 +2022,28 @@ impl RuntimeManager {
         self.admit_and_start(session, priority)
     }
 
+    /// 只更新一个会话的调度优先级，**不做任何状态转移、也不起进程**。
+    ///
+    /// 为什么单独有这一步：[`RuntimeManager::request_run`] 的第一件事是 `tick()`，
+    /// 而 `tick()` 里的 `promote_queued` 是按**队列里现有的**优先级挑人的。
+    /// 「切到一个 Queued 标签」如果直接调 `request_run`，这次 tick 会先用旧优先级
+    /// 把刚空出来的槽让给别的后台会话，自己才在随后的 `admit` 里被抬成 FOREGROUND ——
+    /// 抬了个寂寞。调用方要先落优先级、再申请。
+    ///
+    /// 队列侧沿用 [`WaitQueue::push`] 的既有规则：对已排队条目取 `min`（只升不降），
+    /// 且不刷新 `enqueued_at`，因此反复调用不会把 aging 玩坏。
+    pub fn reprioritize(&self, session: SessionId, priority: Priority) {
+        let now = self.inner.clock.now();
+        let mut core = self.inner.core.lock().unwrap();
+        let Some(slot) = core.sessions.get_mut(&session) else {
+            return;
+        };
+        slot.priority = priority;
+        if core.queue.contains(session) {
+            let _ = core.queue.push(session, priority, now);
+        }
+    }
+
     fn admit_and_start(
         &self,
         session: SessionId,
@@ -6085,6 +6107,60 @@ mod tests {
                 state.label()
             );
         }
+    }
+
+    /// 第十二轮审查 P2：优先级必须在**提升 tick 之前**落到队列上。
+    ///
+    /// `request_run` 的第一件事是 `tick()`，而 `promote_queued` 按队列里现有的优先级挑人。
+    /// 「切到一个排队标签」如果只靠 `admit` 里那句 `slot.priority = priority`，
+    /// 这次调用会先用旧优先级把刚空出来的槽让给别的后台会话，自己才被抬成前台。
+    #[test]
+    fn reprioritize_raises_a_queued_entry_before_the_next_promotion_tick() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let early = parked_session(&manager, "early");
+        let late = parked_session(&manager, "late");
+        let now = manager.inner.clock.now();
+        {
+            let mut core = manager.inner.core.lock().unwrap();
+            for session in [early, late] {
+                core.queue
+                    .push(session, Priority::BACKGROUND, now)
+                    .expect("入队");
+                core.sessions.get_mut(&session).expect("会话仍在").state = SchedulerState::Queued;
+            }
+        }
+        let peek = || manager.inner.core.lock().unwrap().queue.peek_next(now);
+        assert_eq!(peek(), Some(early), "同优先级下先入队的先被挑中");
+
+        manager.reprioritize(late, Priority::FOREGROUND);
+        assert_eq!(peek(), Some(late), "抬到前台后，下一次提升就该轮到它");
+        assert_eq!(
+            manager
+                .inner
+                .core
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&late)
+                .map(|slot| slot.priority),
+            Some(Priority::FOREGROUND),
+            "会话侧也要记下调用方的意图"
+        );
+
+        // 沿用 `WaitQueue::push` 的「只升不降」：反复调用不得把它降回去。
+        manager.reprioritize(late, Priority::BACKGROUND);
+        assert_eq!(peek(), Some(late));
+
+        // 不在队列里的会话只更新 slot.priority，不得被顺手塞进队列。
+        let idle = parked_session(&manager, "idle");
+        manager.reprioritize(idle, Priority::FOREGROUND);
+        assert!(
+            !manager.inner.core.lock().unwrap().queue.contains(idle),
+            "reprioritize 不是入队入口"
+        );
     }
 
     #[test]

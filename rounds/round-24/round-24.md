@@ -439,6 +439,26 @@ Codex thread `01a03b94-a822-73a3-abf8-5834c6c74b06`。结论：**2 项 P1 + 1 �
 > 两处最后都换成了**已有的单一概念**（`holds_process()` / `control_busy()`），
 > 各调用点共用同一个判据，新增状态或新增按钮都不必回来补。
 
+### 第十二轮独立代码审查与整改
+
+Codex thread `01a03bbc-8074-76b1-a7c7-e46a492bcb43`。结论：**1 项 P1 + 2 项 P2，三条全部成立**。
+三条都在第十轮开的那条线上：**多会话让原本互斥的资源可以被同时争抢**。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P1 | 第十一轮加的切换守卫只查 `slot.session.is_some()` 的标签。只读历史标签没登记会话，于是不算占用者：别的标签可以切进它显示的那份 JSONL，两个标签共用同一个 `draft_key`（草稿互相覆盖），随后把历史标签启起来就是两个 pi 进程写同一份文件。另外切换在飞时 `bound_session_file()` 报的还是**旧**文件，两个标签能同时切到同一份 | 归属判据收敛成 `ChatPanel::session_file_owner()` 一个函数，主张由 `SessionUiState::claimed_session_files()` 给出：已经绑上的 + 正在切过去的（`pending_switch_target`，只在 `control_operation == SwitchSession` 期间有意义，因此不需要单独清理）。**并让真正会起进程的另一条入口 `start_live` 也问它**——此前只守了切换，没守启动 | `a_history_only_tab_still_owns_its_session_file`（切换与启动两条入口都拒绝，且被拒时不留主张） |
+| P2 | `close_tab` 立刻摘标签、把 `remove_session` 放后台（它要等优雅停机）。这段时间里那份 JSONL 的主张随标签一起消失，而进程还活着——「关掉 → 重新打开同一段历史 → 启动活会话」会在旧进程退干净之前起第二个进程写它 | `ChatPanel` 新增 `closing_session_files` 墓碑（按 `tab_id` 记账），`close_tab` 压入、后台作业落地时摘除；`session_file_owner` 一并查它 | `a_closing_tab_keeps_its_session_file_claimed_until_the_process_is_gone`（含「落地后必须摘除，否则那份文件就永远打不开了」） |
+| P2 | `request_run` 的第一件事是 `tick()`，而 `promote_queued` 按队列里**现有的**优先级挑人；`slot.priority = priority` 要到随后的 `admit` 才执行。于是「切到一个 Queued 标签」这次调用会先用旧优先级把刚空出来的槽让给别的后台会话，自己才被抬成 FOREGROUND | `pi-runtime` 新增 `RuntimeManager::reprioritize()`：只更新调度优先级、不做任何状态转移、不入队，队列侧沿用 `WaitQueue::push` 既有的「只升不降 + 不刷新 `enqueued_at`」；app 在 `request_run` 之前先调它。**没有改动 `request_run` 自身的语义**，是加一步而不是改一步 | `reprioritize_raises_a_queued_entry_before_the_next_promotion_tick`（抬前抬后 `peek_next` 各挑谁、只升不降、不把未排队会话塞进队列） |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **152 passed**；
+`cargo test -p pi-runtime --lib` → **82 passed**；`--test multi_session_fake_child` → **5 passed**。
+
+> 第十一轮刚把「谁能改工具预设」收敛成一个判据，这一轮同样的形状又出现在「谁占着这份会话文件」上：
+> 第十轮建立守卫、第十一轮没动它、第十二轮发现它从一开始就只覆盖了**一类**占用者，
+> 而且**另一条会起进程的入口根本没被守**。教训不是「再补一个条件」，而是
+> **凡是「某资源归谁」的问题，判据要有唯一的落点，并且所有会取得该资源的入口都从那里问**——
+> 这次把 `session_file_owner()` 做成那个落点，切换与启动两条入口共用。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在
