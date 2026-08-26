@@ -459,6 +459,24 @@ Codex thread `01a03bbc-8074-76b1-a7c7-e46a492bcb43`。结论：**1 项 P1 + 2 �
 > **凡是「某资源归谁」的问题，判据要有唯一的落点，并且所有会取得该资源的入口都从那里问**——
 > 这次把 `session_file_owner()` 做成那个落点，切换与启动两条入口共用。
 
+### 第十三轮独立代码审查与整改
+
+Codex thread `01a03bda-a3a6-7230-b120-1a7469c49b0a`。结论：**2 项 P1，均成立**。
+两条都是「同一条修复漏了某个入口」，其中一条是上一轮整改自己引入的。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P1 | `start_new_session` 的启动描述写死 `ToolPreset::Inherit`，而 `open_tab` 复用干净标签时**刻意保留**用户先挑好的预设（第七轮定的：预设是偏好不是瞬时状态）。于是「在空标签上选 ReadOnly → 新建会话」= 界面写 ReadOnly、进程按 Inherit 起 | 抽出 `ChatPanel::fresh_session_descriptor()`，预设取**这个标签当前显示的那一个**。判定说明：`main` 上的 `start_new_session` 同样硬编码 `Inherit`，但那个函数在 R24 被整体重写过（旧版走 `start_fresh` + `stop_user`），改的是本轮自己的代码，不触红线 3 | `a_fresh_session_starts_with_the_preset_the_tab_shows` |
+| P1 | 上一轮加的关闭墓碑用 `.into_iter().next()`，只盖住**第一条**主张。切换在飞时标签同时主张「现在绑着的」和「正要切过去的」两份文件，漏掉后者；而切换可能在优雅停机之前就完成——那时正在关闭的进程写的恰恰是漏掉的那份，别的标签却被放行切进去 | 墓碑改为盖住 `claimed_session_files()` 的**全部**主张，按 `tab_id` 一并摘除 | `closing_a_tab_mid_switch_tombstones_the_pending_target_too`（两份文件都被挡住，落地后两条墓碑都摘掉） |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **154 passed**；
+`cargo test -p pi-runtime --lib` → **82 passed**。
+
+> 第二条值得单独记：**上一轮的整改自己漏了一个入口**，而且漏法与它当初要修的问题一模一样
+> ——「主张有两份，只处理了第一份」。这正是第三～六轮那条规律在整改代码上的复现：
+> findings 驱动的修复必须和原始实现受同样的审视，`.next()` 这种「取一个就够了吧」的收窄
+> 尤其危险，因为它在类型上完全合法、在单主张的常见路径上也完全正确。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

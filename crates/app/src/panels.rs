@@ -893,11 +893,10 @@ impl ChatPanel {
             // 后台作业落地为止，否则「关掉 → 重新打开同一段历史 → 启动活会话」
             // 会在旧进程退干净之前起第二个进程写同一份文件。
             let tab_id = self.sessions[index].tab_id;
-            if let Some(claimed) = self.sessions[index]
-                .claimed_session_files()
-                .into_iter()
-                .next()
-            {
+            // **全部**主张都要盖上，不能只盖第一条：切换在飞时这个标签同时主张着
+            // 「现在绑着的」和「正要切过去的」两份文件，而切换可能在优雅停机之前就完成 ——
+            // 那时正在关闭的进程写的恰恰是后者。
+            for claimed in self.sessions[index].claimed_session_files() {
                 self.closing_session_files.push((tab_id, claimed));
             }
             self.spawn_scheduler_job(
@@ -1419,18 +1418,31 @@ impl ChatPanel {
             // 上面刚写进去的就是 Ready；走到这里说明代码被改坏了，不要静默继续。
             _ => return Err("新会话初始文档缺失".to_owned()),
         };
-        let descriptor = pi_runtime::SessionDescriptor {
-            binary: official_binary(),
-            cwd: cwd.clone(),
-            session_path: None,
-            tool_preset: ToolPreset::Inherit,
-            agent_dir: pi_data::agent_dir(),
-        };
+        let descriptor = self.fresh_session_descriptor(index, cwd.clone());
         self.start_file_index(tab_id, load_generation, cwd, cx);
         self.bind_session(index, descriptor, document, window, cx);
         self.emit_focused_session(cx);
         cx.notify();
         Ok(())
+    }
+
+    /// fresh 会话的启动描述。
+    ///
+    /// 预设必须取**这个标签当前显示的那一个**：`open_tab` 复用干净标签时刻意把用户先挑好的
+    /// 工具预设留下来（那是偏好，不是瞬时状态）。这里写死 `Inherit` 就会让进程按更宽的权限
+    /// 起来，而界面还显示着 ReadOnly —— 与 R23 审查 P1-1、本轮第十一轮修的是同一类分家。
+    fn fresh_session_descriptor(
+        &self,
+        index: usize,
+        cwd: PathBuf,
+    ) -> pi_runtime::SessionDescriptor {
+        pi_runtime::SessionDescriptor {
+            binary: official_binary(),
+            cwd,
+            session_path: None,
+            tool_preset: self.sessions[index].tool_preset,
+            agent_dir: pi_data::agent_dir(),
+        }
     }
 
     /// 给一个标签登记会话并请求运行。
@@ -8585,6 +8597,105 @@ mod tests {
                     "放行时必须立起自己的主张，挡住同一时刻的第二次切换"
                 );
             });
+        });
+    }
+
+    /// 第十三轮独立审查 P1：fresh 会话必须按标签上显示的那个预设起进程。
+    ///
+    /// `open_tab` 复用干净标签时刻意保留用户先挑好的工具预设（第七轮定的：那是偏好，
+    /// 不是瞬时状态）。启动描述如果写死 `Inherit`，进程就按更宽的权限起来，
+    /// 而界面还显示着 ReadOnly —— 与 R23 审查 P1-1、本轮第十一轮同一类分家。
+    ///
+    /// 覆盖边界（如实标注）：本用例钉的是断掉的那两环——「`open_tab` 保住预设」与
+    /// 「描述取标签的预设」。`start_new_session` 把 `index` 传给这个描述是紧挨着的一行，
+    /// 未机械覆盖：走它会真的 `create_session` + 起桥接线程 + `request_run`，
+    /// 在测试里等于起真实 pi 并写用户 `~/.pi`。
+    #[gpui::test]
+    fn a_fresh_session_starts_with_the_preset_the_tab_shows(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 在空标签上先挑好预设，再点「新建会话」——这是被支持的正常用法。
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                let index = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("干净标签原地复用");
+                assert_eq!(
+                    panel.sessions[index].tool_preset,
+                    ToolPreset::ReadOnly,
+                    "预设是用户偏好，重建标签不得抹掉"
+                );
+                assert_eq!(
+                    panel
+                        .fresh_session_descriptor(index, workspace.path().to_path_buf())
+                        .tool_preset,
+                    ToolPreset::ReadOnly,
+                    "起进程用的必须是界面上显示的那一个"
+                );
+            });
+        });
+    }
+
+    /// 第十三轮独立审查 P1：关标签时墓碑要盖住**全部**主张，不能只盖第一条。
+    ///
+    /// 切换在飞时这个标签同时主张着「现在绑着的」和「正要切过去的」两份文件，
+    /// 而切换可能在优雅停机之前就完成——那时正在关闭的进程写的恰恰是后者。
+    /// 只盖第一条，另一个标签就能同时切进去或在它上面启动活会话。
+    #[gpui::test]
+    fn closing_a_tab_mid_switch_tombstones_the_pending_target_too(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let bound = workspace.path().join("bound.jsonl");
+        let target = workspace.path().join("target.jsonl");
+        std::fs::write(&bound, "").expect("write bound");
+        std::fs::write(&target, "").expect("write target");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(bound.clone())));
+                // 一次还没落地的切换：两份文件此刻都归这个标签。
+                panel.control_operation = Some(ControlOperation::SwitchSession);
+                panel.pending_switch_target = Some(target.clone());
+                assert_eq!(panel.claimed_session_files().len(), 2);
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+
+                panel.close_tab(0, window, cx);
+                for path in [&bound, &target] {
+                    assert_eq!(
+                        panel.session_file_owner(path, usize::MAX).as_deref(),
+                        Some("正在关闭的会话"),
+                        "进程还没回收完，{} 不能被别人抢",
+                        path.display()
+                    );
+                }
+                panel.apply_session_switch_choice(second_tab, target.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("正在关闭")),
+                    "{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.pending_switch_target.is_none(), "被拒时不得留下主张");
+            });
+        });
+
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.closing_session_files.is_empty(),
+                "作业落地后两条墓碑都要摘掉，否则那两份文件永远打不开"
+            );
+            assert!(panel.session_file_owner(&bound, usize::MAX).is_none());
+            assert!(panel.session_file_owner(&target, usize::MAX).is_none());
         });
     }
 }
