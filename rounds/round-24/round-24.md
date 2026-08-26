@@ -477,6 +477,21 @@ Codex thread `01a03bda-a3a6-7230-b120-1a7469c49b0a`。结论：**2 项 P1，均�
 > findings 驱动的修复必须和原始实现受同样的审视，`.next()` 这种「取一个就够了吧」的收窄
 > 尤其危险，因为它在类型上完全合法、在单主张的常见路径上也完全正确。
 
+### 第十四轮独立代码审查与整改
+
+Codex thread `01a03bf8-e58d-7350-8f86-0860d9dfa46b`。结论：**1 项 P2**，成立。严重度较前三轮下降。
+
+| 编号 | 问题 | 整改 | 回归测试 |
+|---|---|---|---|
+| P2 | 第十一轮把按钮的 `disabled` 收敛到了 `control_busy`，但**直接输入路径绕过了它**：composer 的 Enter（`submit_composer`）与 Ctrl+P 循环模型（`can_cycle_model`）仍只看 `control_operation`。Park 作业在飞时 `active` 还挂着、而且是 idle 的，敲一下回车就把请求打在一个正被拆掉的 Runtime 上，既可能让 Park 失败，也可能与另一条控制请求叠在一起 | 把**所有**会把请求发给 `active` 的入口一次收口到同一个判据：`set_model` / `can_cycle_model` / `set_thinking` / `choose_session_switch` / `export_html` / `submit_composer` 与发送按钮全部改走 `control_busy()`。现在非测试代码里除了 `control_busy()` 自身的定义，**没有任何一处裸用 `control_operation.is_some()`**；这条不变式写进了它的文档注释 | `direct_input_paths_honor_the_same_busy_guard_as_the_buttons`（含「被挡住时草稿不得清空」，并用两条不同文案区分是 busy 守卫还是「没有活会话」守卫生效） |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **155 passed**。
+
+> 这是「判据要有唯一落点」在第三个地方复现：第十一轮建立 `control_busy` 时只改了**渲染出来的按钮**，
+> 因为找 findings 的入口是按钮。键盘与 composer 不经过按钮，于是整整三轮没人看它们。
+> 教训因此要再收紧一格：**收敛一个判据时，判据的覆盖面要按「谁会执行这个动作」枚举，
+> 而不是按「谁会显示这个动作」**。前者包含键盘、快捷键、原生选择器回调、以及任何 stale 闭包。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

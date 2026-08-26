@@ -343,7 +343,10 @@ impl SessionUiState {
     /// 控制请求要么打在一个马上要被摘掉的 Runtime 上，要么与调度器的状态转移撞车——
     /// 改工具预设撞上启动窗口更严重：描述改成了 ReadOnly，进程却已经按旧预设起来了。
     ///
-    /// 各个按钮的 `disabled` 与各个 handler 的早退**共用这一个判据**，不再各写一份。
+    /// **凡是会把请求发给 `active` 的入口都必须问它**——按钮的 `disabled`、composer 的
+    /// Enter、Ctrl+P 循环模型、原生选择器那两条（切换会话 / 导出）无一例外。
+    /// 各写一份判据就是第七轮那条「永远漏一个」：第十一轮补了按钮，第十四轮才发现
+    /// Enter 和 Ctrl+P 还绕着走。
     fn control_busy(&self) -> bool {
         self.control_operation.is_some() || self.scheduler_job.is_some()
     }
@@ -2760,7 +2763,7 @@ impl ChatPanel {
     }
 
     fn set_model(&mut self, provider: String, model_id: String, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -2780,7 +2783,7 @@ impl ChatPanel {
     }
 
     fn can_cycle_model(&self) -> bool {
-        self.control_operation.is_none()
+        !self.control_busy()
             && self
                 .active
                 .as_ref()
@@ -2803,7 +2806,7 @@ impl ChatPanel {
     }
 
     fn set_thinking(&mut self, level: pi_rpc::ThinkingLevel, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -2983,7 +2986,7 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.control_operation.is_some() || self.active.is_none() {
+        if self.control_busy() || self.active.is_none() {
             return;
         }
         // 原生选择器可能开着好几秒。不钉住标签，用户切一下界面就会把**别人的**
@@ -3052,7 +3055,7 @@ impl ChatPanel {
     }
 
     fn export_html(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() || self.active.is_none() {
+        if self.control_busy() || self.active.is_none() {
             return;
         }
         let start = self
@@ -3243,7 +3246,10 @@ impl ChatPanel {
             cx.notify();
             return;
         }
-        if self.control_operation.is_some() || self.compacting {
+        // 走 `control_busy` 而不是只看 `control_operation`：调度作业在飞时 `active`
+        // 还挂着、而且是 idle 的，这一发消息会打在一个正被拆掉的 Runtime 上，
+        // 既可能让 Park 失败，也可能和另一条控制请求叠在一起。
+        if self.control_busy() || self.compacting {
             self.rpc_error = Some("会话操作进行中，暂不能发送消息".to_owned());
             cx.notify();
             return;
@@ -4643,7 +4649,7 @@ impl Render for ChatPanel {
                                             .disabled(
                                                 !live_started
                                                     || stopping
-                                                    || self.control_operation.is_some()
+                                                    || control_busy
                                                     || self.branch_preview_leaf.is_some()
                                                     || self.compacting,
                                             )
@@ -8696,6 +8702,46 @@ mod tests {
             );
             assert!(panel.session_file_owner(&bound, usize::MAX).is_none());
             assert!(panel.session_file_owner(&target, usize::MAX).is_none());
+        });
+    }
+
+    /// 第十四轮独立审查 P2：直接输入路径也必须认同一个 busy 判据。
+    ///
+    /// 第十一轮把按钮的 `disabled` 收敛到了 `control_busy`，但 composer 的 Enter 与
+    /// Ctrl+P 循环模型仍只看 `control_operation`。Park 作业在飞时 `active` 还挂着、
+    /// 而且是 idle 的，敲一下回车就把请求打在一个正被拆掉的 Runtime 上。
+    #[gpui::test]
+    fn direct_input_paths_honor_the_same_busy_guard_as_the_buttons(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                register_parked_session(panel, 0, workspace.path());
+                let input = panel.composer.clone();
+                input.update(cx, |input, cx| input.set_value("要发出去的话", window, cx));
+
+                panel.scheduler_job = Some("挂起中…");
+                panel.submit_composer(&input, window, cx);
+                assert_eq!(
+                    panel.rpc_error.as_deref(),
+                    Some("会话操作进行中，暂不能发送消息"),
+                    "调度作业在飞时 Enter 必须被同一个判据挡住"
+                );
+                assert!(!input.read(cx).value().is_empty(), "被挡住时草稿不得被清空");
+                assert!(!panel.can_cycle_model(), "Ctrl+P 同样要被挡住");
+
+                // 作业落地后这条路重新打开：此时挡住它的只应该是「没有活会话」，
+                // 而不再是 busy —— 两条理由的文案不同，足以区分是哪一道守卫生效。
+                panel.scheduler_job = None;
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.submit_composer(&input, window, cx);
+                assert_eq!(
+                    panel.rpc_error.as_deref(),
+                    Some("请先启动活会话"),
+                    "落地后不该再报 busy"
+                );
+            });
         });
     }
 }
