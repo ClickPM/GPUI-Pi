@@ -418,6 +418,27 @@ Codex thread `01a038f4-7bd9-71e1-8943-797c05468e92`。结论：**2 项 P1**，�
 > 这是与「状态分层」并列的第二类多会话问题，之前几轮完全没触及。
 > 说明 findings 数量下降不等于面已经覆盖完，只说明**当前这条线**挖到底了。
 
+### 第十一轮独立代码审查与整改
+
+Codex thread `01a03b94-a822-73a3-abf8-5834c6c74b06`。结论：**2 项 P1 + 1 项 P2**；
+逐条核源码后 **2 条成立、1 条不成立**（那 2 条其实是同一个洞的两端）。
+
+| 编号 | 问题 | 判定与整改 | 回归测试 |
+|---|---|---|---|
+| P1 | `set_session_tool_preset` 只看 `slot.entry.is_some()`。但 `admit` 在进入 `Starting` 时就把描述**克隆**给了正在冷启动的那个进程，`entry` 要到 `finish_start` 才装上——整个启动窗口里这个判据都是空的（`Stopping` 同理）。于是改预设被接受、写进描述，而进程已经拿着旧预设出发了 | **成立**。判据从 `entry` 换成已有的 `SchedulerState::holds_process()`（`Starting \| IdleWarm \| Running \| Stopping`）：它就是「这个状态占着（或正在占）一个进程」，与运行槽会计同源，将来加状态不必回来补一遍 | `tool_preset_edits_are_refused_in_every_state_that_holds_a_process`（七态逐条钉死：三态允许并落到描述，四态拒绝且不得改描述） |
+| P2 | app 侧 `tools_enabled` 漏了 `scheduler_busy`。`request_run_in_background` 期间 `active` 是 `None`，选择器可点、`set_tool_preset` 直接走进「只改会话描述」那条分支；park 作业在飞时 `active` 还在，又能对同一个 Runtime 发起 `restart_with_tools` | **成立**，与上一条合起来才是完整链条：挂起 → 点「恢复运行」→ 在它启动的那几百毫秒里改成 ReadOnly → 界面写 ReadOnly、进程按 Full/Inherit 跑着。新增 `SessionUiState::control_busy()` = `control_operation.is_some() \|\| scheduler_job.is_some()`，**按钮的 `disabled` 与 handler 的早退共用这一个**；删掉原先散在 `can_park` / 启动按钮 / `controls_enabled` / `tools_enabled` / `abort_retry_disabled` 五处的组合判据 | `runtime_controls_are_locked_while_a_scheduler_job_owns_the_session`（busy 期间 UI 与 Manager 描述都不动、也不留误导性错误横幅；落地后照常可改并同步到描述） |
+| P1 | 切标签时若旧对话框不是最上层，`suspend_foreground_dialog` 只在**旧槽**记下 `extension_dialog_needs_close` 就返回，而 `process_extension_ui` 此后只为新前台标签跑，对话框会留在别的会话上 | **不成立**。链条要求「Extension UI 对话框开着时切标签 / 关标签」，但它是 `overlay_closable(false)` 的真模态：gpui-component 的 `Dialog` 用 `anchored().snap_to_window()` 套全窗口 `.occlude()` 背板，`dialog_layer` 在 `workspace.rs` 里渲染在 `AppShell` 之后，整窗口点击都被挡住；而 `focus_tab` / `close_tab` 的全部入口都是鼠标点击（标签条 `on_select` / `on_close`、侧栏选中经 `load_selection`），`crates/app` 与 `crates/ui` 里没有任何 `actions!` / `KeyBinding` / `on_action`，没有键盘路径。该分支在产品里到不了，本轮不改代码 | — |
+
+整改后：`.\scripts\validate.ps1` → `VALIDATE OK`；`cargo test -p gpui-pi` → **150 passed**；
+`cargo test -p pi-runtime --lib` → **81 passed**。
+
+> 两条成立的 findings 落在第十轮那条线的延长线上：**多会话让原本互斥的资源可以被同时争抢**。
+> 第十轮是两个标签抢同一份会话文件，这一轮是 UI 与调度器抢同一个会话的启动参数。
+> 更值得记的是整改形态：第一反应是往 `tools_enabled` 再加一个 `&& !scheduler_busy`、
+> 往 `set_session_tool_preset` 再加一个状态判断——那正是第七轮认定会「永远漏一个」的判据式修复。
+> 两处最后都换成了**已有的单一概念**（`holds_process()` / `control_busy()`），
+> 各调用点共用同一个判据，新增状态或新增按钮都不必回来补。
+
 ### 踩到的坑
 
 - **GPUI 的测试调度器会把「其他线程唤醒任务」判成不确定性测试**：调度器桥接线程最初在

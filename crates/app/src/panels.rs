@@ -323,6 +323,20 @@ impl SessionUiState {
 }
 
 impl SessionUiState {
+    /// 这个标签此刻能不能再发起一次会话控制操作。
+    ///
+    /// 两件事都会让「现在这个 Runtime」在下一刻不再成立：`control_operation` 是上一次
+    /// 控制请求还没回来，`scheduler_job` 是调度器正在起 / 停这个会话的进程。此刻发出的
+    /// 控制请求要么打在一个马上要被摘掉的 Runtime 上，要么与调度器的状态转移撞车——
+    /// 改工具预设撞上启动窗口更严重：描述改成了 ReadOnly，进程却已经按旧预设起来了。
+    ///
+    /// 各个按钮的 `disabled` 与各个 handler 的早退**共用这一个判据**，不再各写一份。
+    fn control_busy(&self) -> bool {
+        self.control_operation.is_some() || self.scheduler_job.is_some()
+    }
+}
+
+impl SessionUiState {
     /// 这个标签当前绑定的会话文件。
     ///
     /// 以 `controls.session_file` 为准（内核回报的权威值）；还没拿到 controls 时
@@ -857,7 +871,7 @@ impl ChatPanel {
         let Some(session) = self.sessions[index].session else {
             return;
         };
-        if self.sessions[index].scheduler_job.is_some() {
+        if self.sessions[index].control_busy() {
             return;
         }
         let tab_id = self.sessions[index].tab_id;
@@ -1482,7 +1496,7 @@ impl ChatPanel {
 
     /// 在当前标签上把一份历史变成活会话。
     fn start_live(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() || self.control_operation.is_some() {
+        if self.active.is_some() || self.control_busy() {
             return;
         }
         let index = self.focused;
@@ -2700,7 +2714,7 @@ impl ChatPanel {
     }
 
     fn set_tool_preset(&mut self, preset: ToolPreset, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() || preset == self.tool_preset {
+        if self.control_busy() || preset == self.tool_preset {
             return;
         }
         let Some(active) = self.active.take() else {
@@ -2760,7 +2774,7 @@ impl ChatPanel {
         request: ControlRequest,
         cx: &mut Context<Self>,
     ) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -3722,12 +3736,12 @@ impl Render for ChatPanel {
         let session_registered = self.session.is_some();
         let session_queued = self.scheduler_state == Some(pi_runtime::SchedulerState::Queued);
         let (start_label, start_tooltip) = start_action_copy(session_queued, session_registered);
-        // 后台还有调度作业没落地时，两个入口都不接受点击：重复点击会叠出第二次
-        // 进程操作，而第一次的结果还没回来。
-        let scheduler_busy = self.scheduler_job.is_some();
+        // 后台还有调度作业没落地、或上一次控制请求还没回来时，所有会碰进程的入口
+        // 一律不接受点击：重复点击会叠出第二次进程操作，而第一次的结果还没回来。
+        // 判据只有 [`SessionUiState::control_busy`] 这一个，按钮与 handler 共用。
+        let control_busy = self.control_busy();
         let can_park = live_started
-            && !scheduler_busy
-            && self.control_operation.is_none()
+            && !control_busy
             && self
                 .active
                 .as_ref()
@@ -3751,11 +3765,9 @@ impl Render for ChatPanel {
             // 错误反馈优先于较早的成功反馈，禁止绿红两条同时出现。
             self.rpc_success = None;
         }
-        let controls_enabled = session_controls_enabled(phase, self.control_operation.is_some());
-        let tools_enabled = !running
-            && !stopping
-            && self.control_operation.is_none()
-            && matches!(self.status, ChatStatus::Ready(_));
+        let controls_enabled = session_controls_enabled(phase, control_busy);
+        let tools_enabled =
+            !running && !stopping && !control_busy && matches!(self.status, ChatStatus::Ready(_));
         let current_model = self
             .controls
             .as_ref()
@@ -4051,9 +4063,7 @@ impl Render for ChatPanel {
                                         .ghost()
                                         .small()
                                         .label("取消重试")
-                                        .disabled(abort_retry_disabled(
-                                            self.control_operation.is_some(),
-                                        ))
+                                        .disabled(abort_retry_disabled(control_busy))
                                         .on_click(cx.listener(Self::abort_retry)),
                                 ),
                         )
@@ -4314,8 +4324,7 @@ impl Render for ChatPanel {
                                                 .tooltip(start_tooltip)
                                                 .disabled(
                                                     session_queued
-                                                        || scheduler_busy
-                                                        || self.control_operation.is_some()
+                                                        || control_busy
                                                         || !matches!(
                                                             self.status,
                                                             ChatStatus::Ready(_)
@@ -8290,5 +8299,55 @@ mod tests {
             "附件条必须与错误横幅共存"
         );
         assert_attachment_composer_rows_do_not_overlap(&mut visual, true);
+    }
+
+    /// 第十一轮独立审查 P1/P2：调度器正在起 / 停这个会话时，会碰进程的入口一律锁死。
+    ///
+    /// 启动窗口里标签上的 `active` 还是空的，Manager 侧 `Starting` 也还没装上 `entry`，
+    /// 于是「改工具预设」会一路走到只改会话描述那条分支——界面写成 ReadOnly，
+    /// 而正在起的那个进程早就拿着旧预设出发了。按钮的 `disabled` 与 handler 的早退
+    /// 共用 `control_busy` 这一个判据，两边不会再各走各的。
+    #[gpui::test]
+    fn runtime_controls_are_locked_while_a_scheduler_job_owns_the_session(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                register_parked_session(panel, 0, workspace.path());
+                let session = panel.session.expect("已登记会话");
+                let preset_in_manager = |panel: &ChatPanel| {
+                    panel
+                        .runtime_manager
+                        .session_descriptor(session)
+                        .map(|descriptor| descriptor.tool_preset)
+                };
+                assert!(panel.active.is_none());
+                assert_eq!(panel.tool_preset, ToolPreset::Inherit);
+
+                panel.scheduler_job = Some("启动中…");
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                assert_eq!(
+                    panel.tool_preset,
+                    ToolPreset::Inherit,
+                    "调度作业在飞时不得改 UI 上的预设"
+                );
+                assert_eq!(
+                    preset_in_manager(panel),
+                    Some(ToolPreset::Inherit),
+                    "更不得改会话描述：正在起的进程用的就是那一份"
+                );
+
+                // 同一个判据也挡住其它控制类操作，且不留下误导性的错误横幅。
+                panel.set_auto_compaction(true, cx);
+                assert!(panel.control_operation.is_none());
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+
+                // 作业落地后照常可改，并且必须同步到 Manager 的描述上。
+                panel.scheduler_job = None;
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
+                assert_eq!(preset_in_manager(panel), Some(ToolPreset::ReadOnly));
+            });
+        });
     }
 }

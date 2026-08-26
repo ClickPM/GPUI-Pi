@@ -1942,11 +1942,17 @@ impl RuntimeManager {
         })
     }
 
-    /// 改一个**当前没有 Runtime** 的会话的工具预设。
+    /// 改一个**当前不占着 pi 进程**的会话的工具预设。
     ///
-    /// 有 Runtime 时一律拒绝：进程已经按旧参数起来了，换预设必须重启进程
+    /// 占着进程时一律拒绝：进程已经按旧参数起来了，换预设必须重启进程
     /// （[`SessionHandle::restart_with_tools`]）。只改描述会让「描述」与「进程实际
     /// 拥有的权限」分家——R23 审查 P1-1 修的就是这条，这里不能再开一个后门。
+    ///
+    /// 判据是**状态**而不是 `entry`：[`RuntimeManager::admit`] 进入 `Starting` 时就把
+    /// 描述克隆给了正在启动的那个进程，而 `entry` 要到 `finish_start` 才装上。只看
+    /// `entry` 会让整个启动窗口都能改预设，结果进程按旧预设起来、UI 显示的却是新预设。
+    /// [`SchedulerState::holds_process`] 正是「这个状态占着（或正在占）一个进程」，
+    /// 与运行槽会计同源，将来加状态也不必回来补一遍判据。
     pub fn set_session_tool_preset(
         &self,
         session: SessionId,
@@ -1957,8 +1963,12 @@ impl RuntimeManager {
             .sessions
             .get_mut(&session)
             .ok_or_else(|| "会话不存在".to_owned())?;
-        if slot.entry.is_some() {
-            return Err("会话正在运行，改工具预设需要重启进程".to_owned());
+        if slot.state.holds_process() {
+            return Err(if slot.state == SchedulerState::Running {
+                "会话正在运行，改工具预设需要重启进程".to_owned()
+            } else {
+                format!("会话正处于 {} 状态，请稍候重试", slot.state.label())
+            });
         }
         slot.descriptor.tool_preset = tool_preset;
         Ok(())
@@ -6000,6 +6010,81 @@ mod tests {
             },
             test_document(label),
         )
+    }
+
+    /// 第十一轮审查 P1：占着进程的四态一律不许从描述这条路改工具预设。
+    ///
+    /// `Starting` / `Stopping` 里 `slot.entry` 还是空的，而 `admit` 早在进入 `Starting`
+    /// 时就把描述克隆给了正在启动的那个进程。只看 `entry` 会让整个启动窗口都能改预设，
+    /// 结果进程按旧预设起来、UI 显示的却是新预设——正是 R23 审查 P1-1 禁止的那种分家。
+    #[test]
+    fn tool_preset_edits_are_refused_in_every_state_that_holds_a_process() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let session = parked_session(&manager, "preset-race");
+        // 直接写状态而不走 `transition`：要钉的是「七态各自允不允许改预设」，
+        // 不是转移表恰好能走通哪几条路径。
+        let force_state = |state: SchedulerState| {
+            manager
+                .inner
+                .core
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(&session)
+                .expect("会话仍在")
+                .state = state;
+        };
+        let preset_of = || {
+            manager
+                .session_descriptor(session)
+                .map(|descriptor| descriptor.tool_preset)
+        };
+
+        for (state, preset) in [
+            (SchedulerState::Parked, ToolPreset::ReadOnly),
+            (SchedulerState::Queued, ToolPreset::None),
+            (SchedulerState::Failed, ToolPreset::Default),
+        ] {
+            force_state(state);
+            manager
+                .set_session_tool_preset(session, preset)
+                .unwrap_or_else(|error| {
+                    panic!("{} 还没有进程，应当允许改预设：{error}", state.label())
+                });
+            assert_eq!(
+                preset_of(),
+                Some(preset),
+                "{} 的改动必须落到描述上，下次启动才会按新预设起进程",
+                state.label()
+            );
+        }
+
+        let settled = preset_of();
+        for state in [
+            SchedulerState::Starting,
+            SchedulerState::Running,
+            SchedulerState::Stopping,
+            SchedulerState::IdleWarm,
+        ] {
+            force_state(state);
+            let refused = manager
+                .set_session_tool_preset(session, ToolPreset::Full)
+                .expect_err(state.label());
+            if state == SchedulerState::Running {
+                assert!(refused.contains("重启"), "{refused}");
+            } else {
+                assert!(refused.contains(state.label()), "{refused}");
+            }
+            assert_eq!(
+                preset_of(),
+                settled,
+                "{} 被拒绝的调用不得改动描述",
+                state.label()
+            );
+        }
     }
 
     #[test]
