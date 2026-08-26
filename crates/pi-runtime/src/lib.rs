@@ -25,7 +25,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
 };
@@ -905,6 +905,93 @@ struct WarmRuntime {
     lease: SlotLease,
 }
 
+/// 调度器状态发生了变化。
+///
+/// **电平触发，不是边沿触发**：通知本身不带「变成了什么」，收到的一方必须重新查询
+/// 自己关心的会话状态。这样被合并掉的帧不会让订阅者停在旧状态上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerChanged;
+
+/// 调度器修订号 + 订阅者名册。
+///
+/// 每个订阅者只有**一格**待处理通知（`sync_channel(1)` + `try_send` 丢满帧）：
+/// 通知是电平触发的，第 N 条与第 N+1 条对订阅者是同一件事——重新查一遍状态。
+/// 给 UI 用的通道必须有界，否则界面一卡就长出一条无界队列，正是 R22 要消灭的东西。
+///
+/// **锁序**：`SchedulerCore` → `SchedulerWatch::watchers`，永不反向。
+/// 发布发生在持 core 锁期间，所以这里只允许做不会阻塞的动作。
+#[derive(Default)]
+struct SchedulerWatch {
+    revision: AtomicU64,
+    next_watcher_id: AtomicU64,
+    watchers: Mutex<Vec<(u64, SyncSender<SchedulerChanged>)>>,
+}
+
+impl SchedulerWatch {
+    fn subscribe(self: &Arc<Self>) -> SchedulerSubscription {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let id = self.next_watcher_id.fetch_add(1, Ordering::Relaxed);
+        self.watchers.lock().unwrap().push((id, tx));
+        SchedulerSubscription {
+            id,
+            watch: Arc::downgrade(self),
+            receiver: Some(rx),
+        }
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        self.watchers
+            .lock()
+            .unwrap()
+            .retain(|(watcher, _)| *watcher != id);
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// 记一次变化并唤醒订阅者。
+    fn publish(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        let mut watchers = self.watchers.lock().unwrap();
+        // `Full` 说明上一条还没被取走 —— 电平触发下这条与上一条对订阅者是同一件事，
+        // 丢掉即可；只有 `Disconnected` 才把订阅者摘掉。
+        watchers.retain(|(_, tx)| {
+            !matches!(
+                tx.try_send(SchedulerChanged),
+                Err(TrySendError::Disconnected(_))
+            )
+        });
+    }
+}
+
+/// 一份调度器订阅。
+///
+/// **丢掉它就是退订**：名册里的发送端随之被摘掉，通道断开，正阻塞在 `recv` 上的
+/// 桥接线程立刻返回并退出。UI 侧必须把接收端交给一条阻塞线程，如果只靠
+/// 「通道另一端没人了」来收尾，那条线程会一直卡在 `recv` 上直到整个 Manager 析构 ——
+/// 关一次窗口漏一条线程。
+pub struct SchedulerSubscription {
+    id: u64,
+    watch: std::sync::Weak<SchedulerWatch>,
+    receiver: Option<Receiver<SchedulerChanged>>,
+}
+
+impl SchedulerSubscription {
+    /// 取走接收端交给桥接线程。只有第一次调用返回 `Some`。
+    pub fn take_receiver(&mut self) -> Option<Receiver<SchedulerChanged>> {
+        self.receiver.take()
+    }
+}
+
+impl Drop for SchedulerSubscription {
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.upgrade() {
+            watch.unsubscribe(self.id);
+        }
+    }
+}
+
 /// 一个已登记的用户会话。
 ///
 /// `Parked` 时 `entry` / `lease` 均为 `None`：零进程零线程，只留描述与轻量摘要。
@@ -917,6 +1004,12 @@ struct SessionSlot {
     entry: Option<Arc<RuntimeEntry>>,
     lease: Option<SlotLease>,
     failure: Option<String>,
+    /// 与 Manager 共享的通知句柄。
+    ///
+    /// 挂在 Slot 上而不是让各调用点自己发布：状态转移散落在十几处（队列提升、崩溃回收、
+    /// Park、Stop、TTL 回收……），漏掉任何一处 UI 就会停在一个再也不会更新的状态上。
+    /// 让唯一的转移入口自己负责通知，漏发就成了不可能。
+    watch: Arc<SchedulerWatch>,
 }
 
 impl SessionSlot {
@@ -932,6 +1025,7 @@ impl SessionSlot {
             });
         }
         self.state = next;
+        self.watch.publish();
         Ok(())
     }
 }
@@ -971,6 +1065,8 @@ struct Reaper {
 
 struct ManagerInner {
     next_runtime_id: AtomicU64,
+    /// 调度器修订号与订阅者名册。
+    watch: Arc<SchedulerWatch>,
     /// R21 兼容通道：`start_fresh` / `start_session` / `stop_user` 维护的唯一活跃会话。
     active_user: Mutex<Option<SessionId>>,
     maintenance: MaintenanceGate,
@@ -1706,6 +1802,7 @@ impl RuntimeManager {
         let manager = Self {
             inner: Arc::new(ManagerInner {
                 next_runtime_id: AtomicU64::new(0),
+                watch: Arc::new(SchedulerWatch::default()),
                 active_user: Mutex::new(None),
                 maintenance: MaintenanceGate::new(limits.maintenance_slots),
                 tuning: RuntimeTuning::from_limits(&limits),
@@ -1790,9 +1887,25 @@ impl RuntimeManager {
                 entry: None,
                 lease: None,
                 failure: None,
+                watch: Arc::clone(&self.inner.watch),
             },
         );
+        // 登记本身就是一次可见变化：UI 的标签在这一刻起就该显示 `Parked`。
+        self.inner.watch.publish();
         id
+    }
+
+    /// 订阅调度器状态变化。
+    ///
+    /// 通道容量 1 且满帧即丢：通知是**电平触发**的，收到后请重新查询
+    /// [`RuntimeManager::session_state`] 等，不要把通知当成事件流累积。
+    pub fn subscribe_scheduler(&self) -> SchedulerSubscription {
+        self.inner.watch.subscribe()
+    }
+
+    /// 调度器修订号；每次会话状态变化 +1。测试用它判断「确实发生过变化」。
+    pub fn scheduler_revision(&self) -> u64 {
+        self.inner.watch.revision()
     }
 
     pub fn session_state(&self, session: SessionId) -> Option<SchedulerState> {
@@ -1827,6 +1940,38 @@ impl RuntimeManager {
             Some(entry) => entry.descriptor.lock().unwrap().clone(),
             None => slot.descriptor.clone(),
         })
+    }
+
+    /// 改一个**当前不占着 pi 进程**的会话的工具预设。
+    ///
+    /// 占着进程时一律拒绝：进程已经按旧参数起来了，换预设必须重启进程
+    /// （[`SessionHandle::restart_with_tools`]）。只改描述会让「描述」与「进程实际
+    /// 拥有的权限」分家——R23 审查 P1-1 修的就是这条，这里不能再开一个后门。
+    ///
+    /// 判据是**状态**而不是 `entry`：[`RuntimeManager::admit`] 进入 `Starting` 时就把
+    /// 描述克隆给了正在启动的那个进程，而 `entry` 要到 `finish_start` 才装上。只看
+    /// `entry` 会让整个启动窗口都能改预设，结果进程按旧预设起来、UI 显示的却是新预设。
+    /// [`SchedulerState::holds_process`] 正是「这个状态占着（或正在占）一个进程」，
+    /// 与运行槽会计同源，将来加状态也不必回来补一遍判据。
+    pub fn set_session_tool_preset(
+        &self,
+        session: SessionId,
+        tool_preset: ToolPreset,
+    ) -> Result<(), String> {
+        let mut core = self.inner.core.lock().unwrap();
+        let slot = core
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "会话不存在".to_owned())?;
+        if slot.state.holds_process() {
+            return Err(if slot.state == SchedulerState::Running {
+                "会话正在运行，改工具预设需要重启进程".to_owned()
+            } else {
+                format!("会话正处于 {} 状态，请稍候重试", slot.state.label())
+            });
+        }
+        slot.descriptor.tool_preset = tool_preset;
+        Ok(())
     }
 
     pub fn scheduler_report(&self) -> SchedulerReport {
@@ -1875,6 +2020,28 @@ impl RuntimeManager {
     ) -> Result<Option<SessionHandle>, String> {
         self.tick();
         self.admit_and_start(session, priority)
+    }
+
+    /// 只更新一个会话的调度优先级，**不做任何状态转移、也不起进程**。
+    ///
+    /// 为什么单独有这一步：[`RuntimeManager::request_run`] 的第一件事是 `tick()`，
+    /// 而 `tick()` 里的 `promote_queued` 是按**队列里现有的**优先级挑人的。
+    /// 「切到一个 Queued 标签」如果直接调 `request_run`，这次 tick 会先用旧优先级
+    /// 把刚空出来的槽让给别的后台会话，自己才在随后的 `admit` 里被抬成 FOREGROUND ——
+    /// 抬了个寂寞。调用方要先落优先级、再申请。
+    ///
+    /// 队列侧沿用 [`WaitQueue::push`] 的既有规则：对已排队条目取 `min`（只升不降），
+    /// 且不刷新 `enqueued_at`，因此反复调用不会把 aging 玩坏。
+    pub fn reprioritize(&self, session: SessionId, priority: Priority) {
+        let now = self.inner.clock.now();
+        let mut core = self.inner.core.lock().unwrap();
+        let Some(slot) = core.sessions.get_mut(&session) else {
+            return;
+        };
+        slot.priority = priority;
+        if core.queue.contains(session) {
+            let _ = core.queue.push(session, priority, now);
+        }
     }
 
     fn admit_and_start(
@@ -2427,7 +2594,10 @@ impl RuntimeManager {
         }
         let mut core = self.inner.core.lock().unwrap();
         core.queue.remove(session);
-        core.sessions.remove(&session);
+        // 注销不经过 `transition`，得自己发通知，否则 UI 永远看不到「这个会话没了」。
+        if core.sessions.remove(&session).is_some() {
+            self.inner.watch.publish();
+        }
     }
 
     /// 推进调度器：回收崩溃的 Runtime、按 Idle TTL 回收热进程、提升排队会话。
@@ -5535,6 +5705,7 @@ mod tests {
             entry: None,
             lease: None,
             failure: None,
+            watch: Arc::new(SchedulerWatch::default()),
         }
     }
 
@@ -5848,5 +6019,233 @@ mod tests {
         );
         assert_eq!(manager.scheduler_report().resident_pi, 0);
         // 「登记不创建线程」由 `tests/reaper_thread_budget.rs` 在独立进程里断言。
+    }
+
+    fn parked_session(manager: &RuntimeManager, label: &str) -> SessionId {
+        manager.create_session(
+            SessionDescriptor {
+                binary: fake_binary(),
+                cwd: std::env::temp_dir(),
+                session_path: None,
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: None,
+            },
+            test_document(label),
+        )
+    }
+
+    /// 第十一轮审查 P1：占着进程的四态一律不许从描述这条路改工具预设。
+    ///
+    /// `Starting` / `Stopping` 里 `slot.entry` 还是空的，而 `admit` 早在进入 `Starting`
+    /// 时就把描述克隆给了正在启动的那个进程。只看 `entry` 会让整个启动窗口都能改预设，
+    /// 结果进程按旧预设起来、UI 显示的却是新预设——正是 R23 审查 P1-1 禁止的那种分家。
+    #[test]
+    fn tool_preset_edits_are_refused_in_every_state_that_holds_a_process() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let session = parked_session(&manager, "preset-race");
+        // 直接写状态而不走 `transition`：要钉的是「七态各自允不允许改预设」，
+        // 不是转移表恰好能走通哪几条路径。
+        let force_state = |state: SchedulerState| {
+            manager
+                .inner
+                .core
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(&session)
+                .expect("会话仍在")
+                .state = state;
+        };
+        let preset_of = || {
+            manager
+                .session_descriptor(session)
+                .map(|descriptor| descriptor.tool_preset)
+        };
+
+        for (state, preset) in [
+            (SchedulerState::Parked, ToolPreset::ReadOnly),
+            (SchedulerState::Queued, ToolPreset::None),
+            (SchedulerState::Failed, ToolPreset::Default),
+        ] {
+            force_state(state);
+            manager
+                .set_session_tool_preset(session, preset)
+                .unwrap_or_else(|error| {
+                    panic!("{} 还没有进程，应当允许改预设：{error}", state.label())
+                });
+            assert_eq!(
+                preset_of(),
+                Some(preset),
+                "{} 的改动必须落到描述上，下次启动才会按新预设起进程",
+                state.label()
+            );
+        }
+
+        let settled = preset_of();
+        for state in [
+            SchedulerState::Starting,
+            SchedulerState::Running,
+            SchedulerState::Stopping,
+            SchedulerState::IdleWarm,
+        ] {
+            force_state(state);
+            let refused = manager
+                .set_session_tool_preset(session, ToolPreset::Full)
+                .expect_err(state.label());
+            if state == SchedulerState::Running {
+                assert!(refused.contains("重启"), "{refused}");
+            } else {
+                assert!(refused.contains(state.label()), "{refused}");
+            }
+            assert_eq!(
+                preset_of(),
+                settled,
+                "{} 被拒绝的调用不得改动描述",
+                state.label()
+            );
+        }
+    }
+
+    /// 第十二轮审查 P2：优先级必须在**提升 tick 之前**落到队列上。
+    ///
+    /// `request_run` 的第一件事是 `tick()`，而 `promote_queued` 按队列里现有的优先级挑人。
+    /// 「切到一个排队标签」如果只靠 `admit` 里那句 `slot.priority = priority`，
+    /// 这次调用会先用旧优先级把刚空出来的槽让给别的后台会话，自己才被抬成前台。
+    #[test]
+    fn reprioritize_raises_a_queued_entry_before_the_next_promotion_tick() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let early = parked_session(&manager, "early");
+        let late = parked_session(&manager, "late");
+        let now = manager.inner.clock.now();
+        {
+            let mut core = manager.inner.core.lock().unwrap();
+            for session in [early, late] {
+                core.queue
+                    .push(session, Priority::BACKGROUND, now)
+                    .expect("入队");
+                core.sessions.get_mut(&session).expect("会话仍在").state = SchedulerState::Queued;
+            }
+        }
+        let peek = || manager.inner.core.lock().unwrap().queue.peek_next(now);
+        assert_eq!(peek(), Some(early), "同优先级下先入队的先被挑中");
+
+        manager.reprioritize(late, Priority::FOREGROUND);
+        assert_eq!(peek(), Some(late), "抬到前台后，下一次提升就该轮到它");
+        assert_eq!(
+            manager
+                .inner
+                .core
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&late)
+                .map(|slot| slot.priority),
+            Some(Priority::FOREGROUND),
+            "会话侧也要记下调用方的意图"
+        );
+
+        // 沿用 `WaitQueue::push` 的「只升不降」：反复调用不得把它降回去。
+        manager.reprioritize(late, Priority::BACKGROUND);
+        assert_eq!(peek(), Some(late));
+
+        // 不在队列里的会话只更新 slot.priority，不得被顺手塞进队列。
+        let idle = parked_session(&manager, "idle");
+        manager.reprioritize(idle, Priority::FOREGROUND);
+        assert!(
+            !manager.inner.core.lock().unwrap().queue.contains(idle),
+            "reprioritize 不是入队入口"
+        );
+    }
+
+    #[test]
+    fn scheduler_notices_are_level_triggered_and_coalesce_to_one_pending_slot() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let mut subscription = manager.subscribe_scheduler();
+        let notices = subscription.take_receiver().expect("first take");
+        assert!(
+            subscription.take_receiver().is_none(),
+            "接收端只能被取走一次"
+        );
+        let before = manager.scheduler_revision();
+
+        let first = parked_session(&manager, "watch-a");
+        let second = parked_session(&manager, "watch-b");
+        manager.remove_session(first);
+
+        // 三次变化，修订号一定涨了三次；但订阅者手里最多只有一格待处理通知。
+        assert_eq!(manager.scheduler_revision(), before + 3);
+        assert_eq!(notices.try_recv(), Ok(SchedulerChanged));
+        assert_eq!(
+            notices.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "电平触发：合并后只留一格，不得堆成事件流"
+        );
+        // 通知只说「变了」，状态得自己查——这正是电平触发要求调用方做的事。
+        assert_eq!(manager.session_state(first), None);
+        assert_eq!(manager.session_state(second), Some(SchedulerState::Parked));
+
+        // 取走之后的下一次变化必须再次唤醒，不能因为丢过帧就永远静默。
+        manager.remove_session(second);
+        assert_eq!(notices.try_recv(), Ok(SchedulerChanged));
+    }
+
+    #[test]
+    fn dropping_a_subscription_unregisters_it_and_disconnects_the_bridge() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        let mut live = manager.subscribe_scheduler();
+        let live_rx = live.take_receiver().expect("receiver");
+        let mut short_lived = manager.subscribe_scheduler();
+        // 模拟 UI 的用法：接收端交给一条阻塞线程，订阅本体留在面板上。
+        let short_rx = short_lived.take_receiver().expect("receiver");
+        assert_eq!(manager.inner.watch.watchers.lock().unwrap().len(), 2);
+
+        // 退订必须**当场**摘掉名册项并断开通道，不能等到下一次发布 ——
+        // 桥接线程正阻塞在 `recv` 上，等下一次发布可能永远等不到。
+        drop(short_lived);
+        assert_eq!(manager.inner.watch.watchers.lock().unwrap().len(), 1);
+        assert_eq!(
+            short_rx.recv(),
+            Err(std::sync::mpsc::RecvError),
+            "退订后阻塞中的接收端必须立刻返回"
+        );
+
+        let session = parked_session(&manager, "watch-drop");
+        assert_eq!(live_rx.try_recv(), Ok(SchedulerChanged));
+        drop(live);
+        assert!(
+            manager.inner.watch.watchers.lock().unwrap().is_empty(),
+            "最后一个订阅退订后名册应为空"
+        );
+        manager.remove_session(session);
+    }
+
+    #[test]
+    fn a_stalled_subscriber_never_blocks_the_publisher() {
+        let manager = RuntimeManager::with_test_clock(
+            RuntimeLimits::default(),
+            Arc::new(FakeClock::new()) as Arc<dyn Clock>,
+        );
+        // 订阅了却一次也不取：发布方持着调度锁，任何阻塞都会把整个调度器卡死。
+        let mut stalled = manager.subscribe_scheduler();
+        let _stalled_rx = stalled.take_receiver().expect("receiver");
+        let sessions = (0..64)
+            .map(|index| parked_session(&manager, &format!("stalled-{index}")))
+            .collect::<Vec<_>>();
+        for session in sessions {
+            manager.remove_session(session);
+        }
+        assert_eq!(manager.scheduler_report().parked, 0);
     }
 }

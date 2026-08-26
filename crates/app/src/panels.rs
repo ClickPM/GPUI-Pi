@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -41,29 +45,59 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionsChanged;
 
+/// 前台会话标签变了。
+///
+/// 多会话之后标签条成了第二个「切会话」入口，而文件浏览器、工作区根目录这些面板
+/// 只认侧栏与新建会话事件。不广播这条，切到另一个项目的标签就会出现
+/// 「B 的对话配着 A 的文件树」，工作区操作还打在 A 上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedSessionChanged {
+    /// 该标签的工作目录；纯历史预览尚未确定目录时为 `None`。
+    pub cwd: Option<PathBuf>,
+    /// 该标签的显示标题，供工作区工具栏使用。
+    pub title: String,
+    /// pi 会话身份，供 tooltip 使用；fresh 会话落盘前没有。
+    pub session_key: Option<String>,
+}
+
+/// 同时打开的会话标签上限。
+///
+/// 常驻 pi 进程数由调度器兜底（`total_runtime_slots`），但**标签**另有代价：每个标签
+/// 常驻一份 `ConversationDocument`、一个 `ListState` 和一整套会话态，全部与进程无关。
+/// 所以标签数必须自己有上限；到顶时明确拒绝，不静默淘汰用户还在用的标签。
+const MAX_SESSION_TABS: usize = 8;
+
 pub struct ChatPanel {
     focus_handle: FocusHandle,
     runtime_manager: RuntimeManager,
-    active_generation: u64,
-    active: Option<SessionHandle>,
-    active_epoch: u64,
-    applied_revision: u64,
-    effect_cursor: u64,
-    /// 上一次已上报的运行时背压计数，用于只在新增时提示。
-    backpressure: pi_runtime::BackpressureStats,
-    session: SessionUiState,
+    /// 会话标签，顺序即标签条顺序。**永远至少有一个** —— 关掉最后一个标签是把它重置
+    /// 成空标签，而不是删除，这样 `Deref` 永远有落点。
+    sessions: Vec<SessionUiState>,
+    /// 用户当前看到的标签下标。渲染只认它。
+    focused: usize,
+    /// 投影游标：`Deref` / `DerefMut` 的落点。
+    ///
+    /// 稳态下恒等于 `focused`；只有后台 pump 会用 [`ChatPanel::project`] 把它临时指到
+    /// 自己那一槽，好让整套 `self.xxx` 投影逻辑原样服务于后台会话，而不必把
+    /// 「写进哪一槽」当参数逐层传下去。
+    cursor: usize,
+    /// 标签身份的单调发号器；永不复用，避免关掉再开的标签复用同一个 GPUI 元素 id。
+    next_tab_id: u64,
     composer: gpui::Entity<TextareaState>,
     drafts: pi_data::DraftStore,
-    model_names: Arc<std::collections::HashMap<String, String>>,
-    popup: Option<ComposerPopup>,
-    popup_index: usize,
-    file_index: Option<pi_data::FileIndex>,
     workspace_bounds: Option<Bounds<Pixels>>,
     message_pane_bounds: Option<Bounds<Pixels>>,
-    extension_widgets_above_scroll: ScrollHandle,
-    extension_widgets_below_scroll: ScrollHandle,
     extension_dialog_body_focus: Option<FocusHandle>,
     extension_dialog_footer_focus: Option<FocusHandle>,
+    /// 已经从标签条上摘掉、但进程还没回收完的会话文件（按 `tab_id` 记账）。
+    ///
+    /// `close_tab` 立刻摘标签，`remove_session` 放后台（它要等优雅停机）。这段时间里
+    /// 那份 JSONL 仍被一个活着的 pi 进程写着；不挂个墓碑，用户马上重新打开同一段历史
+    /// 再点「启动活会话」就会起第二个进程写同一份文件。后台作业落地即摘除。
+    closing_session_files: Vec<(u64, PathBuf)>,
+    /// 调度器订阅本体。存在这里就是为了让它随面板一起析构 —— 析构即退订，
+    /// 桥接线程随之退出。
+    scheduler_subscription: Option<pi_runtime::SchedulerSubscription>,
     _composer_subscription: Subscription,
     probe: Option<LayoutProbe>,
 }
@@ -133,8 +167,40 @@ pub enum ChatStatus {
 }
 
 pub struct SessionUiState {
+    /// app 内的标签身份，单调分配、永不复用。
+    tab_id: u64,
+    /// Manager 分配的会话身份。
+    ///
+    /// **跨 Park/Resume 恒定**，因此会话态按它隔离而不是按 `RuntimeId`（BACKLOG #18）：
+    /// `RuntimeId` 每次 Resume 都会换新，照它隔离等于每次唤醒都丢掉草稿和滚动位置。
+    /// 纯历史预览标签还没登记成会话，为 `None`。
+    session: Option<pi_runtime::SessionId>,
+    /// 标签标题。
+    tab_title: String,
+    /// 调度器里的状态；由 [`ChatPanel::reconcile_scheduler`] 拉取，app 不自行推断。
+    scheduler_state: Option<pi_runtime::SchedulerState>,
+    /// 最近一次调度失败的原因（`Failed` 态才有值）。
+    scheduler_failure: Option<String>,
+    /// 正在后台执行的调度器操作的文案（启动 / 恢复 / 挂起）。
+    ///
+    /// 这些操作会碰进程，必须放后台；期间标签得有个如实的说明，也得挡住重复点击。
+    scheduler_job: Option<&'static str>,
+    /// 当前绑定的 Runtime。
+    active: Option<SessionHandle>,
+    active_generation: u64,
+    active_epoch: u64,
+    applied_revision: u64,
+    effect_cursor: u64,
+    /// 上一次已上报的运行时背压计数，用于只在新增时提示。
+    backpressure: pi_runtime::BackpressureStats,
+    model_names: Arc<std::collections::HashMap<String, String>>,
+    popup: Option<ComposerPopup>,
+    popup_index: usize,
+    file_index: Option<pi_data::FileIndex>,
+    extension_widgets_above_scroll: ScrollHandle,
+    extension_widgets_below_scroll: ScrollHandle,
     status: ChatStatus,
-    load_generation: u64,
+    load_generation: LoadGeneration,
     composer_mode: ComposerMode,
     draft_key: Option<String>,
     attachments: Vec<ComposerAttachment>,
@@ -142,6 +208,12 @@ pub struct SessionUiState {
     controls: Option<SessionControls>,
     tool_preset: ToolPreset,
     control_operation: Option<ControlOperation>,
+    /// 正在切过去的会话文件。
+    ///
+    /// 只在 `control_operation == Some(SwitchSession)` 期间有意义，因此**不需要单独清理**：
+    /// `control_operation` 的三条清空路径（`ControlFinished` / `ToolRestartFinished` /
+    /// `Stopped`）自动让这条主张失效，不会多出一份要跟着同步的生命周期。
+    pending_switch_target: Option<PathBuf>,
     branch_tree: Option<pi_data::SessionBranchTree>,
     branch_preview_leaf: Option<String>,
     branch_preview_document: Option<Arc<ConversationDocument>>,
@@ -187,10 +259,28 @@ pub struct SessionUiState {
 }
 
 impl SessionUiState {
-    fn new(list_state: ListState) -> Self {
+    fn new(tab_id: u64, list_state: ListState) -> Self {
         Self {
+            tab_id,
+            session: None,
+            tab_title: "新标签".to_owned(),
+            scheduler_state: None,
+            scheduler_failure: None,
+            scheduler_job: None,
+            active: None,
+            active_generation: 0,
+            active_epoch: 0,
+            applied_revision: 0,
+            effect_cursor: 0,
+            backpressure: pi_runtime::BackpressureStats::default(),
+            model_names: Arc::new(std::collections::HashMap::new()),
+            popup: None,
+            popup_index: 0,
+            file_index: None,
+            extension_widgets_above_scroll: ScrollHandle::default(),
+            extension_widgets_below_scroll: ScrollHandle::default(),
             status: ChatStatus::Empty,
-            load_generation: 0,
+            load_generation: LoadGeneration(0),
             composer_mode: ComposerMode::Steer,
             draft_key: None,
             attachments: Vec::new(),
@@ -198,6 +288,7 @@ impl SessionUiState {
             controls: None,
             tool_preset: ToolPreset::Inherit,
             control_operation: None,
+            pending_switch_target: None,
             branch_tree: None,
             branch_preview_leaf: None,
             branch_preview_document: None,
@@ -230,17 +321,97 @@ impl SessionUiState {
     }
 }
 
+impl SessionUiState {
+    /// 这个标签的草稿存放键。
+    ///
+    /// `draft_key` 记的是 **pi 会话身份**（标签去重、`ControlsLoaded` 的键迁移都认它），
+    /// 还没登记会话的标签没有它；但草稿必须从标签一诞生就有地方存，否则
+    /// 「在空标签上写了字 → 去开别的标签 → 切回来」这条路上字就没了。
+    /// 没有会话身份时退回标签自己的身份。
+    fn draft_slot_key(&self) -> String {
+        self.draft_key
+            .clone()
+            .unwrap_or_else(|| format!("tab-{}", self.tab_id))
+    }
+}
+
+impl SessionUiState {
+    /// 这个标签此刻能不能再发起一次会话控制操作。
+    ///
+    /// 两件事都会让「现在这个 Runtime」在下一刻不再成立：`control_operation` 是上一次
+    /// 控制请求还没回来，`scheduler_job` 是调度器正在起 / 停这个会话的进程。此刻发出的
+    /// 控制请求要么打在一个马上要被摘掉的 Runtime 上，要么与调度器的状态转移撞车——
+    /// 改工具预设撞上启动窗口更严重：描述改成了 ReadOnly，进程却已经按旧预设起来了。
+    ///
+    /// **凡是会把请求发给 `active` 的入口都必须问它**——按钮的 `disabled`、composer 的
+    /// Enter、Ctrl+P 循环模型、原生选择器那两条（切换会话 / 导出）无一例外。
+    /// 各写一份判据就是第七轮那条「永远漏一个」：第十一轮补了按钮，第十四轮才发现
+    /// Enter 和 Ctrl+P 还绕着走。
+    fn control_busy(&self) -> bool {
+        self.control_operation.is_some() || self.scheduler_job.is_some()
+    }
+}
+
+impl SessionUiState {
+    /// 这个标签当前绑定的会话文件。
+    ///
+    /// 以 `controls.session_file` 为准（内核回报的权威值）；还没拿到 controls 时
+    /// 退回历史文档的来源路径。
+    fn bound_session_file(&self) -> Option<PathBuf> {
+        self.controls
+            .as_ref()
+            .and_then(|controls| controls.session_file.clone())
+            .or_else(|| match &self.status {
+                ChatStatus::Ready(document) => Some(document.source_path.clone()),
+                _ => None,
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+    }
+
+    /// 这个标签此刻主张拥有的会话文件——可能不止一份。
+    ///
+    /// 已经绑上的那份要算：进程正写着它。正在切过去的那份也要算——切换落地前
+    /// `bound_session_file` 报的还是**旧**文件，只看它，第二个标签就能同时切到同一份
+    /// JSONL 上；而切换万一失败，进程还留在旧文件上，所以切换期间两份都不能被别人抢。
+    ///
+    /// 注意这里**不问「有没有登记成会话」**：一个只读历史标签同样占着那份 JSONL。
+    /// 让别人切进去，两个标签就共用同一个 `draft_key`（草稿互相覆盖），
+    /// 随后把历史标签启起来就是两个 pi 进程写同一份文件。
+    fn claimed_session_files(&self) -> Vec<PathBuf> {
+        let mut claims = Vec::new();
+        if let Some(bound) = self.bound_session_file() {
+            claims.push(bound);
+        }
+        if self.control_operation == Some(ControlOperation::SwitchSession)
+            && let Some(target) = self.pending_switch_target.clone()
+            && !claims.iter().any(|claim| same_session_file(claim, &target))
+        {
+            claims.push(target);
+        }
+        claims
+    }
+}
+
+impl ChatPanel {
+    /// 投影游标的落点。`min` 只是防御性收敛：下标漂移宁可落到最后一个标签，
+    /// 也不要在渲染路径上 panic。
+    fn cursor_index(&self) -> usize {
+        self.cursor.min(self.sessions.len().saturating_sub(1))
+    }
+}
+
 impl std::ops::Deref for ChatPanel {
     type Target = SessionUiState;
 
     fn deref(&self) -> &Self::Target {
-        &self.session
+        &self.sessions[self.cursor_index()]
     }
 }
 
 impl std::ops::DerefMut for ChatPanel {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.session
+        let index = self.cursor_index();
+        &mut self.sessions[index]
     }
 }
 
@@ -318,6 +489,134 @@ impl LayoutProbe {
 
 const COMPOSER_MAX_ROWS: usize = 8;
 
+/// 标签标题的最大显示长度。标签条要放得下多个会话，标题必须先收敛再进 `Tab`；
+/// 完整标题在 tooltip 里（S-8）。
+const TAB_LABEL_LIMIT: usize = 18;
+/// 失败原因在横幅里的最大显示长度。
+///
+/// pi 回传的错误长度不受控，横幅又是单行；不先收敛就会把消息区一直往上挤。
+const FAILURE_TEXT_LIMIT: usize = 120;
+
+/// 前台标签的调度状态提示。
+struct SessionStateNote {
+    dot: gpui::Hsla,
+    text: String,
+}
+
+/// 把调度状态映射成标签条认得的形态。
+///
+/// 没有登记会话的标签是 `History`，不是 `Parked` —— 前者「还没启动过」，
+/// 后者「启动过又让出了进程」，对用户是两件事。
+fn tab_state_of(slot: &SessionUiState) -> gpui_pi_ui::SessionTabState {
+    match slot.scheduler_state {
+        Some(pi_runtime::SchedulerState::Running) => gpui_pi_ui::SessionTabState::Running,
+        Some(pi_runtime::SchedulerState::Queued) => gpui_pi_ui::SessionTabState::Queued,
+        Some(pi_runtime::SchedulerState::Starting) => gpui_pi_ui::SessionTabState::Starting,
+        Some(pi_runtime::SchedulerState::Stopping) => gpui_pi_ui::SessionTabState::Stopping,
+        Some(pi_runtime::SchedulerState::Failed) => gpui_pi_ui::SessionTabState::Failed,
+        Some(pi_runtime::SchedulerState::Parked) => gpui_pi_ui::SessionTabState::Parked,
+        // `IdleWarm` 描述的是池内热进程，不描述 Session；真出现在这里说明状态读错了，
+        // 按「没有进程」呈现，不编造一个运行中。
+        Some(pi_runtime::SchedulerState::IdleWarm) | None => {
+            if slot.session.is_some() {
+                gpui_pi_ui::SessionTabState::Parked
+            } else {
+                gpui_pi_ui::SessionTabState::History
+            }
+        }
+    }
+}
+
+/// 「按标签重载」类后台任务的代次：历史渲染与文件索引。
+///
+/// 单独一个类型，是因为 `SessionUiState` 上还有一个 `active_generation`（Runtime 代次），
+/// 两者都是 `u64`，混用编译得过、行为却是回填永远对不上——R24 第二轮独立审查抓到的
+/// 正是这个：fresh 会话把 `active_generation` 传给了按 `load_generation` 校验的索引回填，
+/// 于是新标签上永远是 1 对 0，`@` 补全在 fresh 会话里从来没工作过。
+/// 让它们类型不同，这一类错误就编译不过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadGeneration(u64);
+
+impl LoadGeneration {
+    fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
+/// 主操作入口的文案。
+///
+/// 三态各说各的：没登记过是「启动」，登记过没进程是「恢复」，已经在排队则**什么都不用做**
+/// ——轮到它会自动启动，给一个可点的「恢复运行」只会让用户以为按钮没生效。
+const fn start_action_copy(queued: bool, registered: bool) -> (&'static str, &'static str) {
+    match (queued, registered) {
+        (true, _) => ("排队中…", "已在公平队列里等运行槽，轮到它会自动启动"),
+        (false, true) => ("恢复运行", "重新为该会话申请一个 pi 运行槽"),
+        (false, false) => ("启动活会话", "为这份历史启动官方 pi RPC 活会话"),
+    }
+}
+
+/// 两个路径是不是同一份会话文件。
+///
+/// Windows 上大小写不敏感，还可能差一个 `\\?\` 前缀，直接比 `PathBuf` 会漏判——
+/// 漏判的后果是两个 pi 进程绑上同一份 JSONL。能规范化就以规范化结果为准；
+/// 文件已经不在了就退回原样比较。
+fn same_session_file(left: &Path, right: &Path) -> bool {
+    let normalize =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize(left) == normalize(right)
+}
+
+/// fresh 会话的标签标题。
+fn fresh_session_title(cwd: &Path) -> String {
+    match cwd.file_name().and_then(std::ffi::OsStr::to_str) {
+        Some(name) if !name.is_empty() => format!("新会话 · {name}"),
+        _ => "新会话".to_owned(),
+    }
+}
+
+/// 按**字符**截断并加省略号。
+///
+/// 不能按字节切：中文标题一刀下去就是非法 UTF-8，直接 panic。
+fn truncate_label(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// 造一条新的消息列表状态，并把「是否跟随尾部」的回写钉在**这个标签**上。
+///
+/// 回写必须按 `tab_id` 找槽，不能走 `Deref`：滚动回调是 `cx.defer` 之后才执行的，
+/// 那一刻投影游标可能正指着别的标签，走 `Deref` 会把 A 的滚动状态写进 B。
+fn new_list_state(tab_id: u64, panel: gpui::WeakEntity<ChatPanel>) -> ListState {
+    // 首次静态会话允许一次全量测量，确保长列表首次出现时 scrollbar 即为精确高度。
+    let list_state = ListState::new(0, ListAlignment::Top, px(1200.)).measure_all();
+    let scroll_state = list_state.clone();
+    list_state.set_scroll_handler(move |event, _, cx| {
+        let attached = event.is_following_tail;
+        let scroll_state = scroll_state.clone();
+        let panel = panel.clone();
+        // ListState 在回调时持有可变借用；延后读取/更新，避免 RefCell 重入。
+        cx.defer(move |cx| {
+            let attached = attached || scroll_state.is_scrolled_to_end().unwrap_or(true);
+            let _ = panel.update(cx, |panel, cx| {
+                let Some(slot) = panel.sessions.iter_mut().find(|slot| slot.tab_id == tab_id)
+                else {
+                    return;
+                };
+                if slot.tail_attached != attached {
+                    slot.tail_attached = attached;
+                    cx.notify();
+                }
+            });
+        });
+    });
+    list_state
+}
+
 impl ChatPanel {
     pub fn new(
         runtime_manager: RuntimeManager,
@@ -344,50 +643,513 @@ impl ChatPanel {
                     _ => {}
                 },
             );
-        // 首次静态会话允许一次全量测量，确保长列表首次出现时 scrollbar 即为精确高度。
-        let list_state = ListState::new(0, ListAlignment::Top, px(1200.)).measure_all();
-        let scroll_state = list_state.clone();
-        let panel = cx.weak_entity();
-        list_state.set_scroll_handler(move |event, _, cx| {
-            let attached = event.is_following_tail;
-            let scroll_state = scroll_state.clone();
-            let panel = panel.clone();
-            // ListState 在回调时持有可变借用；延后读取/更新，避免 RefCell 重入。
-            cx.defer(move |cx| {
-                let attached = attached || scroll_state.is_scrolled_to_end().unwrap_or(true);
-                let _ = panel.update(cx, |panel, cx| {
-                    if panel.tail_attached != attached {
-                        panel.tail_attached = attached;
-                        cx.notify();
-                    }
-                });
-            });
-        });
+        let first_tab = SessionUiState::new(0, new_list_state(0, cx.weak_entity()));
         Self {
             focus_handle: cx.focus_handle(),
             runtime_manager,
-            active_generation: 0,
-            active: None,
-            active_epoch: 0,
-            applied_revision: 0,
-            effect_cursor: 0,
-            backpressure: pi_runtime::BackpressureStats::default(),
-            session: SessionUiState::new(list_state),
+            sessions: vec![first_tab],
+            focused: 0,
+            cursor: 0,
+            next_tab_id: 1,
             composer,
             drafts: pi_data::DraftStore::default(),
-            model_names: Arc::new(std::collections::HashMap::new()),
-            popup: None,
-            popup_index: 0,
-            file_index: None,
             workspace_bounds: None,
             message_pane_bounds: None,
-            extension_widgets_above_scroll: ScrollHandle::default(),
-            extension_widgets_below_scroll: ScrollHandle::default(),
             extension_dialog_body_focus: None,
             extension_dialog_footer_focus: None,
+            closing_session_files: Vec::new(),
+            scheduler_subscription: None,
             _composer_subscription: subscription,
             probe: None,
         }
+    }
+
+    /// 分配一个新标签的身份。
+    fn allocate_tab_id(&mut self) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id = self.next_tab_id.wrapping_add(1);
+        id
+    }
+
+    /// 在指定标签的上下文中执行一段投影逻辑。
+    ///
+    /// 整套会话态投影（`apply_snapshot` / `apply_runtime_effect` / `sync_list_document`……）
+    /// 都写成 `self.xxx`，靠 `Deref` 落到「当前标签」。后台会话要复用同一套逻辑，就得
+    /// 让「当前标签」临时变成它自己那一槽 —— 否则只能把目标下标当参数逐层传下去，
+    /// 上千行投影代码要改一遍，还留下「某个分支忘了带下标」的长期隐患。
+    fn project<R>(&mut self, index: usize, body: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.cursor, index);
+        let result = body(self);
+        self.cursor = previous;
+        result
+    }
+
+    /// 当前投影的是不是用户正看着的那个标签。
+    ///
+    /// 后台事件泵会把游标临时指到自己那一槽，只有二者相同时才轮得到动全局资源
+    /// （窗口标题、工作区面板）。
+    fn projecting_focused_tab(&self) -> bool {
+        self.cursor == self.focused
+    }
+
+    fn slot_index_for_tab(&self, tab_id: u64) -> Option<usize> {
+        self.sessions.iter().position(|slot| slot.tab_id == tab_id)
+    }
+
+    /// 这份会话文件此刻归谁 —— 返回占着它的那个标签的标题（`except` 是提问者自己）。
+    ///
+    /// 「归谁」的判据集中在这一个函数里，所有会让 pi 进程绑上一份 JSONL 的入口
+    /// （启动活会话、切换会话）都问它。判据式地在各入口各写一份，就是第七轮那条
+    /// 「永远漏一个」——第十一轮的切换守卫只查了 `session.is_some()` 的标签，
+    /// 于是漏掉了只读历史标签和正在关闭的标签两类占用者。
+    fn session_file_owner(&self, path: &Path, except: usize) -> Option<String> {
+        if let Some(owner) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(index, slot)| {
+                *index != except
+                    && slot
+                        .claimed_session_files()
+                        .iter()
+                        .any(|owned| same_session_file(owned, path))
+            })
+            .map(|(_, slot)| slot.tab_title.clone())
+        {
+            return Some(owner);
+        }
+        self.closing_session_files
+            .iter()
+            .any(|(_, owned)| same_session_file(owned, path))
+            .then(|| "正在关闭的会话".to_owned())
+    }
+
+    /// 把一段**延后执行**的投影逻辑钉回发起它的那个标签。
+    ///
+    /// 异步回调（文件读取、原生选择器、Extension UI 超时、响应写回）回来时，前台可能
+    /// 已经换了标签；走 `Deref` 就会把 A 的结果写进 B。所有跨 await 点的续体都必须在
+    /// 发起时捕获 `tab_id`，回来再用它定位。标签已经关掉就整段跳过——它的会话态
+    /// 已经不存在，硬找一个替身写进去只会造出更难查的串台。
+    fn project_tab<R>(&mut self, tab_id: u64, body: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let index = self.slot_index_for_tab(tab_id)?;
+        Some(self.project(index, body))
+    }
+
+    /// 按 pi 会话身份找标签。
+    ///
+    /// `draft_key` 就是这份身份：历史选择时是侧栏给的会话 id，fresh 会话落盘后由
+    /// `ControlsLoaded` 迁移成真实 session id。
+    fn slot_index_for_key(&self, key: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|slot| slot.draft_key.as_deref() == Some(key))
+    }
+
+    /// 这个标签还是干净的吗？干净的标签可以直接复用，不必再开一个。
+    ///
+    /// 「干净」的判据是**用户往里放过东西没有**：会话、历史、附件、草稿文字，任何一样
+    /// 都算用过。放过东西却被当成空白复用，就是把用户的输入静默丢掉或串进新会话。
+    ///
+    /// 草稿走 `draft_slot_key`，因此调用前必须先 `save_current_draft` ——
+    /// composer 是全窗口一个，内容只有存下来之后才落在这个标签自己身上。
+    fn is_focused_tab_pristine(&self) -> bool {
+        let slot = &self.sessions[self.focused];
+        slot.session.is_none()
+            && slot.draft_key.is_none()
+            && slot.attachments.is_empty()
+            && matches!(slot.status, ChatStatus::Empty)
+            && self.drafts.get(&slot.draft_slot_key()).text.is_empty()
+    }
+
+    /// 开一个新标签，返回它的下标。
+    ///
+    /// 当前标签还没被用过时原地复用它 —— 第一次点开会话不该先长出一条只有一个标签的
+    /// 标签条。到达 [`MAX_SESSION_TABS`] 时明确失败，不淘汰用户还在用的标签。
+    fn open_tab(
+        &mut self,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        // 先存草稿再判断：判据要看「用户往这个标签里放过东西没有」，而 composer 的
+        // 内容只有存下来之后才在标签自己身上。
+        self.save_current_draft(cx);
+        if self.is_focused_tab_pristine() {
+            let index = self.focused;
+            let tab_id = self.sessions[index].tab_id;
+            // **原地重建**，而不是只改个标题。
+            //
+            // 「pristine」只保证用户没往这个标签里放过东西，不保证槽里没有残留的
+            // 瞬时状态——比如往空标签里拖了一张非法图片：附件没加上，`rpc_error`
+            // 却留下了。只改标题就会把那条不相干的红色横幅带进新开的会话。
+            // 逐个字段去清就是在追着枚举，以后新增一个瞬时字段就漏一个；
+            // 直接换一份全新的槽，新增字段自动被覆盖。
+            let mut slot = SessionUiState::new(tab_id, new_list_state(tab_id, cx.weak_entity()));
+            slot.tab_title = title;
+            // 这三项是**用户偏好**不是瞬时状态：在空标签上先挑好工具预设 / 收起
+            // minimap 再开会话是正常用法，重建不该把它们抹掉。
+            slot.minimap_visible = self.sessions[index].minimap_visible;
+            slot.composer_mode = self.sessions[index].composer_mode;
+            slot.tool_preset = self.sessions[index].tool_preset;
+            self.sessions[index] = slot;
+            return Ok(index);
+        }
+        if self.sessions.len() >= MAX_SESSION_TABS {
+            return Err(format!(
+                "最多同时打开 {MAX_SESSION_TABS} 个会话标签；请先关闭一个再试"
+            ));
+        }
+        self.suspend_foreground_dialog(window, cx);
+        let tab_id = self.allocate_tab_id();
+        let mut slot = SessionUiState::new(tab_id, new_list_state(tab_id, cx.weak_entity()));
+        slot.tab_title = title;
+        self.sessions.push(slot);
+        let index = self.sessions.len() - 1;
+        self.focused = index;
+        self.cursor = index;
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        // 新标签的 `window_title` 是初值 "GPUI-Pi"，而窗口上挂的可能是上一个会话
+        // 由 Extension UI 设的标题。`process_extension_ui` 只在「与本标签记录值不同」
+        // 时才写窗口，两者恰好相等就永远不会纠正——必须在这里无条件写一次。
+        self.apply_window_title(window);
+        Ok(index)
+    }
+
+    /// 切到另一个标签。
+    ///
+    /// 只动 UI 绑定：**不启动也不停止任何进程**。后台会话继续跑，这正是 R24 的核心承诺。
+    pub(crate) fn focus_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.sessions.len() || index == self.focused {
+            return;
+        }
+        self.save_current_draft(cx);
+        self.suspend_foreground_dialog(window, cx);
+        self.focused = index;
+        self.cursor = index;
+        self.prepare_draft_restore();
+        self.workspace_bounds = None;
+        self.message_pane_bounds = None;
+        // 排队中的标签被切到前台就该排在前面；`WaitQueue` 只升不降，不会误伤别人。
+        // 走后台：`request_run` 抢到槽就会就地冷启动一个进程。
+        if self.scheduler_state == Some(pi_runtime::SchedulerState::Queued) {
+            self.request_run_in_background(index, "启动中…", window, cx);
+        }
+        self.sync_scheduler_states();
+        self.apply_window_title(window);
+        self.process_extension_ui(window, cx);
+        self.emit_focused_session(cx);
+        cx.notify();
+    }
+
+    /// 广播当前前台标签的身份，让工作区级面板跟着切过去。
+    fn emit_focused_session(&mut self, cx: &mut Context<Self>) {
+        cx.emit(FocusedSessionChanged {
+            cwd: self.composer_cwd.clone(),
+            title: self.tab_title.clone(),
+            session_key: self.draft_key.clone(),
+        });
+    }
+
+    /// 把窗口标题切到前台标签自己那一份。
+    ///
+    /// `process_extension_ui` 只在「标题与本标签记录的值不同」时才写窗口；换标签时这两个
+    /// 值可能恰好相等，而窗口上挂着的还是上一个标签的标题。换标签必须无条件写一次。
+    fn apply_window_title(&mut self, window: &mut Window) {
+        let title = self.extension_ui.title().unwrap_or("GPUI-Pi").to_owned();
+        self.window_title = title.clone();
+        window.set_window_title(&title);
+    }
+
+    /// 关闭一个标签：注销会话（进程随之回收），标签从条上摘掉。
+    pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        if index == self.focused {
+            self.save_current_draft(cx);
+            self.suspend_foreground_dialog(window, cx);
+        }
+        // 关标签前先把这个标签欠 pi 的 Extension UI 响应结清；进程一旦回收就再也送不出去。
+        // 只有关的是前台标签时才动窗口级状态——关后台标签不该影响前台的对话框。
+        if index == self.focused {
+            self.project(index, |panel| {
+                panel.reset_foreground_extension_ui(window, cx)
+            });
+        } else {
+            self.project(index, |panel| panel.reset_extension_ui_slot(cx));
+        }
+        // 匿名标签的草稿存在 `tab-{id}` 下，标签一走这个键就再也取不到了。
+        // 不清掉就是一条随开关次数增长的泄漏——带图片的草稿可能有几十 MB。
+        // 有 `draft_key` 的标签不动：它的草稿按 pi 会话身份存，重新打开还要用。
+        if self.sessions[index].draft_key.is_none() {
+            let orphan = self.sessions[index].draft_slot_key();
+            self.drafts.clear(&orphan);
+        }
+        if let Some(session) = self.sessions[index].session.take() {
+            // 标签立刻从条上摘掉，进程回收放后台：`remove_session` 要等优雅停机，
+            // 随后的 `tick()` 还可能就地拉起一个排队会话，两者都不能占着 UI 线程。
+            // `tick()` 是必须的——不推这一下，排队会话要等 reaper 轮询
+            //（默认 TTL 下最长 45s）才补位。
+            //
+            // 但标签一摘，它对那份 JSONL 的主张也跟着没了，而进程还活着。留个墓碑到
+            // 后台作业落地为止，否则「关掉 → 重新打开同一段历史 → 启动活会话」
+            // 会在旧进程退干净之前起第二个进程写同一份文件。
+            let tab_id = self.sessions[index].tab_id;
+            // **全部**主张都要盖上，不能只盖第一条：切换在飞时这个标签同时主张着
+            // 「现在绑着的」和「正要切过去的」两份文件，而切换可能在优雅停机之前就完成 ——
+            // 那时正在关闭的进程写的恰恰是后者。
+            for claimed in self.sessions[index].claimed_session_files() {
+                self.closing_session_files.push((tab_id, claimed));
+            }
+            self.spawn_scheduler_job(
+                window,
+                cx,
+                move |manager| {
+                    manager.remove_session(session);
+                    manager.tick();
+                },
+                move |panel, (), _, _| {
+                    panel
+                        .closing_session_files
+                        .retain(|(owner, _)| *owner != tab_id);
+                },
+            );
+        }
+        if self.sessions.len() == 1 {
+            // 最后一个标签不删除而是重置：`Deref` 必须永远有落点。
+            let tab_id = self.allocate_tab_id();
+            self.sessions[0] =
+                SessionUiState::new(tab_id, new_list_state(tab_id, cx.weak_entity()));
+            self.focused = 0;
+        } else {
+            self.sessions.remove(index);
+            // 关掉当前标签或它左边的标签都会让下标左移一位。
+            if self.focused > index || self.focused == self.sessions.len() {
+                self.focused = self.focused.saturating_sub(1);
+            }
+        }
+        self.cursor = self.focused;
+        self.prepare_draft_restore();
+        self.apply_window_title(window);
+        self.emit_focused_session(cx);
+        self.reconcile_scheduler(window, cx);
+    }
+
+    /// 挂起当前标签的会话：让出 pi 进程，会话保留。
+    ///
+    /// 整个 `park` 都在后台线程做。它会等作业排空、拆 Actor、可能关进程，收尾时还会
+    /// `tick()` 一次把排队会话就地提升上来——在 GPUI 主线程上做这些就是整窗口卡死。
+    fn park_active_session(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.park_focused_session(window, cx);
+    }
+
+    fn park_focused_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.focused;
+        let Some(session) = self.sessions[index].session else {
+            return;
+        };
+        if self.sessions[index].control_busy() {
+            return;
+        }
+        let tab_id = self.sessions[index].tab_id;
+        self.sessions[index].scheduler_job = Some("挂起中…");
+        cx.notify();
+        self.spawn_scheduler_job(
+            window,
+            cx,
+            move |manager| manager.park(session),
+            move |panel, result, _, _| {
+                panel.project_tab(tab_id, |panel| {
+                    panel.scheduler_job = None;
+                    match result {
+                        // 成功不再另出一条绿条：常驻的状态说明已经写着「会话已挂起」，
+                        // 两条并排说同一件事只是把消息区又挤掉一行。
+                        Ok(()) => {
+                            panel.rpc_success = None;
+                            panel.clear_rpc_error();
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error_protected = true;
+                            panel.rpc_error = Some(format!("挂起失败：{error}"));
+                        }
+                    }
+                });
+            },
+        );
+    }
+
+    /// 一个标签在标签条上的形态。
+    fn tab_items(&self) -> Vec<gpui_pi_ui::SessionTabItem> {
+        self.sessions
+            .iter()
+            .map(|slot| {
+                let state = tab_state_of(slot);
+                gpui_pi_ui::SessionTabItem::new(
+                    format!("tab-{}", slot.tab_id),
+                    truncate_label(&slot.tab_title, TAB_LABEL_LIMIT),
+                    format!("{} · {}", slot.tab_title, state.label()),
+                    state,
+                )
+            })
+            .collect()
+    }
+
+    /// 前台标签需要额外解释的调度状态。
+    ///
+    /// `Running` 不出横幅：正常运行是默认预期，为它常驻一行提示只会挤压消息区。
+    /// `Starting` / `Stopping` 也不出——它们是放开调度锁前的短暂中间态，闪一下反而是噪声。
+    fn session_state_note(&self, cx: &App) -> Option<SessionStateNote> {
+        let slot = &self.sessions[self.focused];
+        // 后台正在办的事优先说：这期间调度状态还停在旧值（比如刚点了「恢复运行」，
+        // 会话仍是 `Parked`），照旧值出提示只会让用户以为按钮没生效。
+        if let Some(job) = slot.scheduler_job {
+            return Some(SessionStateNote {
+                dot: cx.theme().warning,
+                text: job.to_owned(),
+            });
+        }
+        let state = slot.scheduler_state?;
+        let text = match state {
+            pi_runtime::SchedulerState::Queued => format!(
+                "排队中：同时运行的会话已达上限 {}，轮到它就会自动启动",
+                self.runtime_manager.scheduler_limits().user_session_slots
+            ),
+            pi_runtime::SchedulerState::Parked => {
+                "会话已挂起：pi 进程已让出，点「恢复运行」继续".to_owned()
+            }
+            pi_runtime::SchedulerState::Failed => format!(
+                "会话已失败：{}",
+                truncate_label(
+                    slot.scheduler_failure.as_deref().unwrap_or("原因未知"),
+                    FAILURE_TEXT_LIMIT,
+                )
+            ),
+            _ => return None,
+        };
+        Some(SessionStateNote {
+            dot: tab_state_of(slot).dot(cx),
+            text,
+        })
+    }
+
+    /// 切走前台标签时把它的 Extension UI 对话框收起来。
+    ///
+    /// 收起不等于取消：请求仍留在该标签自己的队列里，切回来时
+    /// `maybe_open_extension_dialog` 会重新打开它。窗口级对话框是全局资源，
+    /// 不收起来它就会浮在另一个会话的界面上。
+    fn suspend_foreground_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.extension_dialog_open.take().is_some() {
+            self.request_extension_dialog_close(window, cx);
+        } else {
+            self.clear_extension_dialog_focus();
+        }
+    }
+
+    /// 把调度器里的状态同步到各标签。状态由调度器给出，app 不自行推断。
+    fn sync_scheduler_states(&mut self) {
+        for slot in &mut self.sessions {
+            let Some(session) = slot.session else {
+                slot.scheduler_state = None;
+                slot.scheduler_failure = None;
+                continue;
+            };
+            slot.scheduler_state = self.runtime_manager.session_state(session);
+            slot.scheduler_failure = self.runtime_manager.session_failure(session);
+        }
+    }
+
+    /// 按调度器的当前状态重新对齐所有标签的 Runtime 绑定。
+    ///
+    /// 队列提升、崩溃回收、Park 兜底都发生在调度器内部，且提升后拿到的是一个
+    /// **新的 `RuntimeId`**；不在这里重新取句柄，标签会永远停在 `Queued`。
+    fn reconcile_scheduler(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_scheduler_states();
+        for index in 0..self.sessions.len() {
+            let Some(session) = self.sessions[index].session else {
+                continue;
+            };
+            match self.sessions[index].scheduler_state {
+                Some(pi_runtime::SchedulerState::Running) => {
+                    let Some(handle) = self.runtime_manager.session_handle(session) else {
+                        continue;
+                    };
+                    let bound = self.sessions[index]
+                        .active
+                        .as_ref()
+                        .map(SessionHandle::runtime_id);
+                    if bound != Some(handle.runtime_id()) {
+                        self.attach_runtime(index, handle, window, cx);
+                    }
+                }
+                // 会话在别处被注销了（例如运行时兜底清理）：标签退回「只有历史」的形态。
+                None => self.project(index, |panel| {
+                    panel.session = None;
+                    panel.active = None;
+                    panel.extension_response_sender = None;
+                }),
+                // 其余状态都没有进程可绑：举着一个死句柄只会让 UI 以为还能提交。
+                _ => self.project(index, |panel| {
+                    panel.active = None;
+                    panel.extension_response_sender = None;
+                }),
+            }
+        }
+        cx.notify();
+    }
+
+    /// 起一条调度器通知桥：把 `pi-runtime` 的阻塞通道接到 GPUI 的异步上下文。
+    ///
+    /// 全面板只有这一条，与会话数无关，且**只在真的登记了会话之后才起**——
+    /// 从没启动过活会话的面板不需要监听调度器，也就不该为此常驻一条线程。
+    /// 订阅本体存在面板上，面板析构即退订，桥接线程随即从 `recv` 上返回退出，
+    /// 关一次窗口不留线程。
+    fn ensure_scheduler_bridge(&mut self, window_handle: AnyWindowHandle, cx: &mut Context<Self>) {
+        if self.scheduler_subscription.is_some() {
+            return;
+        }
+        let mut subscription = self.runtime_manager.subscribe_scheduler();
+        let Some(receiver) = subscription.take_receiver() else {
+            return;
+        };
+        self.scheduler_subscription = Some(subscription);
+        // 桥接侧也必须有界且合并，否则 `pi-runtime` 那头「容量 1、满帧即丢」的保证
+        // 到这里就作废了：GPUI 执行器一卡住，这条线程会把上游一条条取空、原样堆进
+        // 一条无界队列。合并规则与上游一致——通知是电平触发的，堆多少条都是同一件事。
+        let (mut tx, mut rx) = mpsc::channel(0);
+        std::thread::Builder::new()
+            .name("pi-runtime-scheduler-bridge".into())
+            .spawn(move || {
+                while receiver.recv().is_ok() {
+                    if let Err(error) = tx.try_send(())
+                        && error.is_disconnected()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn scheduler bridge");
+        cx.spawn(async move |panel, cx| {
+            while rx.next().await.is_some() {
+                let alive = window_handle
+                    .update(cx, |_, window, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.reconcile_scheduler(window, cx))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     #[cfg(test)]
@@ -402,6 +1164,29 @@ impl ChatPanel {
         sender: std::sync::Arc<dyn crate::live_session::ExtensionResponseSender>,
     ) {
         self.extension_response_sender = Some(sender);
+    }
+
+    /// 造两个各自绑定不同工作目录的标签，供工作区级同步的测试使用。
+    #[cfg(test)]
+    pub(crate) fn open_two_tabs_for_test(
+        &mut self,
+        first: PathBuf,
+        second: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft_key = Some("tab-one".to_owned());
+        self.composer_cwd = Some(first);
+        self.open_tab("二号".to_owned(), window, cx)
+            .expect("第二个标签");
+        self.draft_key = Some("tab-two".to_owned());
+        self.composer_cwd = Some(second);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tab_titles_for_test(&mut self, first: &str, second: &str) {
+        self.sessions[0].tab_title = first.to_owned();
+        self.sessions[1].tab_title = second.to_owned();
     }
 
     #[cfg(test)]
@@ -436,17 +1221,12 @@ impl ChatPanel {
     }
 
     fn save_current_draft(&mut self, cx: &App) {
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        let key = self.draft_slot_key();
+        self.drafts.set(key, self.current_draft(cx));
     }
 
     fn prepare_draft_restore(&mut self) {
-        let draft = self
-            .draft_key
-            .as_deref()
-            .map(|key| self.drafts.get(key))
-            .unwrap_or_default();
+        let draft = self.drafts.get(&self.draft_slot_key());
         self.pending_draft_restore = true;
         self.attachments = draft
             .images
@@ -455,18 +1235,39 @@ impl ChatPanel {
             .collect();
     }
 
-    fn start_file_index(&self, generation: u64, cwd: PathBuf, cx: &mut Context<Self>) {
+    /// 为一个标签建立 `@` 补全用的文件索引。
+    ///
+    /// 结果按 `tab_id` 回填：索引是后台任务，回来时用户可能已经切走，
+    /// 走 `Deref` 会把 A 的项目索引装进 B 的补全面板。
+    fn start_file_index(
+        &self,
+        tab_id: u64,
+        generation: LoadGeneration,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor
                 .spawn(async move { pi_data::build_file_index(&cwd) })
                 .await;
             let _ = panel.update(cx, |panel, cx| {
-                if generation == panel.load_generation {
+                let Some(index) = panel.slot_index_for_tab(tab_id) else {
+                    return;
+                };
+                let focused = index == panel.focused;
+                panel.project(index, |panel| {
+                    if generation != panel.load_generation {
+                        return;
+                    }
                     panel.file_index = Some(result);
-                    panel.refresh_popup(cx);
+                    // 只有前台标签的补全面板由输入框驱动：composer 全窗口只有一个，
+                    // 拿它的内容去重算后台标签的补全等于用别人的输入。
+                    if focused {
+                        panel.refresh_popup(cx);
+                    }
                     cx.notify();
-                }
+                });
             });
         })
         .detach();
@@ -485,77 +1286,72 @@ impl ChatPanel {
         self.rpc_error_protected = false;
     }
 
+    /// 这个标签是不是正在交出进程？
+    ///
+    /// Park / Stop 会把正在执行的元数据请求连同 client 一起抽走，那几条 `get_state` /
+    /// `get_commands` 必然超时（实测「加载会话控制失败：request req_5 timed out」）。
+    /// 用户刚点了「挂起」，进程没了正是他要的结果，不是需要他处理的故障——
+    /// 报出来只会让一次正常操作看起来失败了，而且横幅一进一出还会顶得 composer 跳行。
+    fn is_tearing_down(&self) -> bool {
+        self.scheduler_job.is_some() || self.active.is_none()
+    }
+
     fn set_host_extension_degradation(&mut self, diagnostic: Option<&str>) {
         self.host_extension_degradation = diagnostic.map(str::to_owned);
     }
 
+    /// 侧栏选中一个历史会话。
+    ///
+    /// 已经开着的同一个会话直接切过去 —— 它可能正跑着，重新载入一次历史等于把用户的
+    /// 活会话换成一份只读快照。
     pub fn load_selection(
         &mut self,
         selection: SessionSelected,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.save_current_draft(cx);
-        self.reset_extension_ui(window, cx);
-        self.load_generation = self.load_generation.wrapping_add(1);
-        self.begin_active_generation();
-        let generation = self.load_generation;
-        if let Some(active) = self.active.take() {
-            self.runtime_manager.stop_user(active.runtime_id());
+    ) -> Result<(), String> {
+        if let Some(index) = self.slot_index_for_key(&selection.id) {
+            // 侧栏那边可能刚把这个会话改过名，标题以本次选择为准。
+            self.sessions[index].tab_title = selection.title.clone();
+            if index == self.focused {
+                // `focus_tab` 对「已经是前台」会直接返回，改名后的身份就发不出去了。
+                self.emit_focused_session(cx);
+                cx.notify();
+            } else {
+                self.focus_tab(index, window, cx);
+            }
+            return Ok(());
         }
-        self.status = ChatStatus::Loading {
-            title: selection.title.clone(),
-        };
-        self.rpc_success = None;
-        self.rpc_error = None;
-        self.host_extension_degradation = None;
-        self.backpressure_note = None;
-        self.backpressure_note_until = None;
-        self.fresh_session = false;
-        self.draft_key = Some(selection.id.clone());
-        self.composer_cwd = Some(selection.cwd.clone());
-        self.file_index = None;
-        self.slash_commands.clear();
-        self.controls = None;
-        self.model_names = Arc::new(std::collections::HashMap::new());
-        self.tool_preset = ToolPreset::Inherit;
-        self.control_operation = None;
-        self.branch_tree = None;
-        self.branch_preview_leaf = None;
-        self.branch_preview_document = None;
-        self.retry_status = None;
-        self.compacting = false;
-        self.popup = None;
-        self.popup_index = 0;
-        self.prepare_draft_restore();
-        self.start_file_index(generation, selection.cwd.clone(), cx);
-        self.tail_attached = true;
-        self.follow_requested = false;
-        self.minimap_visible = true;
-        self.workspace_bounds = None;
-        self.message_pane_bounds = None;
-        self.expanded_tools.clear();
-        self.expanded_processes.clear();
-        // 新会话使用独立 ListState；首次加载仍只执行一次静态全量测量。
-        self.list_state = ListState::new(0, ListAlignment::Top, px(1200.)).measure_all();
-        let scroll_state = self.list_state.clone();
-        let panel = cx.weak_entity();
-        self.list_state.set_scroll_handler(move |event, _, cx| {
-            let attached = event.is_following_tail;
-            let scroll_state = scroll_state.clone();
-            let panel = panel.clone();
-            cx.defer(move |cx| {
-                let attached = attached || scroll_state.is_scrolled_to_end().unwrap_or(true);
-                let _ = panel.update(cx, |panel, cx| {
-                    if panel.tail_attached != attached {
-                        panel.tail_attached = attached;
-                        cx.notify();
-                    }
-                });
-            });
-        });
-        self.list_items.clear();
+        // 失败必须交回调用方：工作区会跟着这次选择去搬文件树和工具栏标题，
+        // 这里只在自己身上留一条错误的话，界面就会「聊天还在旧会话、工作区已经
+        // 指向被拒绝的那个」。
+        let index = self.open_tab(selection.title.clone(), window, cx)?;
+        self.load_history_into(index, selection, cx);
+        self.emit_focused_session(cx);
         cx.notify();
+        Ok(())
+    }
+
+    /// 把一份历史会话装进指定标签。调用方保证该标签已经是干净的。
+    fn load_history_into(
+        &mut self,
+        index: usize,
+        selection: SessionSelected,
+        cx: &mut Context<Self>,
+    ) {
+        let (tab_id, generation) = self.project(index, |panel| {
+            panel.load_generation = panel.load_generation.next();
+            panel.begin_active_generation();
+            panel.tab_title = selection.title.clone();
+            panel.status = ChatStatus::Loading {
+                title: selection.title.clone(),
+            };
+            panel.draft_key = Some(selection.id.clone());
+            panel.composer_cwd = Some(selection.cwd.clone());
+            panel.prepare_draft_restore();
+            (panel.tab_id, panel.load_generation)
+        });
+        self.start_file_index(tab_id, generation, selection.cwd.clone(), cx);
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let path = selection.path;
@@ -568,7 +1364,7 @@ impl ChatPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel, cx| {
-                if panel.finish_load(generation, title, result) {
+                if panel.finish_load(tab_id, generation, title, result) {
                     cx.notify();
                 }
             });
@@ -576,133 +1372,304 @@ impl ChatPanel {
         .detach();
     }
 
+    /// 侧栏「新建会话」：开一个新标签并登记一个 fresh 会话。
+    ///
+    /// 与 R23 之前最大的差别：**不再停掉已有的活会话**。抢不到运行槽时新会话进入
+    /// `Queued`，标签照常建立，等调度器补位。
     pub fn start_new_session(
         &mut self,
         cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let generation = self.active_generation.wrapping_add(1);
-        let document = ConversationDocument {
-            session_id: format!("fresh-{generation}"),
-            source_path: PathBuf::new(),
-            cwd: cwd.clone(),
-            messages: Arc::from([]),
-            items: Arc::from([]),
-            minimap: Arc::from([]),
-            diagnostics: Arc::from([]),
-        };
-        let active = self.runtime_manager.start_fresh(
-            official_binary(),
-            cwd.clone(),
-            document.clone(),
-            ToolPreset::Inherit,
-            pi_data::agent_dir(),
-        )?;
-        let receiver = active.subscribe_dirty();
-
-        self.save_current_draft(cx);
-        self.reset_extension_ui(window, cx);
-        if let Some(old) = self.active.take() {
-            self.runtime_manager.stop_user(old.runtime_id());
-        }
-        let reset = reset_session_scoped_state(
-            self.load_generation,
-            &mut self.file_index,
-            &mut self.popup,
-            &mut self.popup_index,
-        );
-        self.load_generation = reset.load_generation;
-        let load_generation = self.load_generation;
-        self.active_generation = generation;
-        self.status = ChatStatus::Ready(Arc::new(document.clone()));
-        self.sync_list_document(&document, true);
-        self.list_state.reset(0);
-        self.list_items.clear();
-        self.install_active(active);
-        self.spawn_dirty_pump(receiver, window.window_handle(), cx);
-        self.draft_key = Some(format!("fresh-{generation}"));
-        let draft_key = self.draft_key.clone().unwrap_or_default();
-        self.drafts.clear(&draft_key);
+        // 标题带上项目目录：同一个窗口里可能同时开着好几个 fresh 会话，
+        // 全叫「新会话」的标签条等于没有标签。
+        let index = self.open_tab(fresh_session_title(&cwd), window, cx)?;
+        let tab_id = self.sessions[index].tab_id;
+        let load_generation = self.project(index, |panel| {
+            let generation = panel.begin_active_generation();
+            // 文件索引按 `load_generation` 校验回填，这里必须一起推进。
+            panel.load_generation = panel.load_generation.next();
+            let document = ConversationDocument {
+                session_id: format!("fresh-{tab_id}-{generation}"),
+                source_path: PathBuf::new(),
+                cwd: cwd.clone(),
+                messages: Arc::from([]),
+                items: Arc::from([]),
+                minimap: Arc::from([]),
+                diagnostics: Arc::from([]),
+            };
+            panel.status = ChatStatus::Ready(Arc::new(document.clone()));
+            panel.sync_list_document(&document, true);
+            panel.list_state.reset(0);
+            panel.list_items.clear();
+            // **不给 fresh 会话编一个 `draft_key`**：那个字段是对外的 pi 会话身份
+            // （去重认它、工作区 tooltip 也显示它），编出来的值会以「真实身份」的
+            // 名义漏到界面上。草稿自有 `draft_slot_key()` 兜底，等 `ControlsLoaded`
+            // 拿到真的 session id 再迁移过去。
+            panel.draft_key = None;
+            let draft_slot = panel.draft_slot_key();
+            panel.drafts.clear(&draft_slot);
+            panel.composer_cwd = Some(cwd.clone());
+            panel.fresh_session = true;
+            panel.load_generation
+        });
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.composer_cwd = Some(cwd.clone());
-        self.start_file_index(load_generation, cwd, cx);
-        self.attachments.clear();
-        self.slash_commands.clear();
-        self.controls = None;
-        self.model_names = Arc::new(std::collections::HashMap::new());
-        self.tool_preset = ToolPreset::Inherit;
-        self.control_operation = None;
-        self.branch_tree = None;
-        self.branch_preview_leaf = None;
-        self.branch_preview_document = None;
-        self.retry_status = None;
-        self.compacting = false;
-        self.rpc_success = None;
-        self.rpc_error = None;
-        self.host_extension_degradation = None;
-        self.backpressure_note = None;
-        self.backpressure_note_until = None;
-        self.fresh_session = true;
-        self.tail_attached = true;
-        self.follow_requested = false;
-        self.expanded_tools.clear();
-        self.expanded_processes.clear();
+        let document = match &self.sessions[index].status {
+            ChatStatus::Ready(document) => (**document).clone(),
+            // 上面刚写进去的就是 Ready；走到这里说明代码被改坏了，不要静默继续。
+            _ => return Err("新会话初始文档缺失".to_owned()),
+        };
+        let descriptor = self.fresh_session_descriptor(index, cwd.clone());
+        self.start_file_index(tab_id, load_generation, cwd, cx);
+        self.bind_session(index, descriptor, document, window, cx);
+        self.emit_focused_session(cx);
         cx.notify();
         Ok(())
     }
 
+    /// fresh 会话的启动描述。
+    ///
+    /// 预设必须取**这个标签当前显示的那一个**：`open_tab` 复用干净标签时刻意把用户先挑好的
+    /// 工具预设留下来（那是偏好，不是瞬时状态）。这里写死 `Inherit` 就会让进程按更宽的权限
+    /// 起来，而界面还显示着 ReadOnly —— 与 R23 审查 P1-1、本轮第十一轮修的是同一类分家。
+    fn fresh_session_descriptor(
+        &self,
+        index: usize,
+        cwd: PathBuf,
+    ) -> pi_runtime::SessionDescriptor {
+        pi_runtime::SessionDescriptor {
+            binary: official_binary(),
+            cwd,
+            session_path: None,
+            tool_preset: self.sessions[index].tool_preset,
+            agent_dir: pi_data::agent_dir(),
+        }
+    }
+
+    /// 给一个标签登记会话并请求运行。
+    ///
+    /// 抢不到运行槽不是错误：会话进入 `Queued`，标签保持可见，等调度器通知再接线。
+    /// 只有登记本身失败（例如队列已满）才回滚注销，绝不留下一个没人认领的会话。
+    fn bind_session(
+        &mut self,
+        index: usize,
+        descriptor: pi_runtime::SessionDescriptor,
+        document: ConversationDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_scheduler_bridge(window.window_handle(), cx);
+        // 登记是纯内存操作（R23 验收：登记 20 个会话零进程），同步做没问题；
+        // 真正会拉起进程的 `request_run` 必须进后台。
+        let session = self.runtime_manager.create_session(descriptor, document);
+        self.sessions[index].session = Some(session);
+        self.sessions[index].scheduler_failure = None;
+        self.sync_scheduler_states();
+        self.request_run_in_background(index, "启动中…", window, cx);
+    }
+
+    /// 标签的调度优先级：只有用户正在看的那个才是前台。
+    fn priority_for(&self, index: usize) -> pi_runtime::Priority {
+        if index == self.focused {
+            pi_runtime::Priority::FOREGROUND
+        } else {
+            pi_runtime::Priority::BACKGROUND
+        }
+    }
+
+    /// 在后台线程执行一段**会碰进程**的调度器操作，完成后回到 UI 线程收尾并 reconcile。
+    ///
+    /// `RuntimeManager` 的 `park` / `request_run` / `remove_session` / `tick` 都可能同步地
+    /// 关掉一个 pi 进程、做一次 `switch_session` 往返，甚至冷启一个新进程 ——
+    /// `park` 收尾时的那次 `tick()` 就会把排队会话**就地**提升上来
+    /// （`pi-runtime` 的 `park_finishes_a_queued_handoff_on_the_calling_thread` 钉死了这条）。
+    ///
+    /// 这些工作一旦落在 GPUI 主线程上，就是整窗口卡死一次进程交接的时间；多会话之后更糟，
+    /// 因为它同时冻住了**其他会话**的流式渲染。R24 视觉验收里「2 活跃 + 1 排队时点挂起
+    /// 程序崩溃退出、单活跃时正常」正是这条：单会话时 `tick()` 无事可做，所以看不出来。
+    fn spawn_scheduler_job<R: Send + 'static>(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(RuntimeManager) -> R + Send + 'static,
+        settle: impl FnOnce(&mut Self, R, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let manager = self.runtime_manager.clone();
+        cx.spawn_in(window, async move |panel, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { job(manager) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let _ = panel.update(cx, |panel, cx| {
+                    settle(panel, outcome, window, cx);
+                    // 绑定统一交给 reconcile：它按调度器的**当前**状态取句柄，
+                    // 不依赖这次调用恰好返回了什么。
+                    panel.reconcile_scheduler(window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 后台申请运行槽。
+    ///
+    /// 拿到句柄这件事交给 `reconcile_scheduler`，这里只负责把 busy 标记立起来再放下 ——
+    /// 排队会话后来被调度器提升时走的也是同一条 reconcile 路径，两边保持一致。
+    fn request_run_in_background(
+        &mut self,
+        index: usize,
+        label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions[index].session else {
+            return;
+        };
+        if self.sessions[index].scheduler_job.is_some() {
+            return;
+        }
+        let tab_id = self.sessions[index].tab_id;
+        let priority = self.priority_for(index);
+        self.sessions[index].scheduler_job = Some(label);
+        cx.notify();
+        self.spawn_scheduler_job(
+            window,
+            cx,
+            move |manager| {
+                // 先把优先级落到调度器上再申请：`request_run` 内部第一件事是 `tick()`，
+                // 而 `promote_queued` 按队列里**现有的**优先级挑人。少了这一步，
+                // 「切到一个排队标签」会先用旧优先级把刚空出来的槽让给别的后台会话。
+                manager.reprioritize(session, priority);
+                manager.request_run(session, priority).map(|_| ())
+            },
+            move |panel, result, _, _| {
+                panel.project_tab(tab_id, |panel| {
+                    panel.scheduler_job = None;
+                    match result {
+                        // 抢到槽和进了队列都不是错误：状态由 reconcile 如实反映。
+                        Ok(()) => {
+                            panel.rpc_success = None;
+                            panel.clear_rpc_error();
+                            panel.scheduler_failure = None;
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error_protected = true;
+                            panel.rpc_error = Some(error);
+                        }
+                    }
+                });
+            },
+        );
+    }
+
+    /// 历史渲染完成后回填到**发起它的那个标签**。
+    ///
+    /// 必须按 `tab_id` 找槽：渲染是后台任务，回来时用户可能已经切到别的标签，
+    /// 走 `Deref` 会把 A 的历史写进 B。
     fn finish_load(
         &mut self,
-        generation: u64,
+        tab_id: u64,
+        generation: LoadGeneration,
         title: String,
         result: Result<Arc<ConversationDocument>, String>,
     ) -> bool {
-        if generation != self.load_generation {
+        let Some(index) = self.slot_index_for_tab(tab_id) else {
             return false;
-        }
-        self.status = match result {
-            Ok(document) => {
-                self.sync_list_document(&document, true);
-                self.list_state.scroll_to_end();
-                ChatStatus::Ready(document)
-            }
-            Err(message) => ChatStatus::Error { title, message },
         };
-        true
+        self.project(index, |panel| {
+            if generation != panel.load_generation {
+                return false;
+            }
+            panel.status = match result {
+                Ok(document) => {
+                    panel.sync_list_document(&document, true);
+                    panel.list_state.scroll_to_end();
+                    ChatStatus::Ready(document)
+                }
+                Err(message) => ChatStatus::Error { title, message },
+            };
+            true
+        })
     }
 
+    /// 在当前标签上把一份历史变成活会话。
     fn start_live(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() || self.control_operation.is_some() {
+        if self.active.is_some() || self.control_busy() {
+            return;
+        }
+        let index = self.focused;
+        // 已经登记过（Parked / Failed / Queued）的会话走重跑，不再登记第二遍 ——
+        // 再登记一次会把同一段对话变成两个互不相识的会话。
+        if self.sessions[index].session.is_some() {
+            self.resume_session(index, window, cx);
             return;
         }
         let ChatStatus::Ready(history) = &self.status else {
             return;
         };
         let history = history.clone();
+        // 真正会起进程的另一条入口。只读历史标签可以有两个开在同一份 JSONL 上
+        // （例如另一个标签刚切过去），但**起进程**只能有一个，否则两个 pi 各自往
+        // 同一份文件追加。正在关闭、进程还没回收完的那份同样不能抢。
+        if let Some(owner) = self.session_file_owner(&history.source_path, index) {
+            self.rpc_success = None;
+            self.rpc_error_protected = true;
+            self.rpc_error = Some(format!("该会话已在标签「{owner}」中打开，请直接切过去"));
+            cx.notify();
+            return;
+        }
+        let tool_preset = self.tool_preset;
         self.begin_active_generation();
         let session_path = history.source_path.clone();
         let cwd = session_cwd(&session_path).unwrap_or_else(|| PathBuf::from("."));
-        match self.runtime_manager.start_session(
-            official_binary(),
-            session_path,
+        let descriptor = pi_runtime::SessionDescriptor {
+            binary: official_binary(),
             cwd,
-            (*history).clone(),
-            self.tool_preset,
-            pi_data::agent_dir(),
-        ) {
-            Ok(active) => {
-                let receiver = active.subscribe_dirty();
-                self.install_active(active);
-                self.rpc_success = None;
-                self.rpc_error = None;
-                self.spawn_dirty_pump(receiver, window.window_handle(), cx);
-            }
-            Err(error) => {
-                self.rpc_success = None;
-                self.rpc_error = Some(error);
-            }
+            session_path: Some(session_path),
+            tool_preset,
+            agent_dir: pi_data::agent_dir(),
+        };
+        self.rpc_success = None;
+        self.rpc_error = None;
+        self.bind_session(index, descriptor, (*history).clone(), window, cx);
+        cx.notify();
+    }
+
+    /// 重新请求运行一个已登记的会话（Parked / Failed / Queued 都走这里）。
+    fn resume_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_run_in_background(index, "恢复中…", window, cx);
+    }
+
+    /// 把一个刚拿到的 Runtime 装到标签上，并为它起一条事件泵。
+    fn attach_runtime(
+        &mut self,
+        index: usize,
+        handle: SessionHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = handle.subscribe_dirty();
+        let tab_id = self.sessions[index].tab_id;
+        let terminal = self.project(index, |panel| {
+            panel.install_active(handle);
+            // 立刻拉一次：`subscribe_dirty` 只登记发送端，不补发当前修订号。
+            // 启动/热接管的元数据可能在我们订阅**之前**就跑完了，那几条 Dirty
+            // 发给了零个订阅者；不在这里补一次，这个标签就会一直没有模型、
+            // 没有 slash 命令、没有启动诊断，直到下一次运行时事件——空闲会话
+            // 可能永远等不到。
+            panel.pull_runtime_snapshot(cx)
+        });
+        self.spawn_dirty_pump(tab_id, receiver, window.window_handle(), cx);
+        if terminal {
+            // 订阅不补发之前的 Dirty：进程若在「Manager 发布 Running」与「订阅装好」
+            // 之间就退出了，上面这次补拉就是**唯一**一次能看到终态的机会。
+            // 不在这里收口，运行槽会一直挂在 Running 上，排队会话要等 reaper 轮询
+            //（默认 TTL 下最长 45s）才补位。走后台，`tick()` 可能就地拉起新会话。
+            self.spawn_scheduler_job(window, cx, |manager| manager.tick(), |_, (), _, _| {});
         }
         cx.notify();
     }
@@ -725,18 +1692,31 @@ impl ChatPanel {
         self.active = Some(active);
     }
 
+    /// 为一个标签的 Runtime 起事件泵。
+    ///
+    /// 每条泵只服务**它自己那个标签**：投影游标由 `tab_id` 定位，因此后台会话照常
+    /// 消费 effect（不消费的话 R22 的有界 effect 缓存会把它们淘汰掉，用户切回来就
+    /// 少了一段），但只有前台标签才允许驱动 window —— 通知、窗口标题和 Extension UI
+    /// 对话框是全局资源，后台会话去动它们等于替用户抢屏幕。
     fn spawn_dirty_pump(
         &self,
+        tab_id: u64,
         receiver: std::sync::mpsc::Receiver<pi_runtime::Dirty>,
         window_handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let (tx, mut rx) = mpsc::unbounded();
+        // 有界且合并，与调度器桥同一条规则。`Dirty` 只是「有变化了」的信号——
+        // `pull_runtime_snapshot` 回来会重新读一次完整 Snapshot，中间那些丢掉无损。
+        // 这里必须有界：多会话之后每个 Runtime 各有一条桥，一条无界队列会被会话数
+        // 乘一遍，正是 R22 要消灭的东西。
+        let (mut tx, mut rx) = mpsc::channel(0);
         std::thread::Builder::new()
             .name("pi-runtime-dirty-bridge".into())
             .spawn(move || {
-                while let Ok(dirty) = receiver.recv() {
-                    if tx.unbounded_send(dirty).is_err() {
+                while receiver.recv().is_ok() {
+                    if let Err(error) = tx.try_send(())
+                        && error.is_disconnected()
+                    {
                         break;
                     }
                 }
@@ -748,8 +1728,28 @@ impl ChatPanel {
                     .update(cx, |_, window, cx| {
                         panel
                             .update(cx, |panel, cx| {
-                                let should_stop = panel.pull_runtime_snapshot(cx);
-                                panel.process_extension_ui(window, cx);
+                                let Some(index) = panel.slot_index_for_tab(tab_id) else {
+                                    // 标签已经关掉：这条泵没有归属了，退出。
+                                    return true;
+                                };
+                                let should_stop =
+                                    panel.project(index, |panel| panel.pull_runtime_snapshot(cx));
+                                if should_stop {
+                                    // 这个 Runtime 进了终态：推一次调度让 Manager 收回运行槽，
+                                    // 排队中的会话才能马上补位，而不是等 reaper 轮询。
+                                    // 放后台——这里正跑在 GPUI 主线程上，而 `tick()` 可能
+                                    // 就地把排队会话拉起来。
+                                    panel.spawn_scheduler_job(
+                                        window,
+                                        cx,
+                                        |manager| manager.tick(),
+                                        |_, (), _, _| {},
+                                    );
+                                    panel.reconcile_scheduler(window, cx);
+                                }
+                                if index == panel.focused {
+                                    panel.process_extension_ui(window, cx);
+                                }
                                 cx.notify();
                                 should_stop
                             })
@@ -769,9 +1769,16 @@ impl ChatPanel {
             return true;
         };
         let snapshot = active.snapshot();
-        if snapshot.runtime_id != active.runtime_id() || snapshot.revision <= self.applied_revision
-        {
+        if snapshot.runtime_id != active.runtime_id() {
             return false;
+        }
+        // 终态取自 Snapshot 的权威字段，而**不是**「`Stopped` effect 有没有被投影出来」：
+        // effect 会被背压淘汰，终态不会。收不到终态这条泵就会一直阻塞在下一条 Dirty 上，
+        // 而崩溃的 Runtime 再也不会产生 Dirty —— 运行槽要拖到 reaper 轮询才回收，
+        // 排队中的会话跟着一起等（默认 TTL 下最长 45s）。
+        let terminal = snapshot.terminal.is_some();
+        if snapshot.revision <= self.applied_revision {
+            return terminal;
         }
         let epoch_changed = snapshot.epoch != self.active_epoch;
         if epoch_changed {
@@ -782,7 +1789,7 @@ impl ChatPanel {
             ));
         }
         self.applied_revision = snapshot.revision;
-        self.apply_snapshot(snapshot, cx)
+        self.apply_snapshot(snapshot, cx) || terminal
     }
 
     fn apply_snapshot(&mut self, snapshot: SessionSnapshot, cx: &mut Context<Self>) -> bool {
@@ -935,11 +1942,10 @@ impl ChatPanel {
                         self.rpc_success = None;
                         let mut restored_draft = false;
                         if should_restore_submission(kind)
-                            && let (Some(key), Some(submission)) =
-                                (self.draft_key.clone(), submission)
+                            && let Some(submission) = submission
                         {
                             let restored = self.drafts.restore_submission(
-                                &key,
+                                &self.draft_slot_key(),
                                 pi_data::ComposerDraft {
                                     text: submission.message,
                                     images: submission.images,
@@ -982,6 +1988,8 @@ impl ChatPanel {
                         self.slash_commands = commands;
                         self.refresh_popup_without_input();
                     }
+                    // 拆除期间的元数据失败是交出进程的必然产物，不是故障。
+                    Err(_) if self.is_tearing_down() => {}
                     Err(error) => {
                         self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("加载 slash 命令失败：{error}"));
@@ -993,10 +2001,14 @@ impl ChatPanel {
                 match result {
                     Ok(controls) => {
                         if self.fresh_session {
-                            if let Some(old_key) = self.draft_key.clone() {
-                                migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
-                            }
+                            let old_key = self.draft_slot_key();
+                            migrate_draft_key(&mut self.drafts, &old_key, &controls.session_id);
                             self.draft_key = Some(controls.session_id.clone());
+                            // 身份刚从「无」变成真实 session id：前台标签得把它广播出去，
+                            // 否则工作区 tooltip 会一直停在校准之前的状态。
+                            if self.projecting_focused_tab() {
+                                self.emit_focused_session(cx);
+                            }
                             if controls.session_file.is_some() {
                                 self.fresh_session = false;
                                 cx.emit(SessionsChanged);
@@ -1004,6 +2016,7 @@ impl ChatPanel {
                         }
                         self.apply_controls(controls);
                     }
+                    Err(_) if self.is_tearing_down() => {}
                     Err(error) => {
                         self.rpc_error_protected = true;
                         self.rpc_error = Some(format!("加载会话控制失败：{error}"));
@@ -1124,9 +2137,7 @@ impl ChatPanel {
         if let Some(text) = self.extension_ui.take_editor_text() {
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));
-            if let Some(key) = self.draft_key.clone() {
-                self.drafts.set(key, self.current_draft(cx));
-            }
+            self.save_current_draft(cx);
         }
         if self.extension_dialog_needs_close {
             return;
@@ -1144,16 +2155,20 @@ impl ChatPanel {
             return;
         };
         let id = response.id().to_owned();
+        // 写回失败的诊断属于**这个会话**，不属于用户此刻正看着的那个标签。
+        let tab_id = self.tab_id;
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor.spawn(async move { sender.send(response) }).await;
             let _ = panel.update(cx, |panel, cx| {
-                if let Err(error) = result {
-                    panel.rpc_error = Some(format!(
-                        "Extension UI 响应 {id} 未写回，已丢弃并继续队列：{error}"
-                    ));
-                }
-                cx.notify();
+                panel.project_tab(tab_id, |panel| {
+                    if let Err(error) = result {
+                        panel.rpc_error = Some(format!(
+                            "Extension UI 响应 {id} 未写回，已丢弃并继续队列：{error}"
+                        ));
+                    }
+                    cx.notify();
+                });
             });
         })
         .detach();
@@ -1222,24 +2237,23 @@ impl ChatPanel {
             let panel = cx.weak_entity();
             let timeout_id = dialog_request.id.clone();
             let timeout_sequence = dialog_request.sequence;
+            // 超时属于开出这个对话框的标签。不钉住的话，定时器会去检查前台标签的
+            // 队列——id 撞上就取消了**别人**的请求，撞不上则这条超时被静默吞掉。
+            let tab_id = self.tab_id;
             let timer = cx.background_executor().clone();
             cx.spawn(async move |_, cx| {
                 timer
                     .timer(deadline.saturating_duration_since(std::time::Instant::now()))
                     .await;
                 let _ = panel.update(cx, |panel, cx| {
-                    if panel.extension_ui.active_dialog().is_some_and(|dialog| {
-                        dialog.id == timeout_id && dialog.sequence == timeout_sequence
-                    }) {
-                        panel.extension_dialog_needs_close = true;
-                        panel.finish_extension_dialog(
-                            &timeout_id,
-                            pi_rpc::ExtensionUiResponse::cancelled(&timeout_id),
-                            cx,
-                        );
-                        panel.rpc_error = Some("Extension UI 请求已超时".to_owned());
-                        cx.notify();
-                    }
+                    panel.project_tab(tab_id, |panel| {
+                        if panel.extension_ui.active_dialog().is_some_and(|dialog| {
+                            dialog.id == timeout_id && dialog.sequence == timeout_sequence
+                        }) {
+                            panel.expire_extension_dialog(&timeout_id, cx);
+                            panel.rpc_error = Some("Extension UI 请求已超时".to_owned());
+                        }
+                    });
                 });
             })
             .detach();
@@ -1509,6 +2523,30 @@ impl ChatPanel {
         }
     }
 
+    /// 让一个**已到期**的请求收口，无论它此刻是否正显示在窗口上。
+    ///
+    /// 截止时间属于**请求**，不属于窗口。标签被切走时对话框会被收起
+    /// （`extension_dialog_open` 清空），但 pi 那头仍在等一个响应；只按
+    /// 「窗口上正开着」判断，后台标签的超时请求就会永远悬着。
+    fn expire_extension_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self
+            .extension_ui
+            .active_dialog()
+            .map(|dialog| dialog.id.as_str())
+            != Some(id)
+        {
+            return;
+        }
+        // 只有确实是自己开着的那一个才请求关窗；别人的对话框不归这里管。
+        if self.extension_dialog_open.as_deref() == Some(id) {
+            self.extension_dialog_needs_close = true;
+            self.extension_dialog_open = None;
+        }
+        self.send_extension_response(pi_rpc::ExtensionUiResponse::cancelled(id), cx);
+        self.extension_ui.finish_dialog(id);
+        cx.notify();
+    }
+
     fn finish_extension_dialog(
         &mut self,
         id: &str,
@@ -1537,20 +2575,34 @@ impl ChatPanel {
         self.extension_dialog_needs_close |= self.extension_dialog_open.take().is_some();
     }
 
-    fn reset_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 结清**这个标签**欠 pi 的 Extension UI 债务。
+    ///
+    /// 只碰标签自己的状态。窗口级的那一半（对话框、焦点句柄、窗口标题）在
+    /// [`ChatPanel::reset_foreground_extension_ui`] 里，两者必须分开：关一个**后台**
+    /// 标签时若把窗口级状态一起清掉，前台正开着的对话框就会失去焦点句柄，
+    /// 从此既认不出它是最上层、也关不掉它——一个关不掉的模态浮在别的会话上，
+    /// 它那条请求也永远回不去。
+    fn reset_extension_ui_slot(&mut self, cx: &mut Context<Self>) {
         let cancelled = self.extension_ui.drain_cancelled_dialogs();
         for response in cancelled {
             self.send_extension_response(response, cx);
         }
-        if self.extension_dialog_open.take().is_some() {
+        self.extension_ui.reset();
+        self.extension_response_sender = None;
+    }
+
+    /// 前台标签的 Extension UI 收尾：标签自己的那份，加上窗口级的那份。
+    fn reset_foreground_extension_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_dialog = self.extension_dialog_open.take().is_some();
+        self.reset_extension_ui_slot(cx);
+        if had_dialog {
             self.request_extension_dialog_close(window, cx);
         } else {
             self.clear_extension_dialog_focus();
         }
-        self.extension_ui.reset();
-        self.extension_response_sender = None;
-        self.window_title = "GPUI-Pi".to_owned();
-        window.set_window_title("GPUI-Pi");
+        // `extension_ui` 刚被清空，标题自然回落到 "GPUI-Pi"；走同一个入口，
+        // 免得这里和别处对「窗口标题该是什么」各写一份。
+        self.apply_window_title(window);
     }
 
     fn apply_runtime_events(&mut self, events: Vec<SessionRuntimeEvent>) {
@@ -1617,7 +2669,7 @@ impl ChatPanel {
             ControlOutcome::Forked { data, controls } => {
                 self.apply_session_rebind(controls);
                 self.drafts.set(
-                    self.draft_key.clone().unwrap_or_default(),
+                    self.draft_slot_key(),
                     pi_data::ComposerDraft {
                         text: data.text,
                         images: Vec::new(),
@@ -1634,7 +2686,7 @@ impl ChatPanel {
             } => {
                 if let Some(data) = fork_data {
                     self.drafts.set(
-                        self.draft_key.clone().unwrap_or_default(),
+                        self.draft_slot_key(),
                         pi_data::ComposerDraft {
                             text: data.text,
                             images: Vec::new(),
@@ -1711,7 +2763,7 @@ impl ChatPanel {
     }
 
     fn set_model(&mut self, provider: String, model_id: String, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -1731,7 +2783,7 @@ impl ChatPanel {
     }
 
     fn can_cycle_model(&self) -> bool {
-        self.control_operation.is_none()
+        !self.control_busy()
             && self
                 .active
                 .as_ref()
@@ -1754,7 +2806,7 @@ impl ChatPanel {
     }
 
     fn set_thinking(&mut self, level: pi_rpc::ThinkingLevel, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -1774,10 +2826,24 @@ impl ChatPanel {
     }
 
     fn set_tool_preset(&mut self, preset: ToolPreset, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() || preset == self.tool_preset {
+        if self.control_busy() || preset == self.tool_preset {
             return;
         }
         let Some(active) = self.active.take() else {
+            // 没有 Runtime 时改预设必须同步到 Manager 的会话描述上：
+            // 恢复运行是拿**那份描述**去起进程的，只改 UI 就会出现
+            // 「界面写着 ReadOnly、进程却按挂起前那套更宽的工具起来」。
+            if let Some(session) = self.session
+                && let Err(error) = self
+                    .runtime_manager
+                    .set_session_tool_preset(session, preset)
+            {
+                self.rpc_success = None;
+                self.rpc_error_protected = true;
+                self.rpc_error = Some(format!("切换工具预设失败：{error}"));
+                cx.notify();
+                return;
+            }
             self.tool_preset = preset;
             self.rpc_success = None;
             self.rpc_error = None;
@@ -1820,7 +2886,7 @@ impl ChatPanel {
         request: ControlRequest,
         cx: &mut Context<Self>,
     ) {
-        if self.control_operation.is_some() {
+        if self.control_busy() {
             return;
         }
         let Some(active) = self.active.clone() else {
@@ -1920,9 +2986,12 @@ impl ChatPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.control_operation.is_some() || self.active.is_none() {
+        if self.control_busy() || self.active.is_none() {
             return;
         }
+        // 原生选择器可能开着好几秒。不钉住标签，用户切一下界面就会把**别人的**
+        // 活会话切到这里挑的文件上。
+        let tab_id = self.tab_id;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1938,27 +3007,55 @@ impl ChatPanel {
                 .and_then(|paths| paths.into_iter().next());
             let Some(path) = path else { return };
             let _ = panel.update(cx, |panel, cx| {
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-                {
-                    panel.begin_control(
-                        ControlOperation::SwitchSession,
-                        ControlRequest::SwitchSession { path },
-                        cx,
-                    );
-                } else {
-                    panel.rpc_success = None;
-                    panel.rpc_error = Some("只能切换到 .jsonl 会话文件".to_owned());
-                    cx.notify();
-                }
+                panel.apply_session_switch_choice(tab_id, path, cx);
             });
         })
         .detach();
     }
 
+    /// 把用户在原生选择器里挑中的会话文件应用到**发起这次切换的那个标签**。
+    ///
+    /// 单独成一个方法而不是写在续体里：这是选择器回来之后唯一会改状态的地方，
+    /// 拎出来才能在没有真实 `SessionHandle` 的测试里直接钉住「落在哪个标签」。
+    fn apply_session_switch_choice(&mut self, tab_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(index) = self.slot_index_for_tab(tab_id) else {
+            return;
+        };
+        // 不能切进另一个标签已经占着的会话文件：那会让**两个** pi 进程绑同一份
+        // JSONL，各自往里追加，落盘历史交错甚至写坏。这条路径绕开了侧栏选择时的
+        // `slot_index_for_key` 去重，必须自己查一次。
+        if let Some(owner) = self.session_file_owner(&path, index) {
+            self.project(index, |panel| {
+                panel.rpc_success = None;
+                panel.rpc_error_protected = true;
+                panel.rpc_error = Some(format!("该会话已在标签「{owner}」中打开，请直接切过去"));
+                cx.notify();
+            });
+            return;
+        }
+        self.project_tab(tab_id, |panel| {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                // 先立主张再发请求：切换落地前 `bound_session_file` 报的还是旧文件，
+                // 不登记目标，另一个标签同一时刻也能通过上面那道守卫切到同一份 JSONL。
+                panel.pending_switch_target = Some(path.clone());
+                panel.begin_control(
+                    ControlOperation::SwitchSession,
+                    ControlRequest::SwitchSession { path },
+                    cx,
+                );
+            } else {
+                panel.rpc_success = None;
+                panel.rpc_error = Some("只能切换到 .jsonl 会话文件".to_owned());
+                cx.notify();
+            }
+        });
+    }
+
     fn export_html(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.control_operation.is_some() || self.active.is_none() {
+        if self.control_busy() || self.active.is_none() {
             return;
         }
         let start = self
@@ -1971,6 +3068,8 @@ impl ChatPanel {
             .as_ref()
             .map(|controls| controls.session_id.clone())
             .unwrap_or_else(|| "session".to_owned());
+        // 同上：导出的必须是**发起导出的那个会话**，不是选完路径时正看着的那个。
+        let tab_id = self.tab_id;
         let receiver =
             cx.prompt_for_new_path(&start, Some(&format!("pi-session-{session_id}.html")));
         cx.spawn_in(window, async move |panel, cx| {
@@ -1979,13 +3078,15 @@ impl ChatPanel {
                 return;
             };
             let _ = panel.update(cx, |panel, cx| {
-                panel.begin_control(
-                    ControlOperation::ExportHtml,
-                    ControlRequest::ExportHtml {
-                        output_path: destination,
-                    },
-                    cx,
-                );
+                panel.project_tab(tab_id, |panel| {
+                    panel.begin_control(
+                        ControlOperation::ExportHtml,
+                        ControlRequest::ExportHtml {
+                            output_path: destination,
+                        },
+                        cx,
+                    );
+                });
             });
         })
         .detach();
@@ -1995,9 +3096,7 @@ impl ChatPanel {
         if self.pending_draft_restore {
             self.pending_draft_restore = false;
         }
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        self.save_current_draft(cx);
         let input = input.read(cx);
         self.refresh_popup_for_value(input.value().as_ref(), input.cursor());
         cx.notify();
@@ -2147,7 +3246,10 @@ impl ChatPanel {
             cx.notify();
             return;
         }
-        if self.control_operation.is_some() || self.compacting {
+        // 走 `control_busy` 而不是只看 `control_operation`：调度作业在飞时 `active`
+        // 还挂着、而且是 idle 的，这一发消息会打在一个正被拆掉的 Runtime 上，
+        // 既可能让 Park 失败，也可能和另一条控制请求叠在一起。
+        if self.control_busy() || self.compacting {
             self.rpc_error = Some("会话操作进行中，暂不能发送消息".to_owned());
             cx.notify();
             return;
@@ -2188,13 +3290,13 @@ impl ChatPanel {
         input.update(cx, |input, cx| input.set_value("", window, cx));
         self.attachments.clear();
         self.popup = None;
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.clear(&key);
-        }
+        self.drafts.clear(&self.draft_slot_key());
         cx.notify();
     }
 
     fn choose_images(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 原生选择器可能开着好几秒；附件该落在**点按钮时**那个标签上。
+        let tab_id = self.tab_id;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -2207,15 +3309,23 @@ impl ChatPanel {
             };
             let _ = cx.update(|_, cx| {
                 let _ = panel.update(cx, |panel, cx| {
-                    panel.start_attach_paths(paths, cx);
+                    panel.start_attach_paths(tab_id, paths, cx);
                 });
             });
         })
         .detach();
     }
 
-    fn start_attach_paths(&self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let generation = self.load_generation;
+    /// 读盘并把图片挂到**发起这次附件操作的那个标签**上。
+    ///
+    /// `tab_id` 由调用方在用户动作发生的那一刻捕获：拖拽是当时的前台标签，
+    /// 原生选择器则是点「添加图片」时的那个——选择器可能开着好几秒，
+    /// 期间用户完全可能切走。
+    fn start_attach_paths(&self, tab_id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(index) = self.slot_index_for_tab(tab_id) else {
+            return;
+        };
+        let generation = self.sessions[index].load_generation;
         let executor = cx.background_executor().clone();
         cx.spawn(async move |panel, cx| {
             let result = executor
@@ -2234,21 +3344,23 @@ impl ChatPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel, cx| {
-                if generation != panel.load_generation {
-                    return;
-                }
-                match result {
-                    Ok(images) => {
-                        if let Err(error) = panel.add_draft_images(images, cx) {
-                            panel.rpc_error = Some(error.to_string());
+                panel.project_tab(tab_id, |panel| {
+                    if generation != panel.load_generation {
+                        return;
+                    }
+                    match result {
+                        Ok(images) => {
+                            if let Err(error) = panel.add_draft_images(images, cx) {
+                                panel.rpc_error = Some(error.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            panel.rpc_success = None;
+                            panel.rpc_error = Some(error);
                         }
                     }
-                    Err(error) => {
-                        panel.rpc_success = None;
-                        panel.rpc_error = Some(error);
-                    }
-                }
-                cx.notify();
+                    cx.notify();
+                });
             });
         })
         .detach();
@@ -2262,9 +3374,7 @@ impl ChatPanel {
         pi_data::validate_image_batch(self.attachments.len(), &images)?;
         self.attachments
             .extend(images.into_iter().filter_map(attachment_from_draft));
-        if let Some(key) = self.draft_key.clone() {
-            self.drafts.set(key, self.current_draft(cx));
-        }
+        self.save_current_draft(cx);
         self.rpc_success = None;
         self.rpc_error = None;
         Ok(())
@@ -2304,9 +3414,7 @@ impl ChatPanel {
     fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.attachments.len() {
             self.attachments.remove(index);
-            if let Some(key) = self.draft_key.clone() {
-                self.drafts.set(key, self.current_draft(cx));
-            }
+            self.save_current_draft(cx);
             cx.notify();
         }
     }
@@ -2557,6 +3665,7 @@ impl ChatPanel {
 impl EventEmitter<PanelEvent> for ChatPanel {}
 impl EventEmitter<crate::main_panel::OpenFileRequest> for ChatPanel {}
 impl EventEmitter<SessionsChanged> for ChatPanel {}
+impl EventEmitter<FocusedSessionChanged> for ChatPanel {}
 
 impl Focusable for ChatPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -2592,6 +3701,9 @@ impl Panel for ChatPanel {
 
 impl Render for ChatPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 防御性重置：投影游标只该在 `project` 内部临时偏离，渲染永远看前台标签。
+        // 万一有哪条路径漏了还原，这一行让它在下一帧自愈，而不是把 A 的会话画成 B。
+        self.cursor = self.focused;
         #[cfg(test)]
         let probe = self.probe.clone();
         #[cfg(not(test))]
@@ -2718,13 +3830,31 @@ impl Render for ChatPanel {
         let running = matches!(phase, Some(LivePhase::Running));
         let stopping = matches!(phase, Some(LivePhase::Stopping));
         let live_started = self.active.is_some();
+        let select_tab_panel = cx.entity();
+        let close_tab_panel = cx.entity();
+        let tab_items = self.tab_items();
+        let show_session_tabs =
+            self.sessions.len() > 1 || self.sessions.iter().any(|slot| slot.session.is_some());
+        let session_state_note = self.session_state_note(cx);
+        // 会话已登记但没有进程时，主操作是「恢复运行」而不是「启动活会话」。
+        // 排队中的会话轮到就会**自动**启动：给它一个可点的「恢复运行」是在暗示
+        // 用户必须做点什么，而切到这个标签本身已经把它的优先级抬到前台了。
+        let session_registered = self.session.is_some();
+        let session_queued = self.scheduler_state == Some(pi_runtime::SchedulerState::Queued);
+        let (start_label, start_tooltip) = start_action_copy(session_queued, session_registered);
+        // 后台还有调度作业没落地、或上一次控制请求还没回来时，所有会碰进程的入口
+        // 一律不接受点击：重复点击会叠出第二次进程操作，而第一次的结果还没回来。
+        // 判据只有 [`SessionUiState::control_busy`] 这一个，按钮与 handler 共用。
+        let control_busy = self.control_busy();
+        let can_park = live_started
+            && !control_busy
+            && self
+                .active
+                .as_ref()
+                .is_some_and(SessionHandle::is_quiescent);
         if self.pending_draft_restore {
             let input = self.composer.clone();
-            let text = self
-                .draft_key
-                .as_deref()
-                .map(|key| self.drafts.get(key).text)
-                .unwrap_or_default();
+            let text = self.drafts.get(&self.draft_slot_key()).text;
             input.update(cx, |input, cx| input.set_value(text, window, cx));
             self.pending_draft_restore = false;
         }
@@ -2741,11 +3871,9 @@ impl Render for ChatPanel {
             // 错误反馈优先于较早的成功反馈，禁止绿红两条同时出现。
             self.rpc_success = None;
         }
-        let controls_enabled = session_controls_enabled(phase, self.control_operation.is_some());
-        let tools_enabled = !running
-            && !stopping
-            && self.control_operation.is_none()
-            && matches!(self.status, ChatStatus::Ready(_));
+        let controls_enabled = session_controls_enabled(phase, control_busy);
+        let tools_enabled =
+            !running && !stopping && !control_busy && matches!(self.status, ChatStatus::Ready(_));
         let current_model = self
             .controls
             .as_ref()
@@ -2927,7 +4055,8 @@ impl Render for ChatPanel {
             .capture_action(cx.listener(Self::capture_composer_paste))
             .on_key_down(cx.listener(Self::composer_key_down))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.start_attach_paths(paths.paths().to_vec(), cx);
+                let tab_id = this.tab_id;
+                this.start_attach_paths(tab_id, paths.paths().to_vec(), cx);
             }))
             .size_full()
             .min_w_0()
@@ -2937,7 +4066,44 @@ impl Render for ChatPanel {
                 v_flex()
                     .size_full()
                     .min_h_0()
+                    // 纯历史预览（一个标签、还没登记会话）不画标签条：那条横条不承载
+                    // 任何信息，却要占掉一行消息区。一旦有了活会话就必须画 —— 状态点是
+                    // 用户唯一能看到会话在不在跑的地方，关闭入口也只在标签上。
+                    .when(show_session_tabs, |view| {
+                        view.child(
+                            gpui_pi_ui::SessionTabs::new(tab_items, self.focused)
+                                .on_select(move |index, window, cx| {
+                                    select_tab_panel.update(cx, |panel, cx| {
+                                        panel.focus_tab(index, window, cx)
+                                    });
+                                })
+                                .on_close(move |index, window, cx| {
+                                    close_tab_panel.update(cx, |panel, cx| {
+                                        panel.close_tab(index, window, cx)
+                                    });
+                                }),
+                        )
+                    })
                     .child(div().flex_1().min_h_0().child(content))
+                    .when_some(session_state_note, |view, note| {
+                        view.child(
+                            h_flex()
+                                .debug_selector(|| "session-state-note".into())
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .child(div().size_2().flex_none().rounded_full().bg(note.dot))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(note.text),
+                                ),
+                        )
+                    })
                     .when(!self.tail_attached, |view| {
                         view.child(
                             h_flex().justify_center().child(
@@ -3003,9 +4169,7 @@ impl Render for ChatPanel {
                                         .ghost()
                                         .small()
                                         .label("取消重试")
-                                        .disabled(abort_retry_disabled(
-                                            self.control_operation.is_some(),
-                                        ))
+                                        .disabled(abort_retry_disabled(control_busy))
                                         .on_click(cx.listener(Self::abort_retry)),
                                 ),
                         )
@@ -3253,22 +4417,46 @@ impl Render for ChatPanel {
                                             )
                                             .on_click(cx.listener(Self::choose_images)),
                                     )
-                                    .child(
-                                        Button::new("start-live-session")
-                                            .ghost()
-                                            .small()
-                                            .label(if live_started {
-                                                "活会话已启动"
-                                            } else {
-                                                "启动活会话"
-                                            })
-                                            .disabled(
-                                                live_started
-                                                    || self.control_operation.is_some()
-                                                    || !matches!(self.status, ChatStatus::Ready(_)),
-                                            )
-                                            .on_click(cx.listener(Self::start_live)),
-                                    )
+                                    // 一个按钮承担「起 / 停」两个方向：会话没有进程时它是
+                                    // 启动入口，有进程时它是挂起入口。两个常驻按钮会让
+                                    // composer 操作行长期多一格，而其中一格永远是灰的。
+                                    .when(!live_started, |actions| {
+                                        actions.child(
+                                            Button::new("start-live-session")
+                                                .debug_selector(|| "start-live-session".into())
+                                                .ghost()
+                                                .small()
+                                                .label(start_label)
+                                                .tooltip(start_tooltip)
+                                                .disabled(
+                                                    session_queued
+                                                        || control_busy
+                                                        || !matches!(
+                                                            self.status,
+                                                            ChatStatus::Ready(_)
+                                                        ),
+                                                )
+                                                .on_click(cx.listener(Self::start_live)),
+                                        )
+                                    })
+                                    .when(live_started, |actions| {
+                                        actions.child(
+                                            Button::new("park-live-session")
+                                                .debug_selector(|| "park-live-session".into())
+                                                .ghost()
+                                                .small()
+                                                .label("挂起会话")
+                                                .tooltip(if can_park {
+                                                    "让出 pi 进程；会话与对话都保留，可随时恢复"
+                                                } else {
+                                                    // BACKLOG #22：不静止时挂起会退化成优雅停机，
+                                                    // 下次恢复要多付一次冷启动。这里如实说明。
+                                                    "会话正忙；等它空下来再挂起可省一次冷启动"
+                                                })
+                                                .disabled(!can_park)
+                                                .on_click(cx.listener(Self::park_active_session)),
+                                        )
+                                    })
                                     .child(
                                         Button::new("model-selector")
                                             .debug_selector(|| "model-selector".into())
@@ -3461,7 +4649,7 @@ impl Render for ChatPanel {
                                             .disabled(
                                                 !live_started
                                                     || stopping
-                                                    || self.control_operation.is_some()
+                                                    || control_busy
                                                     || self.branch_preview_leaf.is_some()
                                                     || self.compacting,
                                             )
@@ -3730,25 +4918,6 @@ fn migrate_draft_key(drafts: &mut pi_data::DraftStore, from: &str, to: &str) {
     drafts.clear(from);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionScopedReset {
-    load_generation: u64,
-}
-
-fn reset_session_scoped_state(
-    load_generation: u64,
-    file_index: &mut Option<pi_data::FileIndex>,
-    popup: &mut Option<ComposerPopup>,
-    popup_index: &mut usize,
-) -> SessionScopedReset {
-    *file_index = None;
-    *popup = None;
-    *popup_index = 0;
-    SessionScopedReset {
-        load_generation: load_generation.wrapping_add(1),
-    }
-}
-
 fn restart_session_path(
     controls: Option<&SessionControls>,
     history: &ConversationDocument,
@@ -3907,6 +5076,20 @@ mod tests {
         let path = dir.path().join("fixture.jsonl");
         std::fs::write(
             &path,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/fixture\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        Arc::new(pi_render::render_path(path).unwrap())
+    }
+
+    /// 落在**指定路径**上的历史 fixture。
+    ///
+    /// `document()` 用的是临时目录里的随机路径，钉不住「谁占着哪份 JSONL」。
+    fn document_at(path: &std::path::Path, message: &str) -> Arc<ConversationDocument> {
+        std::fs::write(
+            path,
             format!(
                 "{{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/fixture\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}}}}\n"
             ),
@@ -4282,6 +5465,31 @@ mod tests {
 
     fn render_status(cx: &mut TestAppContext, status: ChatStatus) -> VisualTestContext {
         render_status_with_panel(cx, status).0
+    }
+
+    fn fixture_controls(session_id: &str) -> SessionControls {
+        fixture_controls_with_file(session_id, None)
+    }
+
+    fn fixture_controls_with_file(
+        session_id: &str,
+        session_file: Option<PathBuf>,
+    ) -> SessionControls {
+        SessionControls {
+            model: None,
+            thinking_level: pi_rpc::ThinkingLevel::Off,
+            models: Vec::new(),
+            thinking_levels: Vec::new(),
+            session_file,
+            session_id: session_id.to_owned(),
+            tree: pi_rpc::TreeData {
+                tree: Vec::new(),
+                leaf_id: None,
+            },
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+            is_compacting: false,
+        }
     }
 
     fn fixture_model(id: &str, name: &str, provider: &str) -> pi_rpc::Model {
@@ -4801,7 +6009,9 @@ mod tests {
             body_focus.contains_focused(window, cx) || body_focus.within_focused(window, cx)
         }));
         visual.update(|window, cx| {
-            panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+            panel.update(cx, |panel, cx| {
+                panel.reset_foreground_extension_ui(window, cx)
+            });
         });
         draw_frames(&mut visual, 3);
         assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
@@ -4831,7 +6041,9 @@ mod tests {
                 footer_focus.contains_focused(window, cx) || footer_focus.within_focused(window, cx)
             }));
             visual.update(|window, cx| {
-                panel.update(cx, |panel, cx| panel.reset_extension_ui(window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.reset_foreground_extension_ui(window, cx)
+                });
             });
             draw_frames(&mut visual, 3);
             assert!(!visual.update(|window, cx| window.has_active_dialog(cx)));
@@ -5391,6 +6603,971 @@ mod tests {
         });
     }
 
+    fn fixture_selection(id: &str, title: &str, cwd: &std::path::Path) -> SessionSelected {
+        SessionSelected {
+            id: id.to_owned(),
+            path: cwd.join(format!("{id}.jsonl")),
+            cwd: cwd.to_path_buf(),
+            title: title.to_owned(),
+        }
+    }
+
+    /// 给一个标签登记一个**只登记不启动**的会话。
+    ///
+    /// `create_session` 是纯内存操作（R23 验收：登记 20 个会话零进程），因此这里可以在
+    /// 没有 pi 二进制的测试环境里得到真实的调度器状态，而不是编一个假状态糊弄断言。
+    fn register_parked_session(panel: &mut ChatPanel, index: usize, cwd: &std::path::Path) {
+        let session = panel.runtime_manager.create_session(
+            pi_runtime::SessionDescriptor {
+                binary: PathBuf::from("pi-not-launched"),
+                cwd: cwd.to_path_buf(),
+                session_path: Some(cwd.join("registered.jsonl")),
+                tool_preset: ToolPreset::Inherit,
+                agent_dir: None,
+            },
+            (*document("registered")).clone(),
+        );
+        panel.sessions[index].session = Some(session);
+        panel.sync_scheduler_states();
+    }
+
+    /// T2：`SessionUiState` 按标签多实例隔离 —— 草稿、展开集合、滚动跟随、横幅与
+    /// 补全面板各归各的，切走再切回原样恢复。
+    #[gpui::test]
+    fn session_tabs_isolate_draft_expansion_and_scroll_state(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("session-one".into());
+                panel.tab_title = "一号".into();
+                panel.expanded_tools.insert("tool-a".into());
+                panel.tail_attached = false;
+                panel.rpc_error = Some("一号的错误".into());
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("一号草稿", window, cx);
+                });
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                assert_eq!(second, 1);
+                assert_eq!(panel.focused, 1);
+                // 新标签是干净的：不继承上一个标签的任何会话态。
+                assert!(panel.expanded_tools.is_empty());
+                assert!(panel.rpc_error.is_none());
+                assert!(panel.tail_attached);
+                assert!(panel.file_index.is_none());
+                assert!(panel.popup.is_none());
+                assert_eq!(panel.composer.read(cx).value().as_ref(), "");
+
+                panel.draft_key = Some("session-two".into());
+                panel.expanded_tools.insert("tool-b".into());
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("二号草稿", window, cx);
+                });
+
+                // 切回一号：它自己的展开集合、横幅、跟随状态都还在。
+                panel.focus_tab(0, window, cx);
+                assert_eq!(panel.focused, 0);
+                assert!(panel.expanded_tools.contains("tool-a"));
+                assert!(!panel.expanded_tools.contains("tool-b"));
+                assert_eq!(panel.rpc_error.as_deref(), Some("一号的错误"));
+                assert!(!panel.tail_attached);
+                assert_eq!(panel.drafts.get("session-one").text, "一号草稿");
+                assert_eq!(panel.drafts.get("session-two").text, "二号草稿");
+            });
+        });
+        // 草稿回填发生在渲染时（`pending_draft_restore`），画一帧再断言输入框。
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.composer.read(cx).value().as_ref(), "一号草稿");
+        });
+    }
+
+    /// T2：切换标签只动 UI 绑定 —— 不注销、不停止任何会话。
+    #[gpui::test]
+    fn focusing_another_tab_never_unregisters_a_background_session(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("背景")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("background".into());
+                register_parked_session(panel, 0, workspace.path());
+                let background = panel.sessions[0].session.expect("已登记");
+
+                panel
+                    .open_tab("前台".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.focus_tab(0, window, cx);
+                panel.focus_tab(1, window, cx);
+
+                assert_eq!(
+                    panel.runtime_manager.session_state(background),
+                    Some(pi_runtime::SchedulerState::Parked),
+                    "切换标签不得注销后台会话"
+                );
+                assert_eq!(panel.sessions[0].session, Some(background));
+                // 登记不占进程，这条顺带守住「切换本身不会拉起 pi」。
+                assert_eq!(panel.runtime_manager.scheduler_report().resident_pi, 0);
+            });
+        });
+    }
+
+    /// T2：关标签才注销会话；关掉最后一个标签是重置而不是删除。
+    ///
+    /// 同时钉住 R24 崩溃整改后的契约：**标签立刻从条上消失，进程回收在后台**。
+    /// `remove_session` 要等优雅停机、随后的 `tick()` 还可能就地拉起一个排队会话，
+    /// 这两件事都不能占着 GPUI 主线程。
+    #[gpui::test]
+    fn closing_a_tab_unregisters_its_session_and_never_empties_the_strip(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        let second = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                register_parked_session(panel, 1, workspace.path());
+                let second = panel.sessions[1].session.expect("已登记");
+
+                panel.close_tab(1, window, cx);
+                // UI 是即时的：标签当场没了，不等后台把进程收干净。
+                assert_eq!(panel.sessions.len(), 1);
+                assert_eq!(panel.focused, 0);
+                second
+            })
+        });
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.runtime_manager.session_state(second),
+                None,
+                "后台回收落地后，会话必须已从调度器注销"
+            );
+        });
+
+        let only_tab = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let only_tab = panel.tab_id;
+                panel.close_tab(0, window, cx);
+                assert_eq!(panel.sessions.len(), 1, "标签条永远不为空");
+                assert_ne!(panel.tab_id, only_tab, "最后一个标签是被重置，不是被复用");
+                assert!(matches!(panel.status, ChatStatus::Empty));
+                assert!(panel.draft_key.is_none());
+                only_tab
+            })
+        });
+        assert_ne!(only_tab, u64::MAX);
+    }
+
+    /// R24 视觉验收暴露的崩溃的回归用例：挂起**绝不能**在 GPUI 主线程上做。
+    ///
+    /// `RuntimeManager::park` 会等作业排空、拆 Actor、可能关进程，收尾还会 `tick()`
+    /// 一次把排队会话就地提升上来（见 `pi-runtime` 的
+    /// `park_finishes_a_queued_handoff_on_the_calling_thread`）。这一整套一旦占住主线程，
+    /// 就是整窗口卡死一次进程交接——用户实测「2 活跃 + 1 排队时点挂起程序崩溃退出」。
+    /// 这里钉的是结构：点击**同步返回**，只立起 busy 标记，真正的操作落在后台。
+    #[gpui::test]
+    fn parking_hands_the_process_work_to_a_background_task(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                register_parked_session(panel, 0, workspace.path());
+
+                panel.park_focused_session(window, cx);
+                assert_eq!(
+                    panel.scheduler_job,
+                    Some("挂起中…"),
+                    "点击必须立刻返回并立起 busy 标记"
+                );
+                // 重复点击被挡住：第一次的结果还没回来，再叠一次进程操作只会更糟。
+                panel.park_focused_session(window, cx);
+                assert_eq!(panel.scheduler_job, Some("挂起中…"));
+            });
+        });
+        // busy 期间界面照常有话说，且说的是「正在办」而不是旧状态。
+        let note = panel.update(cx, |panel, cx| {
+            panel
+                .session_state_note(cx)
+                .map(|note| note.text)
+                .expect("busy 期间必须有说明")
+        });
+        assert_eq!(note, "挂起中…");
+
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.scheduler_job.is_none(),
+                "后台落地后必须清掉 busy 标记"
+            );
+        });
+    }
+
+    /// T2：同一个历史会话不会被开成两个标签，重复选中直接切过去。
+    #[gpui::test]
+    fn selecting_an_open_session_focuses_its_tab_instead_of_reloading(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let first = fixture_selection("alpha", "Alpha", workspace.path());
+                panel
+                    .load_selection(first.clone(), window, cx)
+                    .expect("首个标签");
+                assert_eq!(panel.sessions.len(), 1, "干净标签被原地复用");
+                assert_eq!(panel.draft_key.as_deref(), Some("alpha"));
+
+                panel
+                    .load_selection(
+                        fixture_selection("beta", "Beta", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("第二个标签");
+                assert_eq!(panel.sessions.len(), 2);
+                assert_eq!(panel.focused, 1);
+
+                panel.load_selection(first, window, cx).expect("切回第一个");
+                assert_eq!(panel.sessions.len(), 2, "重复选中不得再开一个标签");
+                assert_eq!(panel.focused, 0);
+            });
+        });
+    }
+
+    /// T2：标签数有界，到顶时明确失败且不动已有标签。
+    #[gpui::test]
+    fn the_tab_strip_is_bounded_and_refuses_instead_of_evicting(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                for index in 1..MAX_SESSION_TABS {
+                    let opened = panel
+                        .open_tab(format!("标签 {index}"), window, cx)
+                        .expect("上限之内");
+                    assert_eq!(opened, index);
+                    panel.draft_key = Some(format!("key-{index}"));
+                }
+                assert_eq!(panel.sessions.len(), MAX_SESSION_TABS);
+                let refused = panel
+                    .open_tab("溢出".to_owned(), window, cx)
+                    .expect_err("超出上限必须失败");
+                assert!(refused.contains(&MAX_SESSION_TABS.to_string()), "{refused}");
+                assert_eq!(panel.sessions.len(), MAX_SESSION_TABS, "失败不得动已有标签");
+                assert_eq!(panel.focused, MAX_SESSION_TABS - 1);
+
+                // 第四轮独立审查 P2：失败必须交回调用方。工作区会跟着这次选择去搬
+                // 文件树和工具栏标题，只在自己身上留一条错误的话，界面就会
+                // 「聊天还在旧会话、工作区已经指向被拒绝的那个」。
+                let overflow = panel.load_selection(
+                    fixture_selection("overflow", "溢出会话", std::path::Path::new("C:/fixture")),
+                    window,
+                    cx,
+                );
+                assert!(overflow.is_err(), "标签已满时选择必须返回 Err");
+                assert_eq!(panel.sessions.len(), MAX_SESSION_TABS);
+            });
+        });
+    }
+
+    /// T2：调度状态由调度器给出，四态各有自己的标签形态与说明。
+    #[gpui::test]
+    fn scheduler_states_drive_the_tab_dot_and_the_state_note(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("状态")));
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                // 还没登记会话：是「历史」，不是「已挂起」。
+                assert_eq!(
+                    tab_state_of(&panel.sessions[0]),
+                    gpui_pi_ui::SessionTabState::History
+                );
+                assert!(panel.session_state_note(cx).is_none());
+
+                register_parked_session(panel, 0, workspace.path());
+                assert_eq!(
+                    tab_state_of(&panel.sessions[0]),
+                    gpui_pi_ui::SessionTabState::Parked
+                );
+                let parked = panel.session_state_note(cx).expect("挂起要有说明");
+                assert!(parked.text.contains("已挂起"), "{}", parked.text);
+
+                for (state, expected) in [
+                    (
+                        pi_runtime::SchedulerState::Running,
+                        gpui_pi_ui::SessionTabState::Running,
+                    ),
+                    (
+                        pi_runtime::SchedulerState::Queued,
+                        gpui_pi_ui::SessionTabState::Queued,
+                    ),
+                    (
+                        pi_runtime::SchedulerState::Starting,
+                        gpui_pi_ui::SessionTabState::Starting,
+                    ),
+                    (
+                        pi_runtime::SchedulerState::Stopping,
+                        gpui_pi_ui::SessionTabState::Stopping,
+                    ),
+                    (
+                        pi_runtime::SchedulerState::Failed,
+                        gpui_pi_ui::SessionTabState::Failed,
+                    ),
+                ] {
+                    panel.sessions[0].scheduler_state = Some(state);
+                    assert_eq!(tab_state_of(&panel.sessions[0]), expected);
+                }
+
+                // 运行中与两个短暂中间态不出横幅；排队与失败必须出，且失败要带原因。
+                for quiet in [
+                    pi_runtime::SchedulerState::Running,
+                    pi_runtime::SchedulerState::Starting,
+                    pi_runtime::SchedulerState::Stopping,
+                ] {
+                    panel.sessions[0].scheduler_state = Some(quiet);
+                    assert!(panel.session_state_note(cx).is_none(), "{quiet:?}");
+                }
+                panel.sessions[0].scheduler_state = Some(pi_runtime::SchedulerState::Queued);
+                assert!(
+                    panel
+                        .session_state_note(cx)
+                        .expect("排队要有说明")
+                        .text
+                        .contains("排队中")
+                );
+                panel.sessions[0].scheduler_state = Some(pi_runtime::SchedulerState::Failed);
+                panel.sessions[0].scheduler_failure = Some("pi 启动失败".into());
+                assert!(
+                    panel
+                        .session_state_note(cx)
+                        .expect("失败要有说明")
+                        .text
+                        .contains("pi 启动失败")
+                );
+            });
+        });
+    }
+
+    /// T3：纯历史预览不画标签条；一旦有第二个标签（或有活会话）就出现，并带状态点。
+    #[gpui::test]
+    fn the_tab_strip_appears_only_once_a_second_session_is_open(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        assert!(
+            visual.debug_bounds("session-tabs").is_none(),
+            "单会话不该长出一条只有一个标签的横条"
+        );
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+            });
+        });
+        draw_frames(&mut visual, 4);
+        let strip = visual.debug_bounds("session-tabs").expect("标签条应出现");
+        assert!(strip.size.width > gpui::px(0.));
+        assert!(
+            visual.debug_bounds("session-tab-state-dot").is_some(),
+            "每个标签都要有状态点"
+        );
+        assert!(visual.debug_bounds("close-session-tab").is_some());
+    }
+
+    /// 单个标签一旦登记了会话也要画标签条：状态点是用户唯一能看到会话在不在跑的地方，
+    /// 关闭入口也只在标签上——不画就等于把一个活着的 pi 进程藏起来。
+    #[gpui::test]
+    fn a_single_live_session_still_gets_a_tab_so_it_can_be_seen_and_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("独苗")));
+        assert!(visual.debug_bounds("session-tabs").is_none());
+        panel.update(cx, |panel, _| {
+            register_parked_session(panel, 0, workspace.path());
+        });
+        draw_frames(&mut visual, 4);
+        assert!(visual.debug_bounds("session-tabs").is_some());
+        assert!(visual.debug_bounds("close-session-tab").is_some());
+    }
+
+    /// 后台事件泵靠投影游标写进**自己那一槽**；写完必须还原，前台标签不受污染。
+    #[gpui::test]
+    fn projecting_into_a_background_tab_never_touches_the_foreground_one(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("前台")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("front".into());
+                panel
+                    .open_tab("后台".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("back".into());
+                panel.focus_tab(0, window, cx);
+
+                panel.project(1, |panel| {
+                    panel.rpc_error = Some("后台会话的错误".into());
+                    panel.compacting = true;
+                });
+                assert_eq!(panel.cursor, panel.focused, "投影结束必须还原游标");
+                assert!(panel.rpc_error.is_none(), "后台错误不得渗到前台标签");
+                assert!(!panel.compacting);
+                assert_eq!(
+                    panel.sessions[1].rpc_error.as_deref(),
+                    Some("后台会话的错误")
+                );
+                assert!(panel.sessions[1].compacting);
+            });
+        });
+    }
+
+    /// 独立代码审查 P1：跨 await 点的续体必须钉回发起它的标签。
+    ///
+    /// 附件读盘期间用户切走标签是完全正常的操作；不钉标签的话，图片要么挂到别人身上，
+    /// 要么因为对错了 `load_generation` 被静默丢弃。
+    #[gpui::test]
+    fn an_attachment_started_on_one_tab_never_lands_on_another(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let png = workspace.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nattach-fixture").expect("write png");
+
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                let origin = panel.tab_id;
+                panel.start_attach_paths(origin, vec![png.clone()], cx);
+                // 读盘还没回来就切走——这正是不钉标签会出错的那一刻。
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+            });
+        });
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.focused, 1);
+            assert_eq!(
+                panel.sessions[0].attachments.len(),
+                1,
+                "附件必须落回发起它的标签"
+            );
+            assert!(
+                panel.sessions[1].attachments.is_empty(),
+                "切过去的标签不得凭空多出一张图"
+            );
+            assert!(panel.sessions[1].rpc_error.is_none());
+        });
+    }
+
+    /// 独立代码审查 P1：Extension UI 超时定时器也必须钉回开出它的标签。
+    ///
+    /// 不钉住的话，定时器会去检查前台标签的队列——id 撞上就取消了别人的请求，
+    /// 撞不上则这条超时被静默吞掉，pi 那头永远等不到响应。
+    #[gpui::test]
+    fn an_extension_dialog_timeout_only_cancels_its_own_tabs_request(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        // 超时给得足够长，好让「打开对话框 → 切走标签 → 定时器到点」这三步的先后
+        // 由测试说了算，而不是靠抢时间。
+        panel.update(cx, |panel, cx| {
+            panel.draft_key = Some("one".into());
+            panel.extension_ui.apply(
+                "shared-id".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "一号的确认".into(),
+                    message: "Continue?".into(),
+                    timeout: Some(5_000),
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.extension_dialog_open.as_deref(),
+                Some("shared-id"),
+                "对话框要先真的打开，定时器才会被装上"
+            );
+        });
+
+        // 切到第二个标签，并让它挂上一条**同名**的待处理请求。
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                panel.extension_ui.apply(
+                    "shared-id".into(),
+                    pi_rpc::ExtensionUiRequest::Confirm {
+                        title: "二号的确认".into(),
+                        message: "Continue?".into(),
+                        timeout: None,
+                    },
+                );
+                cx.notify();
+            });
+        });
+        draw_frames(&mut visual, 3);
+
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(6_000));
+        visual.run_until_parked();
+        draw_frames(&mut visual, 3);
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.focused, 1);
+            // 一号的请求超时后被取消，诊断也留在一号。
+            assert!(
+                panel.sessions[0].extension_ui.active_dialog().is_none(),
+                "发起标签的请求应已超时取消"
+            );
+            assert!(
+                panel.sessions[0]
+                    .rpc_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("超时")),
+                "超时诊断必须留在发起标签：{:?}",
+                panel.sessions[0].rpc_error
+            );
+            // 二号的同名请求毫发无伤。
+            let survivor = panel.sessions[1]
+                .extension_ui
+                .active_dialog()
+                .expect("另一个标签的同名请求不得被别人的超时取消");
+            assert_eq!(survivor.id, "shared-id");
+            assert!(
+                matches!(
+                    &survivor.request,
+                    pi_rpc::ExtensionUiRequest::Confirm { title, .. } if title == "二号的确认"
+                ),
+                "留下的必须是二号自己那条请求"
+            );
+            assert!(panel.sessions[1].rpc_error.is_none());
+        });
+    }
+
+    /// 独立代码审查 P1 的同类路径：原生选择器回来后，结果必须落在**发起它的标签**。
+    ///
+    /// 选择器可能开着好几秒。不钉住的话，用户切一下界面就会把别人的活会话切到这里
+    /// 挑的文件上——比附件挂错标签严重得多。
+    #[gpui::test]
+    fn a_session_switch_choice_lands_on_the_tab_that_opened_the_picker(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                let origin = panel.tab_id;
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                assert_eq!(panel.focused, 1);
+
+                // 选择器是在一号上打开的，尽管此刻前台是二号。
+                panel.apply_session_switch_choice(origin, PathBuf::from("note.txt"), cx);
+                assert_eq!(
+                    panel.sessions[0].rpc_error.as_deref(),
+                    Some("只能切换到 .jsonl 会话文件"),
+                    "结果必须回到发起选择器的标签"
+                );
+                assert!(
+                    panel.sessions[1].rpc_error.is_none(),
+                    "前台标签不得替别人背这条错误"
+                );
+
+                // 标签已经关掉时整段跳过，不找替身写进去。
+                panel.close_tab(0, window, cx);
+                panel.apply_session_switch_choice(origin, PathBuf::from("note.txt"), cx);
+                assert!(panel.sessions.iter().all(|slot| slot.rpc_error.is_none()));
+            });
+        });
+    }
+
+    /// 视觉审查 V-3：排队中的会话不该给一个「恢复运行」按钮。
+    #[test]
+    fn a_queued_session_shows_that_it_will_start_by_itself() {
+        assert_eq!(start_action_copy(false, false).0, "启动活会话");
+        assert_eq!(start_action_copy(false, true).0, "恢复运行");
+        // 排队优先于「已登记」：这一格按钮此刻没有任何可执行的动作。
+        assert_eq!(start_action_copy(true, true).0, "排队中…");
+        assert!(start_action_copy(true, true).1.contains("自动启动"));
+    }
+
+    /// 视觉审查 V-6：挂起过程中不该闪一条红色「加载会话控制失败」。
+    ///
+    /// Park 会把在执行的元数据请求连同 client 一起抽走，那几条必然超时；用户刚点了
+    /// 「挂起」，这正是他要的结果。实测在 2 活跃 + 1 排队场景下能看到
+    /// 「加载会话控制失败：request req_5 timed out」一闪而过。
+    #[gpui::test]
+    fn teardown_metadata_failures_are_not_reported_as_errors(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        let controls_error = |sequence: u64| pi_runtime::RuntimeEffect {
+            sequence,
+            epoch: 0,
+            kind: pi_runtime::RuntimeEffectKind::ControlsLoaded(Err(
+                "request req_5 timed out".to_owned()
+            )),
+        };
+        let commands_error = |sequence: u64| pi_runtime::RuntimeEffect {
+            sequence,
+            epoch: 0,
+            kind: pi_runtime::RuntimeEffectKind::CommandsLoaded(Err(
+                "request req_2 timed out".to_owned()
+            )),
+        };
+
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                // 正在挂起：两条元数据失败都不该出横幅。
+                panel.scheduler_job = Some("挂起中…");
+                panel.apply_runtime_effect(controls_error(1), cx);
+                panel.apply_runtime_effect(commands_error(2), cx);
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+
+                // 挂起落地、已经没有 Runtime 了：迟到的失败同样不该出横幅，
+                // 它已经无法据以行动。
+                panel.scheduler_job = None;
+                assert!(panel.active.is_none());
+                panel.apply_runtime_effect(controls_error(3), cx);
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+            });
+        });
+    }
+
+    /// 第十轮独立审查 P1：不许把一个标签切进另一个标签已经占着的会话文件。
+    ///
+    /// 那会让两个 pi 进程绑同一份 JSONL，各自往里追加，落盘历史交错甚至写坏。
+    /// 「切换会话」走的是原生选择器，绕开了侧栏选择时的去重，必须自己查一次。
+    #[gpui::test]
+    fn switching_into_a_session_another_tab_owns_is_refused(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        std::fs::write(&owned, "").expect("write session file");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 一号已经登记了会话，并且绑在 owned.jsonl 上。
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(owned.clone())));
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                let second_tab = panel.sessions[second].tab_id;
+
+                // 二号试图切到一号占着的那份文件：必须被拒，且不得开始任何控制操作。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("一号")),
+                    "拒绝理由要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none(), "被拒时不得发起控制操作");
+                assert!(
+                    panel.sessions[0].rpc_error.is_none(),
+                    "错误只属于发起切换的标签"
+                );
+            });
+        });
+    }
+
+    /// 第九轮独立审查 P2：关一个后台标签不得动前台标签的对话框。
+    ///
+    /// 焦点句柄是**窗口级**的（只有前台标签会开对话框）。关后台标签时如果把它们
+    /// 一起清掉，前台那个对话框就再也认不出自己是最上层，于是既关不掉、
+    /// 它那条请求也回不去——一个关不掉的模态浮在别的会话上。
+    #[gpui::test]
+    fn closing_a_background_tab_leaves_the_foreground_dialog_alone(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        // 前台标签开一个 Extension UI 对话框。
+        panel.update(cx, |panel, cx| {
+            panel.draft_key = Some("one".into());
+            panel.extension_ui.apply(
+                "dlg".into(),
+                pi_rpc::ExtensionUiRequest::Confirm {
+                    title: "确认".into(),
+                    message: "Continue?".into(),
+                    timeout: None,
+                },
+            );
+            cx.notify();
+        });
+        draw_frames(&mut visual, 3);
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.extension_dialog_open.as_deref(), Some("dlg"));
+            assert!(panel.extension_dialog_body_focus.is_some());
+        });
+
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 开第二个标签再切回前台，然后关掉那个后台标签。
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                panel.draft_key = Some("two".into());
+                panel.focus_tab(0, window, cx);
+                assert_eq!(panel.focused, 0);
+
+                panel.close_tab(1, window, cx);
+                assert_eq!(panel.sessions.len(), 1);
+                assert!(
+                    panel.extension_dialog_body_focus.is_some(),
+                    "关后台标签不得清掉前台对话框的焦点句柄"
+                );
+                assert_eq!(
+                    panel.extension_dialog_open.as_deref(),
+                    Some("dlg"),
+                    "前台对话框应原样开着"
+                );
+                assert_eq!(
+                    panel
+                        .extension_ui
+                        .active_dialog()
+                        .map(|dialog| dialog.id.as_str()),
+                    Some("dlg"),
+                    "前台标签的请求不该被别人的关闭流程清掉"
+                );
+            });
+        });
+    }
+
+    /// 第八轮独立审查 P3：fresh 会话在校准之前不得对外暴露编造的会话身份。
+    ///
+    /// `draft_key` 是对外的 pi 会话身份（标签去重认它、工作区 tooltip 显示它）。
+    /// 从前 fresh 会话会先塞一个 `fresh-{tab}-{generation}`，那个编出来的值会以
+    /// 「真实身份」的名义漏到界面上，直到 `ControlsLoaded` 才被换掉。
+    #[gpui::test]
+    fn a_fresh_session_publishes_no_identity_until_it_is_calibrated(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.fresh_session = true;
+                panel.draft_key = None;
+                // 校准之前：没有身份可广播，草稿仍然有地方存。
+                assert!(panel.draft_key.is_none());
+                let slot = panel.draft_slot_key();
+                assert!(slot.starts_with("tab-"), "{slot}");
+                panel.drafts.set(
+                    slot.clone(),
+                    pi_data::ComposerDraft {
+                        text: "开会话前先写了半句".into(),
+                        images: Vec::new(),
+                    },
+                );
+
+                // 校准：拿到真实 session id，草稿一并迁过去。
+                panel.apply_runtime_effect(
+                    pi_runtime::RuntimeEffect {
+                        sequence: 1,
+                        epoch: 0,
+                        kind: pi_runtime::RuntimeEffectKind::ControlsLoaded(Ok(fixture_controls(
+                            "real-session-id",
+                        ))),
+                    },
+                    cx,
+                );
+                assert_eq!(panel.draft_key.as_deref(), Some("real-session-id"));
+                assert_eq!(
+                    panel.drafts.get("real-session-id").text,
+                    "开会话前先写了半句",
+                    "校准时草稿要跟着迁到真实身份下"
+                );
+                assert!(
+                    panel.drafts.get(&slot).text.is_empty(),
+                    "临时键迁移后应清空"
+                );
+            });
+        });
+    }
+
+    /// 第七轮独立审查 P2：复用空白标签时，槽里的瞬时状态必须一并清掉。
+    ///
+    /// 往空标签里拖一张非法图片：附件没加上，`rpc_error` 却留下了，而这仍然满足
+    /// 「用户没往里放过东西」。只改标题就复用，那条不相干的红色横幅会跟进新会话。
+    #[gpui::test]
+    fn reusing_the_pristine_tab_drops_its_leftover_error(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 用户偏好先设好，重建不该把它抹掉。
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                panel.minimap_visible = false;
+
+                // 一次失败的拖入：只留下错误，没有附件。
+                panel.rpc_error = Some("无法识别的图片格式".to_owned());
+                panel.rpc_error_protected = true;
+                assert!(
+                    panel.is_focused_tab_pristine(),
+                    "只留了个错误横幅，仍然算没往里放过东西"
+                );
+
+                let index = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("复用空白标签");
+                assert_eq!(index, 0, "干净标签仍然原地复用");
+                assert!(
+                    panel.rpc_error.is_none(),
+                    "上一段的错误不得跟进新会话：{:?}",
+                    panel.rpc_error
+                );
+                assert!(!panel.rpc_error_protected);
+                assert_eq!(panel.tab_title, "新会话");
+                // 偏好留下。
+                assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
+                assert!(!panel.minimap_visible);
+            });
+        });
+    }
+
+    /// 第六轮独立审查 P2：重开一个已打开的会话要带上最新标题；关掉匿名标签要清草稿。
+    #[gpui::test]
+    fn reopening_a_renamed_session_updates_its_tab_and_closing_frees_its_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .load_selection(
+                        fixture_selection("alpha", "旧名字", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("首次打开");
+                assert_eq!(panel.tab_title, "旧名字");
+
+                // 侧栏改名之后再点同一行：标签标题必须跟着改，而不是停在旧名字。
+                panel
+                    .load_selection(
+                        fixture_selection("alpha", "新名字", workspace.path()),
+                        window,
+                        cx,
+                    )
+                    .expect("重开同一个会话");
+                assert_eq!(panel.sessions.len(), 1, "同一个会话不该开成两个标签");
+                assert_eq!(panel.tab_title, "新名字");
+            });
+        });
+
+        // 匿名标签（没有会话身份）关掉之后，它的草稿键再也取不到，必须清掉。
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                let opened = panel
+                    .open_tab("草稿标签".to_owned(), window, cx)
+                    .expect("再开一个匿名标签");
+                let orphan = panel.sessions[opened].draft_slot_key();
+                assert!(panel.sessions[opened].draft_key.is_none());
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("会被丢掉的草稿", window, cx);
+                });
+                panel.save_current_draft(cx);
+                assert!(!panel.drafts.get(&orphan).text.is_empty());
+
+                panel.close_tab(opened, window, cx);
+                assert!(
+                    panel.drafts.get(&orphan).text.is_empty(),
+                    "匿名标签关掉后，它那份取不回来的草稿必须一起清掉"
+                );
+            });
+        });
+    }
+
+    /// 第五轮独立审查 P2：留在空标签上的草稿文字不能丢。
+    ///
+    /// 空标签没有 `draft_key`（那是 pi 会话身份），从前草稿就无处可存：
+    /// 写了字 → 去开别的标签 → 切回来，字没了。现在每个标签从诞生起就有草稿落点。
+    #[gpui::test]
+    fn text_typed_on_an_empty_tab_survives_a_detour_to_another_tab(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                assert!(panel.draft_key.is_none(), "空标签没有会话身份");
+                panel.composer.update(cx, |input, cx| {
+                    input.set_value("还没想好发给谁的一段话", window, cx);
+                });
+                // 写过字就不算没用过：这个标签不该被当成空白复用。
+                panel.save_current_draft(cx);
+                assert!(!panel.is_focused_tab_pristine());
+
+                panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("另开一个标签");
+                assert_eq!(panel.sessions.len(), 2);
+                assert_eq!(panel.composer.read(cx).value().as_ref(), "");
+
+                panel.focus_tab(0, window, cx);
+            });
+        });
+        // 草稿回填发生在渲染时（`pending_draft_restore`）。
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.composer.read(cx).value().as_ref(),
+                "还没想好发给谁的一段话",
+                "切走再切回来，空标签上的字必须还在"
+            );
+        });
+    }
+
+    /// 第二轮独立审查 P2：空标签上挂着的附件不能被静默带进新会话。
+    ///
+    /// 这类附件没有 `draft_key` 可存，复用这个标签就等于把一张无关的图带进新会话；
+    /// 反过来，直接清掉又是在丢用户已经做过的操作。判成「不干净」另开一个标签，两头都不亏。
+    #[gpui::test]
+    fn an_attachment_on_the_empty_tab_keeps_it_from_being_reused(cx: &mut TestAppContext) {
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 干净的空标签会被原地复用，不长出第二个标签。
+                assert!(panel.is_focused_tab_pristine());
+
+                let draft = pi_data::image_from_bytes(b"\x89PNG\r\n\x1a\ncarry".to_vec())
+                    .expect("fixture png");
+                panel
+                    .add_draft_images(vec![draft], cx)
+                    .expect("挂一张图到空标签上");
+                assert_eq!(panel.attachments.len(), 1);
+                assert!(!panel.is_focused_tab_pristine(), "挂了附件就不算没用过");
+
+                let opened = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("另开一个标签");
+                assert_eq!(opened, 1, "带着附件的标签不该被复用");
+                assert!(panel.attachments.is_empty(), "新标签不得继承别人的附件");
+                assert_eq!(
+                    panel.sessions[0].attachments.len(),
+                    1,
+                    "原标签的附件也不该被悄悄丢掉"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn tab_labels_truncate_by_character_so_multibyte_titles_stay_valid() {
+        assert_eq!(truncate_label("短标题", 18), "短标题");
+        let long = "一二三四五六七八九十一二三四五六七八九十";
+        let truncated = truncate_label(long, 18);
+        assert_eq!(truncated.chars().count(), 19, "18 个字符 + 省略号");
+        assert!(truncated.ends_with('…'));
+        // 按字节切会在这里 panic；按字符切必须原样保留每个汉字。
+        assert!(long.starts_with(truncated.trim_end_matches('…')));
+    }
+
     /// T2 ④：Steer / Follow-up 合并成 ToggleGroup 后仍是单选，点击可来回切换。
     #[gpui::test]
     fn composer_mode_toggle_group_switches_selection(cx: &mut TestAppContext) {
@@ -5760,24 +7937,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_session_reset_clears_project_scoped_index_and_popup_state() {
-        let mut file_index = Some(pi_data::FileIndex {
-            entries: vec![pi_data::FileIndexEntry {
-                path: "old-project.rs".into(),
-                is_dir: false,
-            }],
-            truncated: false,
-        });
-        let mut popup = Some(ComposerPopup::Slash(Vec::new()));
-        let mut popup_index = 7;
-        let reset = reset_session_scoped_state(10, &mut file_index, &mut popup, &mut popup_index);
-        assert!(file_index.is_none());
-        assert!(popup.is_none());
-        assert_eq!(popup_index, 0);
-        assert_eq!(reset.load_generation, 11);
-    }
-
-    #[test]
     fn clipboard_partition_keeps_successes_and_only_falls_back_to_text_without_images() {
         let text = ClipboardEntry::String(gpui::ClipboardString::new("cells".into()));
         let png = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, vec![1]));
@@ -5941,11 +8100,30 @@ mod tests {
         });
         let panel = captured.borrow().clone().unwrap();
         panel.update(cx, |panel, _| {
-            panel.load_generation = 2;
+            let tab_id = panel.tab_id;
+            panel.load_generation = LoadGeneration(2);
             panel.active_generation = 2;
-            assert!(!panel.finish_load(1, "old".to_owned(), Ok(document("old"))));
+            assert!(!panel.finish_load(
+                tab_id,
+                LoadGeneration(1),
+                "old".to_owned(),
+                Ok(document("old"))
+            ));
             assert!(matches!(panel.status, ChatStatus::Empty));
-            assert!(panel.finish_load(2, "new".to_owned(), Ok(document("new"))));
+            // 已经关掉的标签不该被任何迟到的渲染结果复活。
+            assert!(!panel.finish_load(
+                tab_id + 999,
+                LoadGeneration(2),
+                "gone".to_owned(),
+                Ok(document("gone"))
+            ));
+            assert!(matches!(panel.status, ChatStatus::Empty));
+            assert!(panel.finish_load(
+                tab_id,
+                LoadGeneration(2),
+                "new".to_owned(),
+                Ok(document("new"))
+            ));
             assert!(matches!(panel.status, ChatStatus::Ready(_)));
         });
     }
@@ -6241,5 +8419,329 @@ mod tests {
             "附件条必须与错误横幅共存"
         );
         assert_attachment_composer_rows_do_not_overlap(&mut visual, true);
+    }
+
+    /// 第十一轮独立审查 P1/P2：调度器正在起 / 停这个会话时，会碰进程的入口一律锁死。
+    ///
+    /// 启动窗口里标签上的 `active` 还是空的，Manager 侧 `Starting` 也还没装上 `entry`，
+    /// 于是「改工具预设」会一路走到只改会话描述那条分支——界面写成 ReadOnly，
+    /// 而正在起的那个进程早就拿着旧预设出发了。按钮的 `disabled` 与 handler 的早退
+    /// 共用 `control_busy` 这一个判据，两边不会再各走各的。
+    #[gpui::test]
+    fn runtime_controls_are_locked_while_a_scheduler_job_owns_the_session(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                register_parked_session(panel, 0, workspace.path());
+                let session = panel.session.expect("已登记会话");
+                let preset_in_manager = |panel: &ChatPanel| {
+                    panel
+                        .runtime_manager
+                        .session_descriptor(session)
+                        .map(|descriptor| descriptor.tool_preset)
+                };
+                assert!(panel.active.is_none());
+                assert_eq!(panel.tool_preset, ToolPreset::Inherit);
+
+                panel.scheduler_job = Some("启动中…");
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                assert_eq!(
+                    panel.tool_preset,
+                    ToolPreset::Inherit,
+                    "调度作业在飞时不得改 UI 上的预设"
+                );
+                assert_eq!(
+                    preset_in_manager(panel),
+                    Some(ToolPreset::Inherit),
+                    "更不得改会话描述：正在起的进程用的就是那一份"
+                );
+
+                // 同一个判据也挡住其它控制类操作，且不留下误导性的错误横幅。
+                panel.set_auto_compaction(true, cx);
+                assert!(panel.control_operation.is_none());
+                assert!(panel.rpc_error.is_none(), "{:?}", panel.rpc_error);
+
+                // 作业落地后照常可改，并且必须同步到 Manager 的描述上。
+                panel.scheduler_job = None;
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                assert_eq!(panel.tool_preset, ToolPreset::ReadOnly);
+                assert_eq!(preset_in_manager(panel), Some(ToolPreset::ReadOnly));
+            });
+        });
+    }
+
+    /// 第十二轮独立审查 P1：只读历史标签同样占着它那份 JSONL。
+    ///
+    /// 第十一轮的守卫只查 `session.is_some()` 的标签，于是一个还没启动的历史标签
+    /// 不算占用者：别的标签可以切进它显示的那份文件，两个标签共用同一个 `draft_key`
+    /// （草稿互相覆盖），随后把历史标签启起来就是两个 pi 进程写同一份 JSONL。
+    #[gpui::test]
+    fn a_history_only_tab_still_owns_its_session_file(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 一号只是把 owned.jsonl 渲染出来看，没有登记会话、没有进程。
+                panel.tab_title = "历史".to_owned();
+                panel.status = ChatStatus::Ready(document_at(&owned, "历史"));
+                assert!(panel.session.is_none());
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+                panel.status = ChatStatus::Ready(document_at(&owned, "历史"));
+
+                // ① 切换会话这条入口必须拒绝。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("历史")),
+                    "拒绝理由要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none(), "被拒时不得发起控制操作");
+                assert!(panel.pending_switch_target.is_none(), "被拒时不得留下主张");
+
+                // ② 真正会起进程的那条入口（启动活会话）同样必须拒绝。
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.start_live(&gpui::ClickEvent::default(), window, cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("历史")),
+                    "启动活会话也要指明是谁占着：{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.session.is_none(), "被拒时不得登记会话");
+                assert!(
+                    panel.sessions[0].rpc_error.is_none(),
+                    "错误只属于发起操作的标签"
+                );
+            });
+        });
+    }
+
+    /// 第十二轮独立审查 P2：标签摘掉了，进程还没退干净，那份 JSONL 仍不能被别人抢。
+    ///
+    /// `close_tab` 立刻摘标签、把 `remove_session` 放后台（它要等优雅停机）。这段时间里
+    /// 主张随标签一起消失，而进程还活着——「关掉 → 重新打开同一段历史 → 启动活会话」
+    /// 就会在旧进程退干净之前起第二个进程写同一份文件。
+    #[gpui::test]
+    fn a_closing_tab_keeps_its_session_file_claimed_until_the_process_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let owned = workspace.path().join("owned.jsonl");
+        std::fs::write(&owned, "").expect("write session file");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        let second_tab = visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(owned.clone())));
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+
+                panel.close_tab(0, window, cx);
+                assert_eq!(panel.sessions.len(), 1, "一号已经从标签条上摘掉");
+                assert_eq!(
+                    panel.session_file_owner(&owned, usize::MAX).as_deref(),
+                    Some("正在关闭的会话"),
+                    "进程还没回收完，主张必须留着"
+                );
+
+                // 走真实入口再确认一次：这时候切进去就是两个进程写同一份文件。
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("正在关闭")),
+                    "{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.control_operation.is_none());
+                second_tab
+            })
+        });
+
+        // 后台注销落地（`remove_session` 内部已经等过优雅停机）：墓碑必须摘掉，
+        // 否则那份会话文件就永远打不开了。
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                assert!(
+                    panel.closing_session_files.is_empty(),
+                    "作业落地后必须摘除墓碑"
+                );
+                assert!(panel.session_file_owner(&owned, usize::MAX).is_none());
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.apply_session_switch_choice(second_tab, owned.clone(), cx);
+                assert!(
+                    !panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("已在标签")),
+                    "墓碑摘掉后不得再按「被别人占着」拒绝：{:?}",
+                    panel.rpc_error
+                );
+                assert_eq!(
+                    panel.pending_switch_target.as_deref(),
+                    Some(owned.as_path()),
+                    "放行时必须立起自己的主张，挡住同一时刻的第二次切换"
+                );
+            });
+        });
+    }
+
+    /// 第十三轮独立审查 P1：fresh 会话必须按标签上显示的那个预设起进程。
+    ///
+    /// `open_tab` 复用干净标签时刻意保留用户先挑好的工具预设（第七轮定的：那是偏好，
+    /// 不是瞬时状态）。启动描述如果写死 `Inherit`，进程就按更宽的权限起来，
+    /// 而界面还显示着 ReadOnly —— 与 R23 审查 P1-1、本轮第十一轮同一类分家。
+    ///
+    /// 覆盖边界（如实标注）：本用例钉的是断掉的那两环——「`open_tab` 保住预设」与
+    /// 「描述取标签的预设」。`start_new_session` 把 `index` 传给这个描述是紧挨着的一行，
+    /// 未机械覆盖：走它会真的 `create_session` + 起桥接线程 + `request_run`，
+    /// 在测试里等于起真实 pi 并写用户 `~/.pi`。
+    #[gpui::test]
+    fn a_fresh_session_starts_with_the_preset_the_tab_shows(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Empty);
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // 在空标签上先挑好预设，再点「新建会话」——这是被支持的正常用法。
+                panel.set_tool_preset(ToolPreset::ReadOnly, cx);
+                let index = panel
+                    .open_tab("新会话".to_owned(), window, cx)
+                    .expect("干净标签原地复用");
+                assert_eq!(
+                    panel.sessions[index].tool_preset,
+                    ToolPreset::ReadOnly,
+                    "预设是用户偏好，重建标签不得抹掉"
+                );
+                assert_eq!(
+                    panel
+                        .fresh_session_descriptor(index, workspace.path().to_path_buf())
+                        .tool_preset,
+                    ToolPreset::ReadOnly,
+                    "起进程用的必须是界面上显示的那一个"
+                );
+            });
+        });
+    }
+
+    /// 第十三轮独立审查 P1：关标签时墓碑要盖住**全部**主张，不能只盖第一条。
+    ///
+    /// 切换在飞时这个标签同时主张着「现在绑着的」和「正要切过去的」两份文件，
+    /// 而切换可能在优雅停机之前就完成——那时正在关闭的进程写的恰恰是后者。
+    /// 只盖第一条，另一个标签就能同时切进去或在它上面启动活会话。
+    #[gpui::test]
+    fn closing_a_tab_mid_switch_tombstones_the_pending_target_too(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let bound = workspace.path().join("bound.jsonl");
+        let target = workspace.path().join("target.jsonl");
+        std::fs::write(&bound, "").expect("write bound");
+        std::fs::write(&target, "").expect("write target");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("一号")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.draft_key = Some("one".into());
+                panel.tab_title = "一号".to_owned();
+                register_parked_session(panel, 0, workspace.path());
+                panel.apply_controls(fixture_controls_with_file("one", Some(bound.clone())));
+                // 一次还没落地的切换：两份文件此刻都归这个标签。
+                panel.control_operation = Some(ControlOperation::SwitchSession);
+                panel.pending_switch_target = Some(target.clone());
+                assert_eq!(panel.claimed_session_files().len(), 2);
+
+                let second = panel
+                    .open_tab("二号".to_owned(), window, cx)
+                    .expect("第二个标签");
+                let second_tab = panel.sessions[second].tab_id;
+
+                panel.close_tab(0, window, cx);
+                for path in [&bound, &target] {
+                    assert_eq!(
+                        panel.session_file_owner(path, usize::MAX).as_deref(),
+                        Some("正在关闭的会话"),
+                        "进程还没回收完，{} 不能被别人抢",
+                        path.display()
+                    );
+                }
+                panel.apply_session_switch_choice(second_tab, target.clone(), cx);
+                assert!(
+                    panel
+                        .rpc_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("正在关闭")),
+                    "{:?}",
+                    panel.rpc_error
+                );
+                assert!(panel.pending_switch_target.is_none(), "被拒时不得留下主张");
+            });
+        });
+
+        visual.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(
+                panel.closing_session_files.is_empty(),
+                "作业落地后两条墓碑都要摘掉，否则那两份文件永远打不开"
+            );
+            assert!(panel.session_file_owner(&bound, usize::MAX).is_none());
+            assert!(panel.session_file_owner(&target, usize::MAX).is_none());
+        });
+    }
+
+    /// 第十四轮独立审查 P2：直接输入路径也必须认同一个 busy 判据。
+    ///
+    /// 第十一轮把按钮的 `disabled` 收敛到了 `control_busy`，但 composer 的 Enter 与
+    /// Ctrl+P 循环模型仍只看 `control_operation`。Park 作业在飞时 `active` 还挂着、
+    /// 而且是 idle 的，敲一下回车就把请求打在一个正被拆掉的 Runtime 上。
+    #[gpui::test]
+    fn direct_input_paths_honor_the_same_busy_guard_as_the_buttons(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hi")));
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                register_parked_session(panel, 0, workspace.path());
+                let input = panel.composer.clone();
+                input.update(cx, |input, cx| input.set_value("要发出去的话", window, cx));
+
+                panel.scheduler_job = Some("挂起中…");
+                panel.submit_composer(&input, window, cx);
+                assert_eq!(
+                    panel.rpc_error.as_deref(),
+                    Some("会话操作进行中，暂不能发送消息"),
+                    "调度作业在飞时 Enter 必须被同一个判据挡住"
+                );
+                assert!(!input.read(cx).value().is_empty(), "被挡住时草稿不得被清空");
+                assert!(!panel.can_cycle_model(), "Ctrl+P 同样要被挡住");
+
+                // 作业落地后这条路重新打开：此时挡住它的只应该是「没有活会话」，
+                // 而不再是 busy —— 两条理由的文案不同，足以区分是哪一道守卫生效。
+                panel.scheduler_job = None;
+                panel.rpc_error = None;
+                panel.rpc_error_protected = false;
+                panel.submit_composer(&input, window, cx);
+                assert_eq!(
+                    panel.rpc_error.as_deref(),
+                    Some("请先启动活会话"),
+                    "落地后不该再报 busy"
+                );
+            });
+        });
     }
 }

@@ -157,6 +157,11 @@ impl MainPanel {
     }
 
     #[cfg(test)]
+    pub(crate) fn chat_for_test(&self) -> &gpui::Entity<ChatPanel> {
+        &self.chat
+    }
+
+    #[cfg(test)]
     pub(crate) fn root_for_test(&self) -> Option<&std::path::Path> {
         self.root.as_deref()
     }
