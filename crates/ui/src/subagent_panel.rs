@@ -69,6 +69,24 @@ pub fn subagent_summary(tasks: &[SubagentTask]) -> crate::chat::SubagentStatsTex
     }
 }
 
+/// 汇总点的颜色。
+///
+/// 与任务行共用 [`crate::chat::subagent_status_color`]，保证同一语义在两处同色：
+/// 还有没结算的 → 按「运行中」取色；全部结算但有失败 → 按「失败」取色；
+/// 全部正常收尾 → 中性色（不给"完成"上绿点，一屏全绿会把真正需要注意的点淹掉）。
+fn summary_dot_color(tasks: &[SubagentTask], cx: &App) -> gpui::Hsla {
+    if has_active(tasks) {
+        return crate::chat::subagent_status_color(&SubagentStatus::Running, cx);
+    }
+    if tasks
+        .iter()
+        .any(|task| task.status == SubagentStatus::Error)
+    {
+        return crate::chat::subagent_status_color(&SubagentStatus::Error, cx);
+    }
+    cx.theme().muted_foreground
+}
+
 /// 是否还有没结算的任务 —— 决定折叠态状态点用不用「进行中」的颜色。
 fn has_active(tasks: &[SubagentTask]) -> bool {
     tasks.iter().any(|task| !task.status.is_settled())
@@ -85,7 +103,6 @@ pub fn render_subagent_tasks(
     if tasks.is_empty() {
         return None;
     }
-    let active = has_active(tasks);
     let summary = subagent_summary(tasks);
     let summary_detail = summary.detail.clone();
     let summary_has_more = summary_detail != summary.inline;
@@ -103,8 +120,18 @@ pub fn render_subagent_tasks(
                     .debug_selector(|| "subagent-panel-toggle".into())
                     .gap_1p5()
                     .cursor_pointer()
-                    // 规范 § 4.4：折叠头必须有 hover 反馈。
-                    .hover(|row| row.text_color(cx.theme().foreground))
+                    // 规范 § 4.4 字面规定的 hover 反馈：`bg(muted)`。
+                    //
+                    // **不要**照抄 thinking 折叠头的 `hover(text_color(foreground))` 而漏掉
+                    // 它的前一句 —— 那种写法要求该行先有 `text_color(muted_foreground)` 基线，
+                    // 才有落差可言。本行没有基线色：`AppShell` 根节点已经把环境色设成
+                    // `foreground`（`shell.rs`），祖先链上无人改写，于是「hover 时改成
+                    // foreground」是把 foreground 改成 foreground，零像素变化 —— 红线 9
+                    // 点名的「无状态反馈的 hover 空白」原样成立。R26 第一版就是这么错的。
+                    //
+                    // S-1 明确 hover 的 `muted` 属「同一表面上的临时叠加，不是新层」，
+                    // 因此卡片内使用不违反 S-3 的表面层级限制。
+                    .hover(|row| row.bg(cx.theme().muted))
                     .when(summary_has_more, |row| {
                         let detail = summary_detail.clone();
                         row.tooltip(move |window, cx| {
@@ -116,13 +143,12 @@ pub fn render_subagent_tasks(
                             handler(cx);
                         }
                     })
-                    // 状态色只点不铺（规范 S-4）；配色与任务行同源，避免同一状态
-                    // 在汇总点和行内点上呈现两种颜色。
-                    .child(crate::chat::status_dot(if active {
-                        cx.theme().warning
-                    } else {
-                        cx.theme().muted_foreground
-                    }))
+                    // 状态色只点不铺（规范 S-4）。
+                    //
+                    // 汇总点表达的是「整批任务的当前处境」，与逐条状态是不同维度，
+                    // 但取色必须与任务行同源，否则会出现「全部结算且有失败时，汇总点是
+                    // 中性灰、行内点是 danger、汇总文字还写着『1 失败』」这种自相矛盾。
+                    .child(crate::chat::status_dot(summary_dot_color(tasks, cx)))
                     // 两个文本片段：标题 + 行内汇总。完整分桶在 tooltip 里（S-8）。
                     .child(div().text_xs().font_semibold().child("子代理"))
                     .child(div().flex_1())
@@ -274,5 +300,63 @@ mod tests {
         let tasks = vec![task(SubagentStatus::Unknown("hibernating".to_owned()))];
         assert!(has_active(&tasks));
         assert_eq!(subagent_summary(&tasks).inline, "1 运行");
+    }
+
+    /// 折叠头的 hover 必须真的产生视觉变化（规范 § 4.4 / 红线 9）。
+    ///
+    /// R26 第一版写的是 `hover(text_color(foreground))`，但那行没有基线文本色 ——
+    /// `AppShell` 根节点已经把环境色设成 `foreground`，于是 hover 把 foreground
+    /// 改成 foreground，零像素变化，而注释还写着「必须有 hover 反馈」。
+    ///
+    /// 注意：同样的写法在 thinking 折叠头（`chat.rs` 的 `render_thinking`）里是**合法**的，
+    /// 因为那一行先写了 `text_color(muted_foreground)` 基线。所以这条只检查子代理的
+    /// 两处折叠头，不做全文件级的否定断言 —— 否则会误伤那处正确用法。
+    #[test]
+    fn collapse_headers_use_a_hover_effect_that_actually_changes_something() {
+        let no_op = [".hover(|row| row.text_color(cx.theme().", "foreground))"].concat();
+        let wanted = ".hover(|row| row.bg(cx.theme().muted))";
+
+        let panel = include_str!("subagent_panel.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            panel.contains(wanted),
+            "面板折叠头必须用 § 4.4 规定的 bg(muted)"
+        );
+        assert!(
+            !panel.contains(&no_op),
+            "面板折叠头不得用会退化成 no-op 的 hover 写法"
+        );
+
+        // 子代理卡片的折叠头：只截 render_subagent 这一段来判，避开同文件里
+        // thinking 折叠头那处合法用法。
+        let chat = include_str!("chat.rs");
+        let card = chat
+            .split("fn render_subagent(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(
+                    "
+fn ",
+                )
+                .next()
+            })
+            .expect("render_subagent 必须存在");
+        assert!(card.contains(wanted), "子代理卡片折叠头必须用 bg(muted)");
+        assert!(
+            !card.contains(&no_op),
+            "子代理卡片折叠头不得用会退化成 no-op 的 hover 写法"
+        );
+    }
+
+    /// 汇总点与任务行状态点必须同源取色，否则同一状态会呈现两种颜色。
+    #[test]
+    fn the_summary_dot_never_contradicts_the_rows_it_summarizes() {
+        // 全部结算但有失败时，汇总点不能是中性灰 —— 那会和行内的 danger 点、
+        // 以及汇总文字里的「1 失败」自相矛盾。
+        let tasks = vec![task(SubagentStatus::Completed), task(SubagentStatus::Error)];
+        assert!(!has_active(&tasks));
+        assert_eq!(subagent_summary(&tasks).detail, "1 失败 · 1 完成");
     }
 }

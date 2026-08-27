@@ -1218,8 +1218,18 @@ fn render_subagent(
                 .debug_selector(|| "subagent-card-toggle".into())
                 .gap_1p5()
                 .cursor_pointer()
-                // 规范 § 4.4：折叠头必须有 hover 反馈，否则可点区域不可发现。
-                .hover(|row| row.text_color(cx.theme().foreground))
+                // 规范 § 4.4 字面规定的 hover 反馈：`bg(muted)`。
+                //
+                // **不要**照抄 thinking 折叠头的 `hover(text_color(foreground))` 而漏掉
+                // 它的前一句 —— 那种写法要求该行先有 `text_color(muted_foreground)` 基线，
+                // 才有落差可言。本行没有基线色：`AppShell` 根节点已经把环境色设成
+                // `foreground`（`shell.rs`），祖先链上无人改写，于是「hover 时改成
+                // foreground」是把 foreground 改成 foreground，零像素变化 —— 红线 9
+                // 点名的「无状态反馈的 hover 空白」原样成立。R26 第一版就是这么错的。
+                //
+                // S-1 明确 hover 的 `muted` 属「同一表面上的临时叠加，不是新层」，
+                // 因此卡片内使用不违反 S-3 的表面层级限制。
+                .hover(|row| row.bg(cx.theme().muted))
                 .on_click(move |_, _, cx| {
                     if let Some(handler) = &on_toggle_tool {
                         handler(toggle_key.clone(), item_id.clone(), cx);
