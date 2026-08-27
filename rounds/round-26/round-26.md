@@ -93,14 +93,38 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 
 本轮 diff 触及 `crates/ui/src/{chat.rs,subagent_panel.rs}` 与 `crates/app/src/panels.rs` 的视图代码，必须触发视觉 review。
 
-- 视觉审查模式：<待定>
-- 视觉审查结论：<待填>
-- 截图验证：<待填>
-- 兜底原因：<待填>
+- 视觉审查模式：`CODE_ONLY`
+- 视觉审查结论：`CODE_ONLY_PASS`（第 3 轮；前两轮均为 `CODE_ONLY_FAIL`，阻断项已逐条整改）
+- 截图验证：未提供（`SCREENSHOT_NOT_PROVIDED`）
+- 兜底原因：`TIMEOUT_30M`
 - `requested_at`：`2026-08-27T10:45:33+08:00`
 - `deadline`：`2026-08-27T11:15:33+08:00`
-- 审查报告 / 证据：<待填>
-- 说明：<待填>
+- 审查报告 / 证据：diff 导出于 `.pi/visual-review/round-26/ui-diff.txt`（gitignored）
+- 说明：仅完成纯代码层视觉审查，**未验证真实渲染**；不阻塞 PR 的前提是结论为 `CODE_ONLY_PASS`
+
+### 视觉审查过程
+
+| 轮 | 结论 | 阻断项 | 处置 |
+|---|---|---|---|
+| 1 | `CODE_ONLY_FAIL` | **S-8 一行片段超限**：面板折叠行 5 段、任务行 6 段、卡片摘要行 6 段，且都是常态输入 | 按条款重构：统计与汇总各返回 `{ inline, detail }`，行内只放**一项**，完整明细进 tooltip（条款明确 tooltip 内容不计入片段）。改后 2 / 3 / 3 段。另采纳 8 条建议、2 条记 backlog |
+| 2 | `CODE_ONLY_FAIL` | **F-1 hover 零像素变化**：为补 § 4.4 反馈加的 `hover(text_color(foreground))` 在代码层可证明无效——该行无基线文本色，`AppShell` 已把环境色设为 `foreground` | 改用 § 4.4 字面规定的 `hover(bg(muted))`；新增源码级回归测试；并更正 backlog #38 里被写失实的那句 |
+| 3 | **`CODE_ONLY_PASS`** | 无 | 复核确认 S-8 与 hover 两个阻断项均已在代码层关闭。新提 4 条建议级：**F3-1 我给 F-2 写的回归测试从未调用过 `summary_dot_color`**（守卫是空的，把被守卫的函数整个回退掉测试照样全绿）、F3-2 `Stopped`/`TurnLimit` 归进「完成」桶与行内标签互相打脸、F3-3 § 4.4 的 `text_sm` 与汇总条实际用的 `text_xs` 对不上（判为不改代码、交规范维护轮）、F3-4 我在 backlog 里引入的未转义竖线切断了表格。F3-1 / F3-2 / F3-4 已修，F3-3 记 backlog #40 |
+
+**这两轮阻断项的共同点**：我都写了一条断言性注释（"整段汇总只当一个片段" / "折叠头必须有 hover 反馈"），
+而那个断言从未被任何东西验证过。第 1 轮是对规范条款的自我解读，第 2 轮是对自己代码效果的自我判断。
+两次都是**注释在陈述"我以为会发生什么"，而不是"已经验证会发生什么"**——与本轮代码审查中那 4 次
+"从字段名反推上游行为"是同一个根因。
+
+**而第 3 轮又抓到同一模式的第 3 次**：我为 F-2 写的回归测试名叫
+「汇总点永远不与它汇总的行矛盾」，却从头到尾没调用过 `summary_dot_color` ——
+一个名字承诺守护 X、实际没碰 X 的守卫，比没有守卫更糟，因为它让人以为有。
+这条已改成真正调用被守卫函数并逐分支断言。
+
+因此本轮新增的两条测试刻意选了**源码级断言**（`collapse_headers_use_a_hover_effect_that_actually_changes_something`
+断言不出现会退化成 no-op 的写法；`subagent_stats_keep_the_inline_row_to_a_single_fragment` 断言 `inline` 不含 `·`）：
+这类问题靠渲染测试很难发现（no-op 的 hover 渲染出来"看着没问题"），只有把**禁止的写法本身**钉死才挡得住回退。
+注意第一版这条测试做了全文件否定断言，误伤了 thinking 折叠头那处合法用法（它有基线色），收窄后才对——
+说明连"防止犯错的机制"本身也需要验证。
 
 ### 截图请求清单
 

@@ -30,12 +30,17 @@ pub fn subagent_summary(tasks: &[SubagentTask]) -> crate::chat::SubagentStatsTex
     let mut running = 0_usize;
     let mut queued = 0_usize;
     let mut failed = 0_usize;
+    let mut halted = 0_usize;
     let mut done = 0_usize;
     for task in tasks {
         match task.status {
             SubagentStatus::Running => running += 1,
             SubagentStatus::Queued => queued += 1,
             SubagentStatus::Error => failed += 1,
+            // 「已停止」与「达到轮次上限」都是没跑完就结束的，单列一档。
+            // 归进「完成」会让汇总写着「3 完成」而展开后每行都是「已停止」，
+            // 汇总与明细互相打脸 —— 与 F-2 被判红的理由同型。
+            SubagentStatus::Stopped | SubagentStatus::TurnLimit => halted += 1,
             _ if task.status.is_settled() => done += 1,
             _ => running += 1,
         }
@@ -44,6 +49,7 @@ pub fn subagent_summary(tasks: &[SubagentTask]) -> crate::chat::SubagentStatsTex
         (running, "运行"),
         (queued, "排队"),
         (failed, "失败"),
+        (halted, "中止"),
         (done, "完成"),
     ];
     let detail = buckets
@@ -83,6 +89,14 @@ fn summary_dot_color(tasks: &[SubagentTask], cx: &App) -> gpui::Hsla {
         .any(|task| task.status == SubagentStatus::Error)
     {
         return crate::chat::subagent_status_color(&SubagentStatus::Error, cx);
+    }
+    if tasks.iter().any(|task| {
+        matches!(
+            task.status,
+            SubagentStatus::Stopped | SubagentStatus::TurnLimit
+        )
+    }) {
+        return crate::chat::subagent_status_color(&SubagentStatus::Stopped, cx);
     }
     cx.theme().muted_foreground
 }
@@ -289,8 +303,10 @@ mod tests {
         ];
         assert!(!has_active(&tasks));
         let summary = subagent_summary(&tasks);
-        assert_eq!(summary.inline, "3 完成");
-        assert_eq!(summary.detail, "3 完成");
+        // 「已停止」与「达到轮次上限」都没跑完，不能和正常收尾混在「完成」里 ——
+        // 否则汇总写着「3 完成」而展开后每行都是「已停止」。
+        assert_eq!(summary.inline, "2 中止");
+        assert_eq!(summary.detail, "2 中止 · 1 完成");
     }
 
     #[test]
@@ -351,12 +367,46 @@ fn ",
     }
 
     /// 汇总点与任务行状态点必须同源取色，否则同一状态会呈现两种颜色。
-    #[test]
-    fn the_summary_dot_never_contradicts_the_rows_it_summarizes() {
-        // 全部结算但有失败时，汇总点不能是中性灰 —— 那会和行内的 danger 点、
-        // 以及汇总文字里的「1 失败」自相矛盾。
-        let tasks = vec![task(SubagentStatus::Completed), task(SubagentStatus::Error)];
-        assert!(!has_active(&tasks));
-        assert_eq!(subagent_summary(&tasks).detail, "1 失败 · 1 完成");
+    ///
+    /// 这条**必须真的调用 `summary_dot_color`**。第一版只断言了汇总文案和
+    /// `has_active`，把 `summary_dot_color` 整个回退成旧的两态映射也照样全绿 ——
+    /// 一个名字承诺守护 X、实际没碰 X 的守卫，比没有守卫更危险，因为它让人以为有。
+    #[gpui::test]
+    fn the_summary_dot_never_contradicts_the_rows_it_summarizes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+
+            // 全部结算但有失败：汇总点必须与行内的 danger 点同色，
+            // 否则会出现「汇总点中性灰、行内点 danger、汇总文字写着 1 失败」的自相矛盾。
+            let settled_with_failure =
+                vec![task(SubagentStatus::Completed), task(SubagentStatus::Error)];
+            assert!(!has_active(&settled_with_failure));
+            assert_eq!(
+                summary_dot_color(&settled_with_failure, cx),
+                crate::chat::subagent_status_color(&SubagentStatus::Error, cx),
+            );
+            assert_eq!(
+                subagent_summary(&settled_with_failure).detail,
+                "1 失败 · 1 完成"
+            );
+
+            // 还有在跑的：按「运行中」取色，同样与行内同源。
+            let still_running = vec![
+                task(SubagentStatus::Running),
+                task(SubagentStatus::Completed),
+            ];
+            assert_eq!(
+                summary_dot_color(&still_running, cx),
+                crate::chat::subagent_status_color(&SubagentStatus::Running, cx),
+            );
+
+            // 全部正常收尾：中性色。不给「完成」上绿点 —— 一屏全绿会把真正
+            // 需要注意的点淹掉（S-4 的用意）。
+            let all_done = vec![task(SubagentStatus::Completed)];
+            assert_eq!(
+                summary_dot_color(&all_done, cx),
+                cx.theme().muted_foreground
+            );
+        });
     }
 }
