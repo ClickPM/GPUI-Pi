@@ -13,12 +13,17 @@ use serde_json::Value;
 
 pub(crate) mod budget;
 mod live;
+mod subagent;
 pub use budget::{
     DEFAULT_PAYLOAD_BUDGET_BYTES, RELEASED_OUTPUT_NOTICE, RetentionOutcome, apply_payload_budget,
     payload_bytes,
 };
 pub use live::{
     LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer, ReduceOutcome,
+};
+pub use subagent::{
+    AGENT_TOOL, STOP_AGENT_TOOL, SUBAGENT_RESULT_CUSTOM_TYPE, SubagentCard, SubagentStats,
+    SubagentStatus, SubagentTask, collect_tasks, decode_result_card,
 };
 
 const MAX_TEXT_CHARS: usize = 512 * 1024;
@@ -117,6 +122,12 @@ pub enum Block {
     Image(ImageBlock),
     Frontmatter(FrontmatterCard),
     Notice(NoticeBlock),
+    /// 内建子代理的结果卡片，来自 `customType == "subagent-result"` 的会话条目。
+    ///
+    /// 装箱是因为 `SubagentCard` 有八个可选字段加一整组统计，直接内联会让 `Block`
+    /// 从 192 字节涨到 408 —— 每条消息的每个块都要付这份代价，而子代理卡片在一份
+    /// 会话里通常只有几个。
+    Subagent(Box<SubagentCard>),
     Unknown(UnknownBlock),
 }
 
@@ -402,10 +413,22 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
                 custom_type,
                 content,
                 display,
-                ..
+                raw,
             } if display.unwrap_or(true) => {
                 let mut blocks = Vec::new();
-                render_content(content, &mut blocks, &mut diagnostics, base.id.as_deref());
+                // 子代理结果条目是 R26「可回看」的唯一持久化事实来源，单独解码成
+                // 子代理卡片；`details` 只在 raw JSON 里（pi-data 不单独建模它）。
+                if custom_type.as_deref() == Some(SUBAGENT_RESULT_CUSTOM_TYPE) {
+                    // 走 content_plain_text 而不是 as_str：既覆盖数组形式的 content，
+                    // 也顺带套上 MAX_TEXT_CHARS 上限，避免一条超长子代理结果把文档撑爆。
+                    let text = content_plain_text(content);
+                    blocks.push(Block::Subagent(Box::new(decode_result_card(
+                        &text,
+                        raw.get("details"),
+                    ))));
+                } else {
+                    render_content(content, &mut blocks, &mut diagnostics, base.id.as_deref());
+                }
                 if blocks.is_empty() {
                     blocks.push(Block::Unknown(UnknownBlock {
                         kind: "custom_message".to_owned(),
@@ -1867,6 +1890,11 @@ fn first_visible_text(message: &Message) -> Option<String> {
         Block::Thinking(text) | Block::Unknown(UnknownBlock { text, .. }) => first_paragraph(text),
         Block::Notice(notice) => Some(notice.text.clone()),
         Block::Tool(tool) => Some(format!("{} · {}", tool.name, tool.preview)),
+        Block::Subagent(card) => Some(format!(
+            "子代理 {} · {}",
+            card.agent_type,
+            card.status.label()
+        )),
         _ => None,
     })
 }
@@ -1943,6 +1971,13 @@ fn snapshot_block(block: &Block, out: &mut String) {
             notice.title,
             notice.text.trim()
         )),
+        Block::Subagent(card) => out.push_str(&format!(
+            "  subagent:{}:{}:{}:{}\n",
+            card.agent_type,
+            card.short_id.as_deref().unwrap_or("-"),
+            card.status.label(),
+            card.result.trim()
+        )),
         Block::Unknown(unknown) => out.push_str(&format!(
             "  unknown:{}:{}\n",
             unknown.kind,
@@ -1975,6 +2010,38 @@ fn pretty_json(value: &Value) -> String {
 
 fn visible_json(value: &Value) -> String {
     truncate_chars(&canonical_json(value).to_string(), MAX_TEXT_CHARS)
+}
+
+/// 把会话条目的 `content` 摊平成纯文本。
+///
+/// 协议允许 `content` 是字符串，也允许是 `TextContent` / `ImageContent` 数组。
+/// 子代理结果条目实际写的是字符串，但按数组解也要能拿到正文 —— 否则内核哪天改成
+/// 数组形式，"回看"就会静默变成空白卡片。图片段在这里没有意义，直接跳过。
+pub(crate) fn content_plain_text(content: &Value) -> String {
+    fn walk(value: &Value, out: &mut String) {
+        match value {
+            Value::String(text) => push_segment(out, text),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(text) = map.get("text").and_then(Value::as_str)
+                {
+                    push_segment(out, text);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn push_segment(out: &mut String, text: &str) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+
+    let mut out = String::new();
+    walk(content, &mut out);
+    truncate_chars(&out, MAX_TEXT_CHARS)
 }
 
 fn canonical_json(value: &Value) -> Value {
@@ -2059,6 +2126,77 @@ mod tests {
             writeln!(file, "{line}").unwrap();
         }
         render_path(path).unwrap()
+    }
+
+    #[test]
+    fn subagent_result_entries_decode_into_subagent_blocks_for_replay() {
+        // 这是 R26「可回看」的端到端路径：后台子代理完成后由内核写进父会话文件的
+        // custom_message 条目，重新打开会话时必须还原成子代理卡片，而不是掉进
+        // 通用自定义消息里变成一坨纯文本。details 只存在于原始 JSON 上。
+        let document = render_fixture(&[
+            serde_json::json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"并行审这三个模块"}}),
+            serde_json::json!({
+                "type":"custom_message","id":"c1","parentId":"u1",
+                "customType":"subagent-result",
+                "display":true,
+                "content":"[Subagent \"reviewer\" a1b2c3d4 completed]\n\n没发现阻断项",
+                "details":{
+                    "type":"reviewer",
+                    "description":"审 pi-runtime",
+                    "status":"completed",
+                    "outputFile":"/tmp/pi-agent-outputs/a1b2c3d4e5f6.log",
+                    "turnCount":5,
+                    "toolUses":12,
+                    "cost":0.42,
+                    "modelName":"Claude Sonnet 5"
+                }
+            }),
+        ]);
+
+        let card = document
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .find_map(|block| match block {
+                Block::Subagent(card) => Some((**card).clone()),
+                _ => None,
+            })
+            .expect("subagent-result 条目必须还原成子代理卡片");
+        assert_eq!(card.agent_type, "reviewer");
+        assert_eq!(card.description.as_deref(), Some("审 pi-runtime"));
+        assert_eq!(card.status, SubagentStatus::Completed);
+        assert_eq!(card.short_id.as_deref(), Some("a1b2c3d4"));
+        assert_eq!(card.agent_id.as_deref(), Some("a1b2c3d4e5f6"));
+        assert_eq!(card.result, "没发现阻断项");
+        assert_eq!(card.stats.turn_count, Some(5));
+        assert_eq!(card.stats.tool_uses, Some(12));
+        assert_eq!(card.stats.cost, Some(0.42));
+        assert_eq!(card.stats.model_name.as_deref(), Some("Claude Sonnet 5"));
+
+        let tasks = collect_tasks(&document);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].key, "a1b2c3d4e5f6");
+        assert_eq!(tasks[0].status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn other_custom_messages_are_untouched_by_the_subagent_path() {
+        let document = render_fixture(&[serde_json::json!({
+            "type":"custom_message","id":"c1","parentId":null,
+            "customType":"some-other-extension","display":true,
+            "content":"普通自定义消息"
+        })]);
+        assert!(
+            !document
+                .messages
+                .iter()
+                .flat_map(|message| message.blocks.iter())
+                .any(|block| matches!(block, Block::Subagent(_)))
+        );
+        assert_eq!(
+            document.messages[0].label.as_deref(),
+            Some("some-other-extension")
+        );
     }
 
     #[test]

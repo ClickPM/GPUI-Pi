@@ -878,12 +878,29 @@ fn json_string_bytes(value: &Value) -> usize {
     }
 }
 
+/// 一条原始消息如果是子代理结果，返回它那份字符串正文。
+///
+/// 判据用 `customType` 而不是正文形状：内核对这条消息硬编码
+/// `customType: "subagent-result"` + `display: true`（`spawn-coordinator.ts`），
+/// 比去猜 `[Subagent "..."]` 标题稳。
+fn subagent_result_text(message: &Value) -> Option<&str> {
+    (message.get("customType").and_then(Value::as_str) == Some(crate::SUBAGENT_RESULT_CUSTOM_TYPE))
+        .then(|| message.get("content").and_then(Value::as_str))
+        .flatten()
+}
+
 /// 一条原始消息里**可以被释放**的原始字节：内嵌图片数据。
 ///
 /// 刻意不数用户 Query 与最终 Answer 的正文 —— 预算从来不会释放它们，把它们算进来
 /// 只会让一篇长文本会话永远"超预算"，于是每插一条消息都全量重扫一遍却一个字节也
 /// 释放不掉，白白退化成 O(n²)。工具结果不在这里数，由调用方按 id 单独累加。
 fn releasable_raw_bytes(message: &Value) -> usize {
+    // 子代理结果的 content 是**字符串**（内核 `spawn-coordinator.ts` 直接拼模板串），
+    // 走不到下面按数组遍历的图片分支。不单独认它的话，`completed` 里那份原文既不计入
+    // 预算、也永远释放不掉 —— 而后台派发是 R26 的主用例，一次长运行能攒下几十条。
+    if let Some(text) = subagent_result_text(message) {
+        return text.len();
+    }
     let Some(content) = message.get("content").and_then(Value::as_array) else {
         return 0;
     };
@@ -920,6 +937,12 @@ fn tool_ids(message: &Value) -> Vec<String> {
 /// 图片数据换成 `<redacted>`：`crate::parse_image` 本来就认这个标记，重渲染会稳定
 /// 落到 [`crate::ImageState::Redacted`]，而不是把一段占位当成损坏的 base64。
 fn release_raw_message(message: &mut Value, tool_ids: &mut Vec<String>) {
+    if subagent_result_text(message).is_some_and(|text| text != crate::RELEASED_OUTPUT_NOTICE) {
+        // 与工具输出同一口径：换成占位文案而不是删字段，重渲染时仍是一张结构完整的
+        // 子代理卡片（类型、状态、统计都在 details 里），只是正文换成了说明。
+        message["content"] = Value::String(crate::RELEASED_OUTPUT_NOTICE.to_owned());
+        return;
+    }
     let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };
@@ -1000,9 +1023,37 @@ fn render_live_message(
     let role = match value.get("role").and_then(Value::as_str) {
         Some("user") => MessageRole::User,
         Some("assistant") => MessageRole::Assistant,
+        // 扩展经 `sendMessage` 注入的消息在 agent 层就是 `role: "custom"`，且带着
+        // `customType` / `details`。R26 之前它掉进 Unknown 只当纯文本渲染。
+        Some("custom") => MessageRole::Custom,
         Some(_) => MessageRole::Unknown,
         None => return None,
     };
+    let custom_type = value.get("customType").and_then(Value::as_str);
+
+    // 子代理结果：实时路径必须和从会话文件回看的结果**渲染成同一种块**。
+    // 否则同一条结果在流式时是一段纯文本、重开会话后才变成子代理卡片，任务面板也要
+    // 等到重新读盘才认得它 —— 正文和面板对不上，而且只在"后台子代理刚完成"这一小段
+    // 时间窗里复现，是最难查的那类不一致。
+    if custom_type == Some(crate::SUBAGENT_RESULT_CUSTOM_TYPE)
+        && let Some(content) = value.get("content")
+    {
+        let text = crate::content_plain_text(content);
+        let card = crate::decode_result_card(&text, value.get("details"));
+        return Some(Message {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("live-{sequence}"), ToOwned::to_owned),
+            role,
+            timestamp: None,
+            label: Some(crate::SUBAGENT_RESULT_CUSTOM_TYPE.to_owned()),
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Subagent(Box::new(card))],
+        });
+    }
+
     let mut blocks = Vec::new();
     match value.get("content") {
         Some(Value::String(text)) => blocks.push(Block::Markdown(crate::MarkdownBlock {

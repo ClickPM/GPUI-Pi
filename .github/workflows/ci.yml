@@ -28,6 +28,9 @@ jobs:
       - name: 准备钉死的 pi-web 0.8.9 对照基线
         shell: pwsh
         run: .\scripts\fetch-pi-web.ps1
+      - name: 准备钉死的子代理执行内核 pi-subagents-lite 1.13.0
+        shell: pwsh
+        run: .\scripts\fetch-pi-subagents-lite.ps1
       - name: T1 全量验收
         shell: pwsh
         run: .\scripts\validate.ps1

@@ -3,6 +3,7 @@ pub mod clock;
 mod effects;
 pub mod resource;
 pub mod scheduler;
+pub mod subagent_config;
 
 pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
 pub use clock::{Clock, FakeClock, SystemClock};
@@ -40,8 +41,8 @@ use std::{
 use pi_rpc::{
     AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
     Command, CommandsData, CompactionResult, EventDetach, EventStream, ExportPathData,
-    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, JobLimits, Model,
-    NotifyType, RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
+    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType,
+    RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
     ThinkingLevelsData, TreeData, WidgetPlacement,
 };
 
@@ -586,9 +587,9 @@ impl ToolPreset {
         match self {
             Self::Inherit => "沿用 settings.json 的 defaultTools 与扩展工具",
             Self::None => "不启用任何工具（扩展工具也不生效）",
-            Self::ReadOnly => "内建 read、grep、find、ls（扩展工具不生效）",
-            Self::Default => "内建四件套 read、bash、edit、write（扩展工具不生效）",
-            Self::Full => "全部 7 个内建工具（扩展工具不生效）",
+            Self::ReadOnly => "内建 read、grep、find、ls（不含子代理与其他扩展工具）",
+            Self::Default => "内建四件套 read、bash、edit、write + 内建子代理",
+            Self::Full => "全部 7 个内建工具 + 内建子代理",
         }
     }
 
@@ -601,12 +602,38 @@ impl ToolPreset {
         }
     }
 
+    /// 该预设下是否放行内建子代理工具（`Agent` / `StopAgent` / `AgentStatus`）。
+    ///
+    /// `ReadOnly` 故意**不**放行：`--tools` 只约束当前会话自己看得见的工具，
+    /// 而子代理的工具集由 agent 定义的 `tools:` frontmatter 与 pi settings 的
+    /// `defaultTools` 决定，父会话的允许列表传导不过去。只读会话一旦能派发子代理，
+    /// 就等于能借一个带 `bash` / `edit` 的 agent 绕开"只读"这个承诺。
+    /// `None` 是"一个工具都不给"，同理不放行；`Inherit` 不下发 `--tools`，
+    /// 由 pi 自己的配置决定，不归这里管。
+    pub const fn allows_subagents(self) -> bool {
+        matches!(self, Self::Default | Self::Full)
+    }
+
+    /// 该预设下是否需要把子代理内核扩展注入进 pi。
+    ///
+    /// 与 [`Self::allows_subagents`] 是两件事：那个决定 `--tools` 允许列表里写不写
+    /// 三个子代理工具名，这个决定要不要给 pi 加 `-e <内核目录>`。`Inherit` 不下发
+    /// `--tools`，可见性由 pi 自己的 `defaultTools` 决定，所以仍须注入；
+    /// `None` / `ReadOnly` 无论如何都不会放行这些工具，注入只是白白多加载一个扩展。
+    pub const fn loads_subagent_kernel(self) -> bool {
+        !matches!(self, Self::None | Self::ReadOnly)
+    }
+
     pub fn append_args(self, args: &mut Vec<std::ffi::OsString>) {
         if self == Self::Inherit {
             return;
         }
+        let mut names: Vec<&str> = self.tool_names().to_vec();
+        if self.allows_subagents() {
+            names.extend(pi_rpc::SUBAGENT_TOOL_NAMES);
+        }
         args.push("--tools".into());
-        args.push(self.tool_names().join(",").into());
+        args.push(names.join(",").into());
     }
 }
 
@@ -838,8 +865,12 @@ struct RuntimeTuning {
     effects: EffectLimits,
     event_frame: Duration,
     event_backlog_bytes: usize,
-    /// 进程树硬上限；随 Runtime 创建固化，经 `clamp_manager_config` 透传给 `pi-rpc`。
-    job: JobLimits,
+    /// 已收敛的内存/进程数参数；`clamp_manager_config` 据此按是否加载子代理内核
+    /// 算出该 Runtime 的 Job Object 上限。
+    ///
+    /// 存参数而不是存算好的 `JobLimits`：R26 起同一套 tuning 会派生出两种上限
+    /// （带子代理余量 / 不带），把计算留到调用点才不会有人拿错那一份。
+    memory: MemoryLimits,
 }
 
 impl RuntimeTuning {
@@ -850,7 +881,7 @@ impl RuntimeTuning {
             effects: limits.effects.sanitized(),
             event_frame: clamp_event_frame(limits.event_frame),
             event_backlog_bytes: limits.event_backlog_bytes.max(1),
-            job: limits.memory.sanitized().job_limits(),
+            memory: limits.memory.sanitized(),
         }
     }
 }
@@ -1808,6 +1839,7 @@ impl SessionHandle {
                     publish_tool_restart_failure(&entry, old_epoch, preset, error);
                     return;
                 }
+                let session_cwd = cwd.clone();
                 let (mut config, diagnostic) =
                     active_session_config(binary, session_path, cwd, preset);
                 let agent_dir = entry.state.lock().unwrap().agent_dir.clone();
@@ -1817,7 +1849,11 @@ impl SessionHandle {
                         agent_dir.as_os_str().to_owned(),
                     ));
                 }
-                clamp_manager_config(&mut config, entry.tuning);
+                clamp_manager_config_with_subagent_slots(
+                    &mut config,
+                    entry.tuning,
+                    subagent_slots_for(preset, agent_dir.as_deref(), &session_cwd),
+                );
                 let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
                 let client = match Client::spawn(config) {
                     Ok(client) => client,
@@ -2552,7 +2588,15 @@ impl RuntimeManager {
                 agent_dir.as_os_str().to_owned(),
             ));
         }
-        clamp_manager_config(&mut config, self.inner.tuning);
+        clamp_manager_config_with_subagent_slots(
+            &mut config,
+            self.inner.tuning,
+            subagent_slots_for(
+                descriptor.tool_preset,
+                descriptor.agent_dir.as_deref(),
+                &descriptor.cwd,
+            ),
+        );
         let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
         let client = Client::spawn(config).map_err(|error| error.to_string())?;
         let events = client.subscribe();
@@ -3535,12 +3579,37 @@ fn shutdown_entry(entry: &RuntimeEntry) {
 }
 
 fn clamp_manager_config(config: &mut ClientConfig, tuning: RuntimeTuning) {
+    clamp_manager_config_with_subagent_slots(config, tuning, 0);
+}
+
+/// 该 Runtime 要为子代理预留几个并发槽的内存余量。
+///
+/// 与「有没有注入内核」同一个判据（[`ToolPreset::loads_subagent_kernel`]）：没注入内核
+/// 就不可能有进程内子代理，余量为 0；注入了就按内核**配置的**并发上限预留。
+/// 配置只读不写（见 [`subagent_config`] 模块头），读不到就落到内核默认值。
+fn subagent_slots_for(preset: ToolPreset, agent_dir: Option<&Path>, cwd: &Path) -> u32 {
+    if preset.loads_subagent_kernel() {
+        subagent_config::effective_concurrency(agent_dir, Some(cwd))
+    } else {
+        0
+    }
+}
+
+/// R25：经 Manager 创建的每一个 Runtime 都带自己的 Job Object 硬上限 —— 用户会话、
+/// 内建子代理、maintenance 导出一视同仁。这里是唯一落点，新增创建路径只要走
+/// 这个函数就自动被纳管，不会漏掉一棵没人管的进程树。
+///
+/// R26 增加 `subagent_slots`：加载了子代理内核的 Runtime 需要为内核**进程内**开的
+/// 子代理会话预留内存余量，否则一次正常的并行委派会把父会话一起撞死在硬上限上。
+/// 不加载内核的路径传 `0`，行为与 R25 完全一致。
+fn clamp_manager_config_with_subagent_slots(
+    config: &mut ClientConfig,
+    tuning: RuntimeTuning,
+    subagent_slots: u32,
+) {
     config.max_restarts = 0;
     config.event_backlog_bytes = tuning.event_backlog_bytes;
-    // R25：经 Manager 创建的每一个 Runtime 都带自己的 Job Object 硬上限 —— 用户会话、
-    // 内建子代理、maintenance 导出一视同仁。这里是唯一落点，新增创建路径只要走
-    // `clamp_manager_config` 就自动被纳管，不会漏掉一棵没人管的进程树。
-    config.job_limits = tuning.job;
+    config.job_limits = tuning.memory.job_limits_with_subagent_slots(subagent_slots);
 }
 
 fn publish_if_current(entry: &RuntimeEntry, epoch: u64, kind: RuntimeEffectKind) {
@@ -3948,32 +4017,71 @@ fn active_session_config(
     cwd: PathBuf,
     tool_preset: ToolPreset,
 ) -> (ClientConfig, Option<String>) {
-    active_session_config_with_materializer(binary, session_path, cwd, tool_preset, || {
-        pi_rpc::materialize_host_extension()
-    })
+    active_session_config_with_sources(
+        binary,
+        session_path,
+        cwd,
+        tool_preset,
+        pi_rpc::materialize_host_extension,
+        official_subagent_kernel,
+    )
 }
 
-fn active_session_config_with_materializer(
+/// 组装一个用户会话的启动参数。
+///
+/// 两个 `-e` 的来源不同，所以分成两个可注入的解析器：项目命令环境扩展是随 Rust 二进制
+/// 内嵌、每次落到临时目录（会失败，所以返回 `io::Result`）；子代理内核是 vendor 里的
+/// 钉死目录（不会"生成失败"，只会"没准备好"）。两者任一缺席都只降级并回报诊断，
+/// 不阻断会话启动 —— 少一个扩展总好过开不出会话。
+fn active_session_config_with_sources(
     binary: PathBuf,
     session_path: Option<PathBuf>,
     cwd: PathBuf,
     tool_preset: ToolPreset,
     materialize: impl FnOnce() -> std::io::Result<PathBuf>,
+    resolve_kernel: impl FnOnce() -> PathBuf,
 ) -> (ClientConfig, Option<String>) {
     let mut config = ClientConfig::new(binary);
     config.current_dir = Some(cwd);
     config.initial_session = session_path;
     config.args = vec!["--no-context-files".into()];
-    let diagnostic = match materialize() {
+    let mut diagnostics = Vec::new();
+    match materialize() {
         Ok(host_extension) => {
             config
                 .args
                 .extend(["-e".into(), host_extension.into_os_string()]);
-            None
         }
-        Err(error) => Some(format!("项目命令环境扩展未加载：{error}")),
-    };
+        Err(error) => diagnostics.push(format!("项目命令环境扩展未加载：{error}")),
+    }
+    if tool_preset.loads_subagent_kernel() {
+        let kernel = resolve_kernel();
+        // pi 读的是包根的 package.json 里那份 `pi.extensions` 清单，所以以它为就绪标志。
+        if kernel.join("package.json").is_file() {
+            config.args.extend(["-e".into(), kernel.into_os_string()]);
+        } else {
+            diagnostics.push(format!(
+                "内建子代理内核未就绪（先跑 scripts/fetch-pi-subagents-lite.ps1）：{}",
+                kernel.display()
+            ));
+        }
+    }
     tool_preset.append_args(&mut config.args);
+    // 所有者裁定（2026-08-27）：内建内核是本应用唯一的子代理通道，已知第三方子代理
+    // 工具名对每个预设恒拉黑。对下发 `--tools` 允许列表的四个预设这是冗余保险
+    // （allowlist 本就挡在外面）；真正的洞在 `Inherit` —— 它不下发 `--tools`，用户
+    // 全局装的 pi-subagents 之类会与内核同场，模型可能挑走第三方工具（R26 实测
+    // 撞过一次，见 BACKLOG #41 收口）。`--exclude-tools` 是进程级参数，只作用于
+    // 本应用拉起的 pi，不碰用户终端 pi；用户其他扩展及其工具不受影响。
+    config.args.push("--exclude-tools".into());
+    config
+        .args
+        .push(pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES.join(",").into());
+    let diagnostic = if diagnostics.is_empty() {
+        None
+    } else {
+        Some(diagnostics.join("；"))
+    };
     (config, diagnostic)
 }
 
@@ -4051,6 +4159,18 @@ pub fn official_binary() -> PathBuf {
         .join("vendor")
         .join("pi")
         .join(pi_rpc::pi_binary_name())
+}
+
+/// vendor 里钉死的子代理执行内核目录（`pi -e <该目录>` 加载）。
+///
+/// 与 [`official_binary`] 用同一套 `CARGO_MANIFEST_DIR` 相对定位，两者必须一起随
+/// R17 打包方案调整 —— 一个改成运行时相对路径而另一个没改，会出现"pi 起得来但
+/// 子代理不见了"这种只在安装包里复现的问题。
+pub fn official_subagent_kernel() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("vendor")
+        .join(pi_rpc::subagent_kernel_dir_name())
 }
 
 fn spawn_event_pump(
@@ -4629,21 +4749,33 @@ mod tests {
 
     #[test]
     fn active_session_config_always_loads_host_extension_without_changing_tool_presets() {
+        // 每个预设：`--tools` 允许列表（None = 不下发该 flag），以及是否注入子代理内核。
         let expected = [
-            (ToolPreset::Inherit, None),
-            (ToolPreset::None, Some("")),
-            (ToolPreset::ReadOnly, Some("read,grep,find,ls")),
-            (ToolPreset::Default, Some("read,bash,edit,write")),
-            (ToolPreset::Full, Some("bash,read,edit,write,grep,find,ls")),
+            (ToolPreset::Inherit, None, true),
+            (ToolPreset::None, Some(""), false),
+            (ToolPreset::ReadOnly, Some("read,grep,find,ls"), false),
+            (
+                ToolPreset::Default,
+                Some("read,bash,edit,write,Agent,StopAgent,AgentStatus"),
+                true,
+            ),
+            (
+                ToolPreset::Full,
+                Some("bash,read,edit,write,grep,find,ls,Agent,StopAgent,AgentStatus"),
+                true,
+            ),
         ];
-        for (preset, allowlist) in expected {
-            let (config, diagnostic) = active_session_config(
+        for (preset, allowlist, loads_kernel) in expected {
+            // 故意给一个不存在的内核目录：这里要验证的是「缺内核只降级、不改工具列表、
+            // 也不多塞 -e」，而不是本机 vendor 是否恰好准备好了。
+            let (config, diagnostic) = active_session_config_with_sources(
                 PathBuf::from("pi.exe"),
                 Some(PathBuf::from("session.jsonl")),
                 PathBuf::from("project"),
                 preset,
+                pi_rpc::materialize_host_extension,
+                || PathBuf::from("kernel-not-prepared"),
             );
-            assert!(diagnostic.is_none());
             assert_eq!(config.args[0], "--no-context-files");
             assert_eq!(config.args[1], "-e");
             let extension_path = Path::new(&config.args[2]);
@@ -4652,24 +4784,239 @@ mod tests {
                 extension_path.file_name().and_then(|name| name.to_str()),
                 Some("project-command-environment.ts")
             );
+            assert_eq!(diagnostic.is_some(), loads_kernel, "preset={preset:?}");
+            // 每个预设尾部恒带第三方子代理工具的拉黑对（所有者裁定 2026-08-27）。
+            let exclusion = [
+                "--exclude-tools",
+                "subagent,subagent_wait,subagent_supervisor",
+            ]
+            .map(std::ffi::OsString::from);
             match allowlist {
-                Some(allowlist) => assert_eq!(
-                    &config.args[3..],
-                    &["--tools", allowlist].map(std::ffi::OsString::from)
-                ),
-                None => assert_eq!(config.args.len(), 3),
+                Some(allowlist) => {
+                    let mut tail = ["--tools", allowlist]
+                        .map(std::ffi::OsString::from)
+                        .to_vec();
+                    tail.extend(exclusion);
+                    assert_eq!(&config.args[3..], &tail[..]);
+                }
+                None => assert_eq!(&config.args[3..], &exclusion),
             }
         }
     }
 
     #[test]
-    fn fresh_active_session_config_has_no_initial_session() {
-        let (config, diagnostic) = active_session_config_with_materializer(
+    fn active_session_config_injects_prepared_subagent_kernel_as_second_extension() {
+        let kernel_dir = tempfile::tempdir().unwrap();
+        std::fs::write(kernel_dir.path().join("package.json"), "{}").unwrap();
+        let kernel = kernel_dir.path().to_path_buf();
+        let (config, diagnostic) = active_session_config_with_sources(
+            PathBuf::from("pi.exe"),
+            None,
+            PathBuf::from("project"),
+            ToolPreset::Full,
+            || Ok(PathBuf::from("host.ts")),
+            || kernel,
+        );
+        assert!(diagnostic.is_none());
+        assert_eq!(
+            config.args,
+            [
+                std::ffi::OsString::from("--no-context-files"),
+                "-e".into(),
+                "host.ts".into(),
+                "-e".into(),
+                kernel_dir.path().into(),
+                "--tools".into(),
+                "bash,read,edit,write,grep,find,ls,Agent,StopAgent,AgentStatus".into(),
+                "--exclude-tools".into(),
+                "subagent,subagent_wait,subagent_supervisor".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_kernel_is_not_injected_for_read_only_or_disabled_presets() {
+        // ReadOnly 放行子代理等于给只读会话开写权限：子代理的工具集来自 agent 定义与
+        // pi settings 的 defaultTools，父会话的 --tools 传导不过去。这条把结论钉住。
+        for preset in [ToolPreset::ReadOnly, ToolPreset::None] {
+            assert!(!preset.loads_subagent_kernel(), "preset={preset:?}");
+            assert!(!preset.allows_subagents(), "preset={preset:?}");
+            let kernel_dir = tempfile::tempdir().unwrap();
+            std::fs::write(kernel_dir.path().join("package.json"), "{}").unwrap();
+            let kernel = kernel_dir.path().to_path_buf();
+            let (config, diagnostic) = active_session_config_with_sources(
+                PathBuf::from("pi.exe"),
+                None,
+                PathBuf::from("project"),
+                preset,
+                || Ok(PathBuf::from("host.ts")),
+                || kernel,
+            );
+            assert!(diagnostic.is_none(), "preset={preset:?}");
+            assert_eq!(
+                config.args.iter().filter(|arg| *arg == "-e").count(),
+                1,
+                "preset={preset:?}"
+            );
+            let tools = config
+                .args
+                .iter()
+                .skip_while(|arg| *arg != "--tools")
+                .nth(1)
+                .cloned()
+                .unwrap_or_default();
+            for name in pi_rpc::SUBAGENT_TOOL_NAMES {
+                assert!(
+                    !tools.to_string_lossy().contains(name),
+                    "preset={preset:?} 不应放行 {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherit_preset_injects_kernel_without_emitting_a_tools_allowlist() {
+        // Inherit 不下发 --tools（可见性交给 pi 的 defaultTools），但内核必须注入，
+        // 否则默认预设下子代理直接不存在。
+        let kernel_dir = tempfile::tempdir().unwrap();
+        std::fs::write(kernel_dir.path().join("package.json"), "{}").unwrap();
+        let kernel = kernel_dir.path().to_path_buf();
+        let (config, diagnostic) = active_session_config_with_sources(
             PathBuf::from("pi.exe"),
             None,
             PathBuf::from("project"),
             ToolPreset::Inherit,
             || Ok(PathBuf::from("host.ts")),
+            || kernel,
+        );
+        assert!(diagnostic.is_none());
+        assert!(!config.args.iter().any(|arg| arg == "--tools"));
+        assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 2);
+    }
+
+    #[test]
+    fn third_party_subagent_tools_are_excluded_for_every_preset() {
+        // 拉黑必须对全部预设成立：四个显式预设靠 allowlist 已经挡住只是巧合式防护，
+        // `Inherit` 不下发 `--tools`，没有这条 denylist 时第三方 `subagent` 会与内建
+        // `Agent` 同场竞争（R26 实测就是这么撞上的）。同时钉死 denylist 与内建三件套
+        // 名字不相交 —— pi 的排除是精确名匹配，一旦交叉就等于拉黑自己。
+        for third_party in pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES {
+            assert!(
+                !pi_rpc::SUBAGENT_TOOL_NAMES.contains(&third_party),
+                "denylist 不得包含内建子代理工具名：{third_party}"
+            );
+        }
+        for preset in ToolPreset::ALL {
+            let (config, _) = active_session_config_with_sources(
+                PathBuf::from("pi.exe"),
+                None,
+                PathBuf::from("project"),
+                preset,
+                || Ok(PathBuf::from("host.ts")),
+                || PathBuf::from("kernel-not-prepared"),
+            );
+            let denylist = config
+                .args
+                .iter()
+                .skip_while(|arg| *arg != "--exclude-tools")
+                .nth(1)
+                .cloned()
+                .unwrap_or_else(|| panic!("preset={preset:?} 缺 --exclude-tools"));
+            assert_eq!(
+                denylist,
+                std::ffi::OsString::from(pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES.join(",")),
+                "preset={preset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_subagent_kernel_degrades_with_a_diagnostic_naming_the_fetch_script() {
+        let (config, diagnostic) = active_session_config_with_sources(
+            PathBuf::from("pi.exe"),
+            None,
+            PathBuf::from("project"),
+            ToolPreset::Full,
+            || Ok(PathBuf::from("host.ts")),
+            || PathBuf::from("definitely-not-prepared"),
+        );
+        let diagnostic = diagnostic.expect("缺内核必须回报诊断");
+        assert!(
+            diagnostic.contains("fetch-pi-subagents-lite"),
+            "{diagnostic}"
+        );
+        // 降级后仍要能开会话：只是少了第二个 -e。
+        assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 1);
+    }
+
+    #[test]
+    fn only_kernel_loading_presets_reserve_subagent_memory_headroom() {
+        // 判据必须与「注入不注入内核」严格同源，否则会出现两种错配：给不加载内核的
+        // Runtime 白留几 GiB 上限，或者给加载了内核的 Runtime 不留 —— 后者会让一次
+        // 正常的并行委派把父会话一起撞死。
+        let dir = tempfile::tempdir().unwrap();
+        let expected = subagent_config::effective_concurrency(None, Some(dir.path()));
+        assert!(expected > 0, "默认配置也必须留出余量");
+        for preset in ToolPreset::ALL {
+            let slots = subagent_slots_for(preset, None, dir.path());
+            if preset.loads_subagent_kernel() {
+                assert_eq!(slots, expected, "preset={preset:?}");
+            } else {
+                assert_eq!(slots, 0, "preset={preset:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_level_concurrency_override_changes_the_reserved_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        // 项目层受 trust 门禁，而门禁要 `agent_dir` 才能查 trust store —— 传 `None`
+        // 一律按不可信处理，项目配置不会生效。这里给一个真实的 agent_dir。
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+        std::fs::write(
+            cwd.join(".pi").join("subagents-lite.json"),
+            r#"{"concurrency":{"default":1}}"#,
+        )
+        .unwrap();
+        let with_override = subagent_slots_for(ToolPreset::Full, Some(&agent_dir), &cwd);
+        assert!(
+            with_override < subagent_config::effective_concurrency(None, None),
+            "调小 concurrency.default 必须让预留槽数跟着变小（实际 {with_override}）"
+        );
+        // 不加载内核的预设根本不看配置。
+        assert_eq!(
+            subagent_slots_for(ToolPreset::ReadOnly, Some(&agent_dir), &cwd),
+            0
+        );
+    }
+
+    #[test]
+    fn official_subagent_kernel_points_at_the_pinned_vendor_directory() {
+        let kernel = official_subagent_kernel();
+        assert_eq!(
+            kernel.file_name().and_then(|name| name.to_str()),
+            Some(pi_rpc::subagent_kernel_dir_name().as_str())
+        );
+        assert!(
+            pi_rpc::subagent_kernel_dir_name().ends_with(pi_rpc::PINNED_SUBAGENTS_LITE_VERSION)
+        );
+    }
+
+    #[test]
+    fn fresh_active_session_config_has_no_initial_session() {
+        let kernel_dir = tempfile::tempdir().unwrap();
+        std::fs::write(kernel_dir.path().join("package.json"), "{}").unwrap();
+        let kernel = kernel_dir.path().to_path_buf();
+        let (config, diagnostic) = active_session_config_with_sources(
+            PathBuf::from("pi.exe"),
+            None,
+            PathBuf::from("project"),
+            ToolPreset::Inherit,
+            || Ok(PathBuf::from("host.ts")),
+            || kernel,
         );
         assert!(diagnostic.is_none());
         assert_eq!(config.current_dir.as_deref(), Some(Path::new("project")));
@@ -4678,7 +5025,8 @@ mod tests {
 
     #[test]
     fn active_session_config_degrades_without_extension_and_reports_diagnostic() {
-        let (config, diagnostic) = active_session_config_with_materializer(
+        // ReadOnly 本就不注入子代理内核，所以这里只会有项目命令环境扩展那一条诊断。
+        let (config, diagnostic) = active_session_config_with_sources(
             PathBuf::from("pi.exe"),
             Some(PathBuf::from("session.jsonl")),
             PathBuf::from("project"),
@@ -4689,10 +5037,18 @@ mod tests {
                     "denied",
                 ))
             },
+            || PathBuf::from("unused"),
         );
         assert_eq!(
             config.args,
-            ["--no-context-files", "--tools", "read,grep,find,ls"].map(std::ffi::OsString::from)
+            [
+                "--no-context-files",
+                "--tools",
+                "read,grep,find,ls",
+                "--exclude-tools",
+                "subagent,subagent_wait,subagent_supervisor",
+            ]
+            .map(std::ffi::OsString::from)
         );
         assert_eq!(
             diagnostic.as_deref(),

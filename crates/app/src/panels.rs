@@ -226,6 +226,11 @@ pub struct SessionUiState {
     tail_attached: bool,
     follow_requested: bool,
     minimap_visible: bool,
+    /// 子代理任务面板是否展开。
+    ///
+    /// 与 `minimap_visible` 一样按会话隔离：并行会话里只有一个在跑子代理时，
+    /// 不该因为在那边展开过，切回来就把另一个会话的 composer 也顶下去一截。
+    subagent_panel_expanded: bool,
     expanded_tools: HashSet<String>,
     expanded_processes: HashSet<String>,
     rpc_success: Option<String>,
@@ -301,6 +306,8 @@ impl SessionUiState {
             tail_attached: true,
             follow_requested: false,
             minimap_visible: true,
+            // 默认折叠：绝大多数会话没有子代理，折叠态只占一行汇总，不抢 composer 的高度。
+            subagent_panel_expanded: false,
             expanded_tools: HashSet::new(),
             expanded_processes: HashSet::new(),
             rpc_success: None,
@@ -3499,6 +3506,32 @@ impl ChatPanel {
         cx.notify();
     }
 
+    fn toggle_subagent_panel(&mut self, cx: &mut Context<Self>) {
+        self.subagent_panel_expanded = !self.subagent_panel_expanded;
+        cx.notify();
+    }
+
+    /// 当前可见文档里的子代理任务。
+    ///
+    /// 每帧现算，**刻意不做缓存**。曾经按 `Arc::ptr_eq(document)` 记忆化过一版，但
+    /// `SessionHandle::snapshot()` 每次都 `Arc::new(reducer.document())` —— 运行期每一帧
+    /// 都是新 `Arc`，缓存恰好在它声称要优化的场景里永远不命中，只剩下「钉住一份过期
+    /// 文档不让它释放」的副作用（后台标签尤其明显：失焦那一刻的文档会被无限期持有，
+    /// 让负载释放退化成写时复制）。
+    ///
+    /// 现算之所以够便宜，是因为 [`pi_render::SubagentTask`] 刻意不带 `prompt` / `result`
+    /// 这两个大字段：一次扫描 + 每个任务几个短字符串，与遍历文档本身同量级。
+    fn subagent_tasks(&self) -> Vec<pi_render::SubagentTask> {
+        self.branch_preview_document
+            .as_ref()
+            .or_else(|| match &self.status {
+                ChatStatus::Ready(document) => Some(document),
+                _ => None,
+            })
+            .map(|document| pi_render::collect_tasks(document))
+            .unwrap_or_default()
+    }
+
     fn update_workspace_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         if self.workspace_bounds != Some(bounds) {
             self.workspace_bounds = Some(bounds);
@@ -3725,6 +3758,20 @@ impl Render for ChatPanel {
             .as_ref()
             .map(|document| ChatStatus::Ready(document.clone()))
             .unwrap_or_else(|| self.status.clone());
+        let subagent_panel = {
+            let tasks = self.subagent_tasks();
+            gpui_pi_ui::render_subagent_tasks(
+                &tasks,
+                self.subagent_panel_expanded,
+                Some(Arc::new({
+                    let panel = cx.entity();
+                    move |cx: &mut App| {
+                        panel.update(cx, |panel, cx| panel.toggle_subagent_panel(cx));
+                    }
+                })),
+                cx,
+            )
+        };
         let content = match &visible_status {
             ChatStatus::Empty => centered_state(
                 IconName::Bot,
@@ -4236,6 +4283,7 @@ impl Render for ChatPanel {
                                 .child(error),
                         )
                     })
+                    .when_some(subagent_panel, gpui::ParentElement::child)
                     .when(!above_widgets.is_empty(), |view| {
                         view.child(render_extension_widgets(
                             "extension-widgets-above",
@@ -5081,6 +5129,26 @@ mod tests {
             ),
         )
         .unwrap();
+        Arc::new(pi_render::render_path(path).unwrap())
+    }
+
+    /// 含一条内建子代理结果条目的历史 fixture。
+    fn subagent_document() -> Arc<ConversationDocument> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent.jsonl");
+        // 原始字符串直写 JSONL：`gpui-pi` 不依赖 serde_json，而 `r#".."#` 里的 `\"`
+        // 与 `\n` 正好就是 JSON 需要的转义，不必再套一层 Rust 转义。
+        let body = concat!(
+            r#"{"type":"session","id":"s","timestamp":"2026-01-01T00:00:00Z","cwd":"C:/fixture"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","message":{"role":"user","content":"并行审这三个模块"}}"#,
+            "\n",
+            r#"{"type":"custom_message","id":"c1","parentId":"u1","customType":"subagent-result","display":true,"#,
+            r#""content":"[Subagent \"reviewer\" a1b2c3d4 completed]\n\n没发现阻断项","#,
+            r#""details":{"type":"reviewer","description":"审 pi-runtime","status":"completed","turnCount":5}}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
         Arc::new(pi_render::render_path(path).unwrap())
     }
 
@@ -7678,6 +7746,63 @@ mod tests {
         assert!(production.contains(".max_h_64()"));
         assert!(!production.contains(&old_width));
         assert!(!production.contains(&old_height));
+    }
+
+    #[gpui::test]
+    fn subagent_panel_appears_only_when_the_session_actually_has_tasks(cx: &mut TestAppContext) {
+        let (mut visual, panel) =
+            render_status_with_panel(cx, ChatStatus::Ready(document("没有子代理")));
+        draw_frames(&mut visual, 2);
+        assert!(
+            visual.debug_bounds("subagent-panel").is_none(),
+            "没有子代理任务时不该占用 composer 上方的高度"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.status = ChatStatus::Ready(subagent_document());
+            cx.notify();
+        });
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("subagent-panel").is_some());
+        // 默认折叠：只有汇总那一行，任务行要展开才出现。
+        assert!(visual.debug_bounds("subagent-task-row").is_none());
+
+        panel.update(cx, |panel, cx| panel.toggle_subagent_panel(cx));
+        draw_frames(&mut visual, 2);
+        assert!(visual.debug_bounds("subagent-task-row").is_some());
+    }
+
+    #[gpui::test]
+    fn subagent_tasks_carry_no_bulk_payload_so_recomputing_every_frame_is_cheap(
+        cx: &mut TestAppContext,
+    ) {
+        // 任务列表每帧现算，所以它必须**不含**大字段：结果正文归 `Block::Subagent`
+        // 卡片（那一份是记账、可释放的），任务只带标识与统计。
+        // 先前那版带 `result` 且靠 `Arc::ptr_eq` 记忆化，而 `snapshot()` 每次都造新 Arc，
+        // 缓存在运行期恒不命中 —— 等于每帧深拷贝一遍全部子代理产出。
+        let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
+        panel.update(cx, |panel, _| {
+            panel.status = ChatStatus::Ready(subagent_document());
+            let tasks = panel.subagent_tasks();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].agent_type, "reviewer");
+            assert_eq!(tasks[0].status, pi_render::SubagentStatus::Completed);
+
+            // 任务本身的字符串量级必须与「一条摘要」相当，不能是正文的副本。
+            let footprint: usize = tasks
+                .iter()
+                .map(|task| {
+                    task.key.len()
+                        + task.agent_type.len()
+                        + task.description.len()
+                        + task.stop_reason.as_deref().map_or(0, str::len)
+                })
+                .sum();
+            assert!(footprint < 512, "单条任务的字符串足迹过大：{footprint}");
+
+            panel.status = ChatStatus::Empty;
+            assert!(panel.subagent_tasks().is_empty());
+        });
     }
 
     #[gpui::test]

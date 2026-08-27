@@ -42,6 +42,11 @@ $global:LASTEXITCODE = 0
 & "$Root\scripts\check-pi-web-pin.ps1"
 if ($LASTEXITCODE -ne 0) { $fail = $true }
 
+# R26 起 vendor 里多了一份**运行时**依赖（子代理执行内核），同样按 manifest 全量判红。
+$global:LASTEXITCODE = 0
+& "$Root\scripts\check-pi-subagents-lite-pin.ps1"
+if ($LASTEXITCODE -ne 0) { $fail = $true }
+
 # 成功也要显式 exit 0：调用方（validate.ps1）靠 $LASTEXITCODE 判断，
 # 而 .ps1 正常落地时并不会写这个变量。
 if ($fail) { exit 1 } else { exit 0 }

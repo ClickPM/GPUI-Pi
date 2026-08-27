@@ -29,6 +29,13 @@ fn main() {
     assert!(status.success(), "Windows 应用图标资源编译失败");
 
     println!("cargo:rustc-link-arg-bin=gpui-pi={}", output.display());
+
+    // Windows 主线程默认 1MB 栈对 GPUI 的 debug 构建不够：元素树布局的调用深度在
+    // debug（无内联、帧膨胀）下会一次性吃穿 1MB，启动即 0xc00000fd（R26 实测：
+    // release 正常、debug 空 agent 目录也必崩，故障与会话内容无关，纯阈值问题——
+    // 早晨的 debug 构建侥幸在阈值下，一次重编译后被推过线）。与 Zed 对 zed.exe 的
+    // 处置一致：把主线程栈抬到 8MB。只影响链接参数，不动依赖。
+    println!("cargo:rustc-link-arg-bin=gpui-pi=/STACK:8388608");
 }
 
 fn find_resource_compiler() -> PathBuf {

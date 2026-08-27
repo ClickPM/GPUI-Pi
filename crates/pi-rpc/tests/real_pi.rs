@@ -466,6 +466,109 @@ export default function userBash(pi: ExtensionAPI): void {
 
 #[test]
 #[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
+fn third_party_subagent_tool_is_excluded_while_other_extensions_survive() {
+    // 关掉 R26 的 T2 盲区：当初的内核加载实测带着 `--no-extensions`，与生产形态
+    // （不带该参数、用户全局扩展同场）不同。这里按生产形态复现「两套子代理并存」：
+    // 密封 agent 目录里装一个注册三个第三方子代理工具的样板 + 一个注册普通工具的
+    // 用户扩展，再显式 `-e` 内核并带上生产恒加的 `--exclude-tools` 拉黑对。
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vendor")
+        .join(pi_rpc::subagent_kernel_dir_name());
+    assert!(
+        kernel.join("package.json").is_file(),
+        "内核未就绪，先跑 scripts/fetch-pi-subagents-lite.ps1：{}",
+        kernel.display()
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let extension_dir = temp.path().join("agent").join("extensions");
+    fs::create_dir_all(&extension_dir).unwrap();
+    // 样板一：模仿 npm:pi-subagents@0.56.0 在父会话注册的**全部三个**工具（派发
+    // `subagent`、等待 `subagent_wait`、监督 `subagent_supervisor`；其第四个工具
+    // `contact_supervisor` 有子进程门禁、不会出现在父会话，故不模仿），外加一个
+    // 命令用来证明「扩展本身照常加载，被屏蔽的只是工具」。
+    fs::write(
+        extension_dir.join("fake-third-party-subagents.ts"),
+        r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+export default function fakeThirdPartySubagents(pi: ExtensionAPI): void {
+  for (const name of ["subagent", "subagent_wait", "subagent_supervisor"]) {
+    pi.registerTool({
+      name,
+      label: `fake third-party ${name}`,
+      description: "mimics npm:pi-subagents",
+      parameters: Type.Object({ task: Type.String() }),
+      async execute() { return { content: [{ type: "text", text: "must-not-be-visible" }] }; },
+    });
+  }
+  pi.registerCommand("r26-fake-subagents-loaded", {
+    description: "proves the extension itself still loads",
+    handler: async () => {},
+  });
+}
+"#,
+    )
+    .unwrap();
+    // 样板二：用户的其他扩展 —— 注册一个普通工具，并在资源发现后回报全场工具可见性。
+    fs::write(
+        extension_dir.join("other-user-extension.ts"),
+        r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+export default function otherUserExtension(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "r26_user_other",
+    label: "user other tool",
+    description: "unrelated user tool that must survive",
+    parameters: Type.Object({ value: Type.String() }),
+    async execute() { return { content: [{ type: "text", text: "ok" }] }; },
+  });
+  pi.on("resources_discover", () => {
+    const names = new Set(pi.getAllTools().map((tool) => tool.name));
+    pi.appendEntry("r26-tool-visibility", {
+      subagent: names.has("subagent"),
+      subagentWait: names.has("subagent_wait"),
+      subagentSupervisor: names.has("subagent_supervisor"),
+      agent: names.has("Agent"),
+      stopAgent: names.has("StopAgent"),
+      agentStatus: names.has("AgentStatus"),
+      other: names.has("r26_user_other"),
+    });
+  });
+}
+"#,
+    )
+    .unwrap();
+    let mut config = client_config(&temp);
+    remove_arg(&mut config, "--no-extensions");
+    config.args.extend([
+        "-e".into(),
+        kernel.into_os_string(),
+        "--exclude-tools".into(),
+        pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES.join(",").into(),
+    ]);
+    let client = Client::spawn(config).unwrap();
+    let visibility = wait_for_entry(&client, "r26-tool-visibility");
+    assert_eq!(visibility["subagent"], false, "{visibility}");
+    assert_eq!(visibility["subagentWait"], false, "{visibility}");
+    assert_eq!(visibility["subagentSupervisor"], false, "{visibility}");
+    assert_eq!(visibility["agent"], true, "{visibility}");
+    assert_eq!(visibility["stopAgent"], true, "{visibility}");
+    assert_eq!(visibility["agentStatus"], true, "{visibility}");
+    assert_eq!(visibility["other"], true, "{visibility}");
+    let commands: CommandsData = client.request_data(Command::GetCommands, TIMEOUT).unwrap();
+    assert!(
+        commands
+            .commands
+            .iter()
+            .any(|command| command.name == "r26-fake-subagents-loaded"),
+        "第三方扩展本身应照常加载，被屏蔽的只是工具"
+    );
+    client.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires PI_RPC_TEST_BINARY=official pi 0.84.2"]
 fn zero_token_command_matrix() {
     let test = client();
     let client = &test.client;

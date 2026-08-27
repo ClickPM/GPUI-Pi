@@ -82,6 +82,10 @@ fn block_payload_bytes(block: &Block) -> usize {
             // 大幅超出上限。`crates/ui` / `crates/app` 对它零引用，释放它没有视觉代价。
             output.saturating_add(tool.details.as_ref().map_or(0, json_string_bytes))
         }
+        // 子代理结果是**进程产出**，和工具输出同一性质：单条上限 512KiB，一个长会话里
+        // 攒几十条就能把文档撑爆。不计入的话，这类负载会绕开整篇文档的总预算 ——
+        // 而它恰恰是 R26 新引入的、唯一会随后台任务数线性增长的字段。
+        Block::Subagent(card) => card.result.len(),
         _ => 0,
     }
 }
@@ -187,6 +191,7 @@ fn release_cost(message: &Message) -> usize {
         .map(|block| match block {
             Block::Image(image) if image.bytes.is_some() => RELEASED_IMAGE_NOTICE.len(),
             Block::Tool(tool) if !tool.output.is_empty() => RELEASED_OUTPUT_NOTICE.len(),
+            Block::Subagent(card) if !card.result.is_empty() => RELEASED_OUTPUT_NOTICE.len(),
             _ => 0,
         })
         .sum()
@@ -207,10 +212,16 @@ pub(crate) fn release_payload(message: &mut Message) -> (usize, usize) {
                 }
             }
             Block::Tool(tool) => {
-                // 结构化详情先无条件放掉。它是被计入预算的，而一张"输出为空、详情很大"
-                // 的卡片（合法的空结果 + 非 patch 结构化详情）会在下面那个 `continue`
-                // 上原样溜走 —— 预算算得到它、却永远释放不掉。
-                tool.details = None;
+                // 结构化详情先放掉。它是被计入预算的，而一张"输出为空、详情很大"的卡片
+                // （合法的空结果 + 非 patch 结构化详情）会在下面那个 `continue` 上原样
+                // 溜走 —— 预算算得到它、却永远释放不掉。
+                //
+                // 唯一的例外是内建子代理的派发卡片：后台派发的 `agentId` **只**存在于
+                // details 里（内核 `tool-execution.ts:229`），它同时是任务面板归并同一次
+                // 派发的主键。整份抹掉会让一次派发在面板里裂成两条，其中一条还会因为
+                // 丢了 `status` 而把在跑的子代理显示成已完成。所以这里按名字保留一小撮
+                // **定长**身份字段，其余照旧释放。
+                tool.details = retained_tool_details(&tool.name, tool.details.take());
                 if tool.output.is_empty() {
                     continue;
                 }
@@ -235,10 +246,40 @@ pub(crate) fn release_payload(message: &mut Message) -> (usize, usize) {
                 outputs += tool.output.len();
                 tool.output = vec![ToolOutput::Text(RELEASED_OUTPUT_NOTICE.to_owned())];
             }
+            Block::Subagent(card) => {
+                // 只放掉正文，卡片本身（类型、状态、统计、transcript 路径）留着 ——
+                // 与工具卡片同一口径：结构可见、负载可释放。完整正文仍在磁盘上的
+                // 会话文件里，也在 `details.outputFile` 指向的 transcript 里。
+                if card.result.is_empty() || card.result == RELEASED_OUTPUT_NOTICE {
+                    continue;
+                }
+                card.result = RELEASED_OUTPUT_NOTICE.to_owned();
+                outputs += 1;
+            }
             _ => {}
         }
     }
     (images, outputs)
+}
+
+/// 释放工具 details 时需要保留的身份字段。
+///
+/// 只保留短小且不可再生的标识：`agentId` 是 17 字符，`status` / `type` 是短枚举词，
+/// 三者加起来不到 100 字节，不构成负载；而它们一旦丢失就无法从别处恢复。
+const RETAINED_SUBAGENT_DETAIL_KEYS: [&str; 3] = ["agentId", "status", "type"];
+
+fn retained_tool_details(tool_name: &str, details: Option<Value>) -> Option<Value> {
+    if tool_name != crate::AGENT_TOOL {
+        return None;
+    }
+    let details = details?;
+    let mut kept = serde_json::Map::new();
+    for key in RETAINED_SUBAGENT_DETAIL_KEYS {
+        if let Some(value) = details.get(key) {
+            kept.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!kept.is_empty()).then_some(Value::Object(kept))
 }
 
 fn release_image(image: &mut ImageBlock) -> bool {
@@ -260,6 +301,29 @@ mod tests {
     use super::*;
     use crate::{MarkdownBlock, MessageRole, ToolCard, ToolStatus};
     use serde_json::Value;
+
+    fn subagent_message(id: &str, result: &str) -> Arc<Message> {
+        Arc::new(Message {
+            id: id.to_owned(),
+            role: MessageRole::Custom,
+            timestamp: None,
+            label: None,
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Subagent(Box::new(crate::SubagentCard {
+                agent_type: "scout".to_owned(),
+                description: Some("找调用点".to_owned()),
+                short_id: Some("a1b2c3d4".to_owned()),
+                agent_id: Some("a1b2c3d4e5f6".to_owned()),
+                status: crate::SubagentStatus::Completed,
+                stop_reason: None,
+                worktree_path: None,
+                output_file: Some("/tmp/pi-agent-outputs/a1b2c3d4e5f6.log".to_owned()),
+                result: result.to_owned(),
+                stats: crate::SubagentStats::default(),
+            }))],
+        })
+    }
 
     fn image_message(id: &str, bytes: usize) -> Arc<Message> {
         Arc::new(Message {
@@ -450,6 +514,49 @@ mod tests {
         assert!(
             kept.bytes.is_some(),
             "已经发出去的文档快照必须原样不动，不能在 UI 眼皮底下变内容"
+        );
+    }
+
+    #[test]
+    fn subagent_results_are_counted_and_released_like_tool_output() {
+        // R26 新增的这条负载会随后台任务数线性增长；不入账就会整个绕开文档总预算。
+        let big = "x".repeat(200 * 1024);
+        let mut messages = vec![
+            subagent_message("s1", &big),
+            subagent_message("s2", &big),
+            subagent_message("s3", &big),
+        ];
+        let before: usize = messages.iter().map(|m| payload_bytes(m)).sum();
+        assert!(before >= 600 * 1024, "实际 {before}");
+
+        let outcome = apply_payload_budget(&mut messages, 128 * 1024);
+        assert!(outcome.released_outputs > 0, "必须真的释放掉一些正文");
+        let after: usize = messages.iter().map(|m| payload_bytes(m)).sum();
+        assert!(after < before, "释放后总量必须下降：{before} -> {after}");
+
+        // 卡片结构留着，只有正文被换成占位文案 —— 与工具卡片同一口径。
+        let Block::Subagent(card) = &messages[0].blocks[0] else {
+            panic!("子代理块不该被替换成别的类型");
+        };
+        assert_eq!(card.result, RELEASED_OUTPUT_NOTICE);
+        assert_eq!(card.agent_type, "scout");
+        assert_eq!(card.status, crate::SubagentStatus::Completed);
+        assert_eq!(
+            card.output_file.as_deref(),
+            Some("/tmp/pi-agent-outputs/a1b2c3d4e5f6.log"),
+            "transcript 路径是找回完整正文的唯一线索，不能一起丢掉"
+        );
+    }
+
+    #[test]
+    fn releasing_a_subagent_result_twice_does_not_double_count() {
+        let mut messages = vec![subagent_message("s1", &"y".repeat(300 * 1024))];
+        let first = apply_payload_budget(&mut messages, 1024);
+        let second = apply_payload_budget(&mut messages, 1024);
+        assert!(first.released_outputs > 0);
+        assert_eq!(
+            second.released_outputs, 0,
+            "已经只剩占位文案的卡片不该被重复计数"
         );
     }
 }
