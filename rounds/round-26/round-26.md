@@ -146,6 +146,17 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 最终干脆不用 npm：直接下载并解包两个钉死 tarball，确定性最好，也顺带避开 typebox `^0.34.52` 这个
 caret 区间会随时间漂移的问题。
 
+### T2 验收实测
+
+| 检查 | 实测 |
+|---|---|
+| 扩展从 vendor 真实路径加载 | `pi --mode rpc --no-extensions -e <vendor 绝对路径>` 的 `get_commands` 返回 `agents` 命令，`sourceInfo.path` 指向 `vendor/pi-subagents-lite-1.13.0/src/index.ts`，**stderr 全空**，exit 0 |
+| `~/.pi` 无新增写入 | 运行前后对 `~/.pi` 递归 `find` 取快照逐条 diff：**24884 → 24884，新增 0 条**（红线 5） |
+| 预设与子代理工具的关系 | 由 `crates/pi-runtime` 的 `active_session_config_always_loads_host_extension_without_changing_tool_presets` 等 4 条用例覆盖五个预设 |
+| 回看 | `subagent_result_entries_decode_into_subagent_blocks_for_replay` 走完整 `render_path` 链路，从磁盘 JSONL 还原成子代理卡片并归并成任务 |
+
+> **T3（桌面端真实派发）未做** —— 需要真实模型调用与人工操作，本轮未执行，不得视为已验收。
+
 ### 与内核的三处口径修正
 
 1. **`ReadOnly` 预设不放行子代理**（任务卡初稿要求"非 `Inherit` 都放行"）。核对内核源码后确认：
@@ -225,7 +236,7 @@ caret 区间会随时间漂移的问题。
 
 ### validation
 
-`.\scriptsalidate.ps1` 全量（两轮独立代码审查整改后的最终一次），**exit 0**，共 **567 passed / 0 failed**，clippy `-D warnings` 零警告：
+`.\scripts\validate.ps1` 全量（两轮独立代码审查整改后的最终一次），**exit 0**，共 **567 passed / 0 failed**，clippy `-D warnings` 零警告：
 
 ```
 ### 范围：全工作区（含 gpui / gpui-component 编译）
