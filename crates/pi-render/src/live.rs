@@ -2,7 +2,11 @@
 //!
 //! RPC wire 类型刻意不泄漏到本 crate；app 只需把事件投影成这里的 `LiveEvent`。
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use serde_json::Value;
 
@@ -216,6 +220,19 @@ pub struct LiveSessionReducer {
     cached_items: Arc<[ConversationItem]>,
     cached_minimap: Arc<[MinimapNode]>,
     cached_diagnostics: Arc<[RenderDiagnostic]>,
+    /// 流式段的过程性负载预算。历史段在 `render_session` 里已经各自裁过一次，
+    /// 这里只管本次会话新长出来的部分，因此不必对历史做 `Arc` 手术。
+    payload_budget: usize,
+    /// 流式段负载的估算值；`None` 表示"不确定，下次必须重算"。
+    ///
+    /// 它只是**快门**：常态下用它 O(1) 判断"离预算还远着呢"，真要动手时再走一遍
+    /// 精确统计。没有它，每收一条完成消息都要 O(n) 扫一遍流式段。
+    live_payload_hint: Option<usize>,
+    /// 触发全量重扫的门槛，常态等于 `payload_budget`。
+    ///
+    /// 一趟扫完什么都没释放掉时会被抬高：剩下的负载释放不动，再每插一条消息就全量
+    /// 重扫一遍纯属白干，长会话会退化成 O(n²)。
+    enforce_threshold: usize,
     structure_dirty: bool,
     draft_dirty: bool,
     diagnostics_dirty: bool,
@@ -241,6 +258,9 @@ impl LiveSessionReducer {
             steering: Vec::new(),
             follow_up: Vec::new(),
             diagnostics: Vec::new(),
+            payload_budget: crate::DEFAULT_PAYLOAD_BUDGET_BYTES,
+            enforce_threshold: crate::DEFAULT_PAYLOAD_BUDGET_BYTES,
+            live_payload_hint: Some(0),
             structure_dirty: false,
             draft_dirty: false,
             diagnostics_dirty: false,
@@ -259,6 +279,41 @@ impl LiveSessionReducer {
             minimap: Arc::from([]),
             diagnostics: Arc::from([]),
         })
+    }
+
+    /// 覆盖流式段的过程性负载预算（测试与调参用）。
+    ///
+    /// 立即按新预算裁一次，避免"改小了预算却要等下一条消息才生效"。
+    pub fn set_payload_budget(&mut self, budget: usize) {
+        self.payload_budget = budget;
+        self.enforce_threshold = budget;
+        self.live_payload_hint = None;
+        self.enforce_payload_budget();
+    }
+
+    pub const fn payload_budget(&self) -> usize {
+        self.payload_budget
+    }
+
+    /// 流式段**原始副本**当前占用的字节估算：`CompletedMessage.value` 与
+    /// `tools[*].result` 里所有字符串长度之和。
+    ///
+    /// 存在的理由是可验收性 —— 渲染结果有界不等于内存有界。只裁 `rendered` 的话
+    /// [`crate::payload_bytes`] 会一直报"在预算内"，而原始 JSON 与工具结果照样在涨。
+    /// 这条是"原始副本也确实被裁了"的唯一客观判据。
+    pub fn live_raw_bytes(&self) -> usize {
+        let messages: usize = self
+            .completed
+            .iter()
+            .map(|completed| json_string_bytes(&completed.value))
+            .sum();
+        let results: usize = self
+            .tools
+            .values()
+            .filter_map(|tool| tool.result.as_ref())
+            .map(json_string_bytes)
+            .sum();
+        messages.saturating_add(results)
     }
 
     pub const fn phase(&self) -> LivePhase {
@@ -319,6 +374,11 @@ impl LiveSessionReducer {
         self.draft = None;
         self.tools.clear();
         self.diagnostics.clear();
+        // 流式段被整段丢掉，负载账要跟着归零；留着旧值会让下一条消息白跑一次全量统计。
+        // 触发线也必须复位 —— 上一段流若因释放不动被抬高过，留着它会让新的一段在
+        // 远超预算之后才开始受管。
+        self.live_payload_hint = Some(0);
+        self.enforce_threshold = self.payload_budget;
         self.structure_dirty = true;
         self.draft_dirty = false;
         self.diagnostics_dirty = true;
@@ -479,6 +539,9 @@ impl LiveSessionReducer {
                     rendered: Arc::new(rendered),
                 };
                 self.structure_dirty = true;
+                // 原地替换时旧负载的账没法只减不加地维护，直接作废快门重算。
+                self.live_payload_hint = None;
+                self.enforce_payload_budget();
             }
             return;
         }
@@ -490,7 +553,178 @@ impl LiveSessionReducer {
             });
             self.completed_indexes.insert(identity, index);
             self.structure_dirty = true;
+            // 快门必须与全量统计**同源**：手写一份"渲染负载 + 图片原始数据"的加法很容易
+            // 漏项（工具结果常常在 `MessageEnd` 之前就到了，只算这条消息自身就会把它漏掉），
+            // 于是快门显示"还没到预算"、全量统计其实早就超了。直接复用 `retained_bytes`
+            // 就不存在两套算法对不上的可能。
+            let added = self.retained_bytes(index);
+            self.live_payload_hint = self
+                .live_payload_hint
+                .map(|hint| hint.saturating_add(added));
+            self.enforce_payload_budget();
         }
+    }
+
+    /// 把流式段压回预算内。
+    ///
+    /// 预算算的是**实际驻留内存**：渲染结果的过程性负载 **加上**原始副本
+    /// （`CompletedMessage.value` 与它引用的 `tools[*].result`）。只按渲染结果算是不够的 ——
+    /// 无效、超限或已脱敏的图片渲染出来根本没有 `bytes`，[`crate::payload_bytes`] 一律
+    /// 记 0，可那一大坨 base64 明明还完整躺在原始 JSON 里；只看渲染侧的话，一串这样的
+    /// 消息能让预算永远触发不了，而内存一路涨上去。
+    fn enforce_payload_budget(&mut self) {
+        if self
+            .live_payload_hint
+            .is_some_and(|hint| hint <= self.enforce_threshold)
+        {
+            return;
+        }
+        let mut total: usize = self.total_retained_bytes();
+        if total <= self.payload_budget {
+            self.live_payload_hint = Some(total);
+            return;
+        }
+        let mut changed = false;
+        for index in 0..self.completed.len() {
+            if total <= self.payload_budget {
+                break;
+            }
+            let freed = self.release_message_at(index);
+            if freed > 0 {
+                changed = true;
+                total = total.saturating_sub(freed);
+            }
+        }
+        // 已完成的消息都裁过了还超，就轮到那些**没有对应完成消息**的工具结果：
+        // 先到一步的、以及消息永远没来的孤儿。放在最后是因为它们可能马上就要被
+        // 一条到来的 `MessageEnd` 用上；但真到了这一步，无界增长比丢一条尚未显示的
+        // 输出更糟。
+        if total > self.payload_budget {
+            let orphans = self.orphan_tool_ids();
+            for id in orphans {
+                if total <= self.payload_budget {
+                    break;
+                }
+                let freed = self.release_tool_result(&id);
+                if freed > 0 {
+                    changed = true;
+                    total = total.saturating_sub(freed);
+                }
+            }
+        }
+        self.structure_dirty |= changed;
+        let settled: usize = self.total_retained_bytes();
+        self.live_payload_hint = Some(settled);
+        // 全量扫过一遍仍然超预算，说明剩下的都是释放不动的（例如一整篇都是短到不值得
+        // 换占位的输出）。这时把触发线抬到"再涨一个预算"，否则往后每插一条消息都要
+        // 白扫一遍全段，长会话直接退化成 O(n²)。有东西被释放掉就说明还推得动，
+        // 触发线复位。
+        self.enforce_threshold = if changed || settled <= self.payload_budget {
+            self.payload_budget
+        } else {
+            settled.saturating_add(self.payload_budget)
+        };
+    }
+
+    /// 流式段实际占住的全部内存，**含没有对应完成消息的工具结果**。
+    ///
+    /// 只按完成消息累加是不够的：工具结果常常先于 `MessageEnd` 到达，消息也可能永远
+    /// 不来（run 被取消）。那些结果一直挂在 `tools` 里，既不被计入也永远释放不掉，
+    /// 足够让 reducer 在"预算通过"的同时一路涨上去。
+    fn total_retained_bytes(&self) -> usize {
+        let messages: usize = (0..self.completed.len())
+            .map(|index| self.retained_bytes(index))
+            .sum();
+        let orphans: usize = self
+            .orphan_tool_ids()
+            .iter()
+            .filter_map(|id| self.tools.get(id))
+            .filter_map(|tool| tool.result.as_ref())
+            .map(json_string_bytes)
+            .sum();
+        messages.saturating_add(orphans)
+    }
+
+    /// 目前没有被任何完成消息引用的工具 id。
+    fn orphan_tool_ids(&self) -> Vec<String> {
+        let referenced: HashSet<String> = self
+            .completed
+            .iter()
+            .flat_map(|completed| tool_ids(&completed.value))
+            .collect();
+        self.tools
+            .keys()
+            .filter(|id| !referenced.contains(*id))
+            .cloned()
+            .collect()
+    }
+
+    /// 一条完成消息实际占住的内存：渲染结果的过程性负载 + 原始副本 + 它引用的工具结果。
+    fn retained_bytes(&self, index: usize) -> usize {
+        let Some(completed) = self.completed.get(index) else {
+            return 0;
+        };
+        let mut total = crate::payload_bytes(&completed.rendered)
+            .saturating_add(releasable_raw_bytes(&completed.value));
+        for id in tool_ids(&completed.value) {
+            if let Some(result) = self.tools.get(&id).and_then(|tool| tool.result.as_ref()) {
+                total = total.saturating_add(json_string_bytes(result));
+            }
+        }
+        total
+    }
+
+    /// 同时释放一条消息的渲染结果与原始副本，返回省下的字节数。
+    ///
+    /// 两侧必须一起裁：只裁渲染结果等于只把统计做小；只裁原始副本又会让下一次重渲染
+    /// 把界面上还留着的内容换掉，看起来像是自己变了。
+    fn release_message_at(&mut self, index: usize) -> usize {
+        let Some(completed) = self.completed.get_mut(index) else {
+            return 0;
+        };
+        let rendered_before = crate::payload_bytes(&completed.rendered);
+        // 同一条大小判据也要在这里生效：`release_payload` 自己不判，直接调等于把
+        // 一条 `"ok"` 换成一整句更长的占位 —— 有用的输出丢了，内存一个字节没省下，
+        // 对应的原始结果那边还会因为"换了不划算"而拒绝替换，两头落空。
+        if crate::budget::is_worth_releasing(&completed.rendered) {
+            crate::budget::release_payload(Arc::make_mut(&mut completed.rendered));
+        }
+        let rendered_after = crate::payload_bytes(&completed.rendered);
+
+        let raw_before = json_string_bytes(&completed.value);
+        let mut ids = Vec::new();
+        release_raw_message(&mut completed.value, &mut ids);
+        let raw_after = json_string_bytes(&completed.value);
+
+        let mut freed = rendered_before
+            .saturating_sub(rendered_after)
+            .saturating_add(raw_before.saturating_sub(raw_after));
+        for id in ids {
+            freed = freed.saturating_add(self.release_tool_result(&id));
+        }
+        freed
+    }
+
+    /// 把一条工具结果换成与 `rendered` 完全一致的占位，返回省下的字节数。
+    fn release_tool_result(&mut self, id: &str) -> usize {
+        let Some(tool) = self.tools.get_mut(id) else {
+            return 0;
+        };
+        let Some(result) = tool.result.as_ref() else {
+            return 0;
+        };
+        let before = json_string_bytes(result);
+        let placeholder = Value::Object(serde_json::Map::from_iter([(
+            "content".to_owned(),
+            Value::String(crate::RELEASED_OUTPUT_NOTICE.to_owned()),
+        )]));
+        let after = json_string_bytes(&placeholder);
+        // 比占位还短的结果留着：换掉它是净亏，也白丢了有用的输出。
+        if before <= after {
+            return 0;
+        }
+        tool.result = Some(placeholder);
+        before.saturating_sub(after)
     }
 
     fn rerender_completed_tools(&mut self) {
@@ -510,6 +744,14 @@ impl LiveSessionReducer {
         }
         self.structure_dirty |= changed;
         self.draft_dirty |= self.draft.is_some();
+        // 无论有没有卡片被重渲染，都要重新压一次预算。两条理由，缺一条都会漏：
+        //
+        // ① 重渲染是从 `value` 重新生成的，会把之前释放掉的负载原样带回来；
+        // ② **结果先于 `MessageEnd` 到达、或消息因取消永远不来**时，压根没有卡片可
+        //    重渲染，`changed` 恒为 false —— 只在 `changed` 时触发的话，这些孤儿结果
+        //    既进不了 `live_payload_hint`、也永远等不到一次全量重算，可以一路涨上去。
+        self.live_payload_hint = None;
+        self.enforce_payload_budget();
     }
 
     fn push_diagnostic(&mut self, message: impl Into<String>) {
@@ -618,6 +860,92 @@ impl LiveSessionReducer {
             minimap: self.cached_minimap.clone(),
             diagnostics: self.cached_diagnostics.clone(),
         }
+    }
+}
+
+/// JSON 里全部字符串字面量的字节数之和。
+///
+/// 只数字符串：内嵌图片的 base64 与工具输出正文都在那儿，结构本身的开销可以忽略。
+fn json_string_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(json_string_bytes).sum(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, item)| key.len() + json_string_bytes(item))
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// 一条原始消息里**可以被释放**的原始字节：内嵌图片数据。
+///
+/// 刻意不数用户 Query 与最终 Answer 的正文 —— 预算从来不会释放它们，把它们算进来
+/// 只会让一篇长文本会话永远"超预算"，于是每插一条消息都全量重扫一遍却一个字节也
+/// 释放不掉，白白退化成 O(n²)。工具结果不在这里数，由调用方按 id 单独累加。
+fn releasable_raw_bytes(message: &Value) -> usize {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return 0;
+    };
+    content
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+        .map(|item| {
+            let inline = item.get("data").and_then(Value::as_str).map_or(0, str::len);
+            let nested = item
+                .get("source")
+                .and_then(|source| source.get("data"))
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+            inline + nested
+        })
+        .sum()
+}
+
+/// 一条原始消息引用到的全部工具 id。
+fn tool_ids(message: &Value) -> Vec<String> {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 就地裁掉一条原始消息里的重负载，并收集它引用的工具 id。
+///
+/// 图片数据换成 `<redacted>`：`crate::parse_image` 本来就认这个标记，重渲染会稳定
+/// 落到 [`crate::ImageState::Redacted`]，而不是把一段占位当成损坏的 base64。
+fn release_raw_message(message: &mut Value, tool_ids: &mut Vec<String>) {
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("image") => release_raw_image(item),
+            Some("toolCall") => {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    tool_ids.push(id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn release_raw_image(item: &mut Value) {
+    for key in ["data"] {
+        if item.get(key).and_then(Value::as_str).is_some() {
+            item[key] = Value::String("<redacted>".to_owned());
+        }
+    }
+    if let Some(source) = item.get_mut("source")
+        && source.get("data").and_then(Value::as_str).is_some()
+    {
+        source["data"] = Value::String("<redacted>".to_owned());
     }
 }
 

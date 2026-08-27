@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::{
     jsonl::{JsonlError, JsonlFramer},
+    platform::{self, JobLimits, JobObject, JobStats},
     protocol::{Command, ExtensionUiResponse, RpcEvent, RpcRequest, RpcResponse, RpcSessionState},
 };
 
@@ -60,6 +61,11 @@ pub struct ClientConfig {
     pub max_frame_len: usize,
     /// 每个订阅者的事件积压字节上限，见 [`DEFAULT_EVENT_BACKLOG_BYTES`]。
     pub event_backlog_bytes: usize,
+    /// 进程树硬上限，透传给每次启动新建的 Job Object。
+    ///
+    /// 默认不设配额 —— 库层只保证「句柄关闭即整树终止」，具体水位由 `pi-runtime`
+    /// 按实测配置，避免在这一层写死产品策略。
+    pub job_limits: JobLimits,
 }
 
 impl ClientConfig {
@@ -76,6 +82,7 @@ impl ClientConfig {
             shutdown_grace_period: Duration::from_secs(2),
             max_frame_len: crate::jsonl::DEFAULT_MAX_FRAME_LEN,
             event_backlog_bytes: DEFAULT_EVENT_BACKLOG_BYTES,
+            job_limits: JobLimits::default(),
         }
     }
 }
@@ -274,6 +281,11 @@ struct Shared {
     pid: AtomicU64,
     resume_session: Mutex<Option<PathBuf>>,
     event_backlog_bytes: usize,
+    /// 当前活跃进程所属的 Job Object。
+    ///
+    /// 每次启动新建、进程退出即清空 —— 清空会关掉句柄，`KILL_ON_JOB_CLOSE` 随即收走
+    /// 所有被 pi 落下的孙进程，因此「不泄漏工具子进程」不依赖上层记得调用终止。
+    job: Mutex<Option<Arc<JobObject>>>,
 }
 
 /// 可 clone 的同步客户端。每个 blocking request 只阻塞调用线程；stdout/stderr/监督各自独立线程。
@@ -295,6 +307,7 @@ impl Client {
             pid: AtomicU64::new(0),
             resume_session: Mutex::new(initial_session),
             event_backlog_bytes: config.event_backlog_bytes.max(1),
+            job: Mutex::new(None),
         });
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         let thread_shared = Arc::clone(&shared);
@@ -519,10 +532,52 @@ impl Client {
     }
 
     /// 进程树强杀，供用户显式取消或测试外部故障。未调用 shutdown 时会触发自动重启。
+    ///
+    /// R25 起优先走 Job Object 整树终止；只有平台不支持 job 时才回退到按 PPID 链走的
+    /// [`kill_process_tree`]。
     pub fn kill_process_tree(&self) -> Result<(), ClientError> {
         let pid = self.pid().ok_or(ClientError::NotRunning)?;
-        kill_process_tree(pid).map_err(|error| ClientError::Supervisor(error.to_string()))
+        let job = self.shared.job.lock().unwrap().clone();
+        terminate_tree(job.as_ref(), pid)
+            .map_err(|error| ClientError::Supervisor(error.to_string()))
     }
+
+    /// 整棵进程树的一次采样（含 pi 自身、工具子进程与扩展自行 spawn 的孙进程）。
+    ///
+    /// 平台不支持 Job Object 时返回 [`std::io::ErrorKind::Unsupported`] 对应的错误，
+    /// 调用方应据此关闭依赖整树统计的策略，而不是把它当成 0。
+    pub fn process_tree_stats(&self) -> Result<JobStats, ClientError> {
+        let job = self.shared.job.lock().unwrap().clone();
+        let job = job.ok_or(ClientError::NotRunning)?;
+        job.stats()
+            .map_err(|error| ClientError::Supervisor(error.to_string()))
+    }
+
+    /// 整棵进程树当前的 pid 列表。
+    ///
+    /// 验收「关闭 Runtime 不泄漏工具子进程」需要知道**具体是谁**：只比进程数的话，
+    /// 一个退出、一个新起会互相抵消。
+    pub fn process_tree_pids(&self) -> Result<Vec<u32>, ClientError> {
+        let job = self.shared.job.lock().unwrap().clone();
+        let job = job.ok_or(ClientError::NotRunning)?;
+        job.process_ids()
+            .map_err(|error| ClientError::Supervisor(error.to_string()))
+    }
+}
+
+/// 整树终止：有 job 就用 job，没有或平台不支持才回退到按 PPID 链走的 `taskkill /T`。
+///
+/// 回退只认 `Unsupported` —— job 存在却终止失败是真故障，必须原样上报，不能悄悄换一条
+/// 更弱的路径把错误盖住。
+fn terminate_tree(job: Option<&Arc<JobObject>>, pid: u32) -> std::io::Result<()> {
+    if let Some(job) = job {
+        match job.terminate() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => return Err(error),
+        }
+    }
+    kill_process_tree(pid)
 }
 
 impl Drop for Client {
@@ -586,7 +641,13 @@ fn supervise(
         }
         let resume_session = shared.resume_session.lock().unwrap().clone();
         let spawned = spawn_child(&config, resume_session.as_deref());
-        let (mut child, stdout, stderr, stdin) = match spawned {
+        let SpawnedChild {
+            mut child,
+            stdout,
+            stderr,
+            stdin,
+            job,
+        } = match spawned {
             Ok(parts) => parts,
             Err(error) => {
                 if let Some(tx) = first_start.take() {
@@ -605,6 +666,7 @@ fn supervise(
         };
         let pid = child.id();
         shared.pid.store(u64::from(pid), Ordering::Release);
+        *shared.job.lock().unwrap() = Some(Arc::clone(&job));
         *shared.writer.lock().unwrap() = Some(stdin);
         let (io_tx, io_rx) = mpsc::channel();
         let stdout_handle = spawn_stdout_reader(stdout, config.max_frame_len, io_tx.clone());
@@ -644,7 +706,7 @@ fn supervise(
                         let now = Instant::now();
                         if started.elapsed() >= config.shutdown_grace_period
                             && next_shutdown_kill.is_none_or(|next| now >= next)
-                            && let Err(error) = kill_process_tree(pid)
+                            && let Err(error) = terminate_tree(Some(&job), pid)
                         {
                             broadcast(
                                 &shared,
@@ -664,7 +726,7 @@ fn supervise(
                             error: error.to_string(),
                         }),
                     );
-                    let _ = kill_process_tree(pid);
+                    let _ = terminate_tree(Some(&job), pid);
                     match child.wait() {
                         Ok(status) => break status,
                         Err(_) => return,
@@ -672,6 +734,14 @@ fn supervise(
                 }
             }
         };
+
+        // R25：进程一退出就整树终止并放掉 job 句柄，且必须**早于**下面的 reader join。
+        // pi 的孙进程会继承 stdout 管道的写端（Windows 的 CreateProcess 只要开继承就会
+        // 把父进程可继承的句柄一并带过去），不先收走它们，reader 永远等不到 EOF ——
+        // 一个早已与会话无关的进程就能把整个 shutdown 拖到它自己退出为止。
+        let _ = terminate_tree(Some(&job), pid);
+        shared.job.lock().unwrap().take();
+        drop(job);
 
         *shared.writer.lock().unwrap() = None;
         while let Ok(message) = io_rx.try_recv() {
@@ -725,7 +795,14 @@ fn supervise(
     }
 }
 
-type SpawnedChild = (Child, ChildStdout, ChildStderr, ChildStdin);
+/// 一次成功启动的全部产物；`job` 已经纳管了 `child`，两者必须同生共死。
+struct SpawnedChild {
+    child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    stdin: ChildStdin,
+    job: Arc<JobObject>,
+}
 
 fn spawn_child(
     config: &ClientConfig,
@@ -752,22 +829,59 @@ fn spawn_child(
         command.process_group(0);
     }
 
+    // R25：先建 job，再**挂起**创建子进程，纳管成功后才放行。
+    // 顺序不能反 —— 若先让 pi 跑起来再 assign，它在这段空隙里 spawn 出的孙进程会永远
+    // 留在 job 之外，硬限制与整树终止都管不到；挂起期间 pi 一条指令都没执行，因此这条
+    // 竞态被彻底消除，而不是"概率很小"。
+    let job = JobObject::create(config.job_limits)
+        .map_err(|error| ClientError::Spawn(format!("创建 Job Object 失败：{error}")))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(platform::suspended_creation_flags());
+    }
+
     let mut child = command
         .spawn()
         .map_err(|error| ClientError::Spawn(error.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ClientError::Spawn("missing stdout pipe".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ClientError::Spawn("missing stderr pipe".into()))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ClientError::Spawn("missing stdin pipe".into()))?;
-    Ok((child, stdout, stderr, stdin))
+    let pid = child.id();
+
+    // 从这里开始，任何失败都必须把挂起的子进程杀掉：它还没被 resume，不会自己退出。
+    let mut prepare = || -> Result<(ChildStdout, ChildStderr, ChildStdin), ClientError> {
+        job.assign(&child)
+            .map_err(|error| ClientError::Spawn(format!("纳入 Job Object 失败：{error}")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ClientError::Spawn("missing stdout pipe".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ClientError::Spawn("missing stderr pipe".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ClientError::Spawn("missing stdin pipe".into()))?;
+        platform::resume_process(pid)
+            .map_err(|error| ClientError::Spawn(format!("恢复挂起的子进程失败：{error}")))?;
+        Ok((stdout, stderr, stdin))
+    };
+    let (stdout, stderr, stdin) = match prepare() {
+        Ok(parts) => parts,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+
+    Ok(SpawnedChild {
+        child,
+        stdout,
+        stderr,
+        stdin,
+        job: Arc::new(job),
+    })
 }
 
 #[derive(Debug)]

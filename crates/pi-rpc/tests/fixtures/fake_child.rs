@@ -1,14 +1,28 @@
 use std::{
-    env,
+    env, fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
+    process::{Command as ProcessCommand, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
 
+/// 孙进程的最长存活时间：测试一旦漏杀，它自己也会退，不至于在开发机上长期赖着。
+const GRANDCHILD_MAX_LIFETIME: Duration = Duration::from_secs(120);
+
 fn main() {
+    // R25：模拟"pi 的扩展自己 spawn 子代理"。孙进程重执行本二进制，不依赖任何系统命令。
+    if env::args_os().any(|arg| arg == "--grandchild-sleep") {
+        let started = Instant::now();
+        while started.elapsed() < GRANDCHILD_MAX_LIFETIME {
+            thread::sleep(Duration::from_millis(50));
+        }
+        return;
+    }
+    spawn_requested_grandchildren();
+
     let ephemeral = env::args_os().any(|arg| arg == "--no-session");
     let mut session_file = env::args_os()
         .collect::<Vec<_>>()
@@ -389,5 +403,41 @@ fn main() {
         };
         writeln!(stdout, "{response}").unwrap();
         stdout.flush().unwrap();
+    }
+}
+
+/// 按 `PI_RPC_FAKE_SPAWN_GRANDCHILD` 生若干孙进程，把结果写进
+/// `PI_RPC_FAKE_GRANDCHILD_PIDS` 指定的文件：成功写 pid，失败写 `ERROR:<原因>`。
+///
+/// 孙进程的三个标准流一律接 null —— 若让它继承 stdout 管道，父进程退出后管道仍有写端，
+/// 宿主的 stdout reader 就永远等不到 EOF。
+fn spawn_requested_grandchildren() {
+    let Some(count) = env::var("PI_RPC_FAKE_SPAWN_GRANDCHILD")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let report = env::var_os("PI_RPC_FAKE_GRANDCHILD_PIDS").map(PathBuf::from);
+    let Ok(self_exe) = env::current_exe() else {
+        return;
+    };
+    let mut lines = Vec::new();
+    for _ in 0..count {
+        let spawned = ProcessCommand::new(&self_exe)
+            .arg("--grandchild-sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => lines.push(child.id().to_string()),
+            Err(error) => lines.push(format!("ERROR:{error}")),
+        }
+    }
+    if let Some(report) = report {
+        let mut body = lines.join("\n");
+        body.push('\n');
+        let _ = fs::write(report, body);
     }
 }

@@ -11,7 +11,12 @@ use base64::Engine as _;
 use pi_data::{EntryBase, SessionEntry, SessionFile};
 use serde_json::Value;
 
+pub(crate) mod budget;
 mod live;
+pub use budget::{
+    DEFAULT_PAYLOAD_BUDGET_BYTES, RELEASED_OUTPUT_NOTICE, RetentionOutcome, apply_payload_budget,
+    payload_bytes,
+};
 pub use live::{
     LiveAssistantUpdate, LiveBlockKind, LiveEvent, LivePhase, LiveSessionReducer, ReduceOutcome,
 };
@@ -483,6 +488,9 @@ pub fn render_session(session: &SessionFile) -> ConversationDocument {
     }
 
     let mut messages = messages.into_iter().map(Arc::new).collect::<Vec<_>>();
+    // R25：聚合预算必须在投影**之前**执行 —— `items` 与 `minimap` 复用同一批
+    // `Arc<Message>`，先投影再裁剪的话，投影里留下的仍是没裁过的那份。
+    budget::apply_payload_budget(&mut messages, budget::DEFAULT_PAYLOAD_BUDGET_BYTES);
     let cwd = PathBuf::from(&session.header.cwd);
     attach_written_files(&mut messages, &cwd, false);
     let (items, minimap) = project_conversation(&messages, false);

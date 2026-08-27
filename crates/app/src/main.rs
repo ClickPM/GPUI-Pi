@@ -29,8 +29,21 @@ fn main() {
             gpui_component::init(cx);
             gpui_pi_ui::theme::init_fonts(cx).expect("无法加载内嵌字体");
 
-            cx.on_window_closed(|cx, _| {
+            let runtime_manager = pi_runtime::RuntimeManager::new(Default::default());
+
+            // R25：窗口全关时**显式**收走全部 pi 进程，不再依赖 Drop 链。
+            //
+            // 标签持有的 `SessionHandle` 会让 `RuntimeEntry` 比 Manager 活得久，靠 Drop
+            // 链回收等于把进程退出推迟到一个不确定的时刻（BACKLOG #19 / #25），多会话
+            // 又把它从"最多一个进程"放大到 `total_runtime_slots` 个。
+            //
+            // 进程真的泄漏不了 —— 每棵树的 Job Object 都带 `KILL_ON_JOB_CLOSE`，本进程
+            // 一退它们就没了。这里等的是**优雅**停机：让 pi 收到 stdin EOF、把会话文件
+            // 写完再退，而不是被内核直接掐断。
+            let shutdown_manager = runtime_manager.clone();
+            cx.on_window_closed(move |cx, _| {
                 if cx.windows().is_empty() {
+                    shutdown_manager.shutdown_all();
                     cx.quit();
                 }
             })
@@ -59,7 +72,6 @@ fn main() {
                 ..TitleBar::window_options()
             };
 
-            let runtime_manager = pi_runtime::RuntimeManager::new(Default::default());
             cx.spawn(async move |cx| {
                 let window = cx.open_window(options, |window, cx| {
                     let workspace = cx.new(|cx| Workspace::new(runtime_manager, window, cx));
