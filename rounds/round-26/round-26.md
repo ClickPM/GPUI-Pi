@@ -110,6 +110,22 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 - 审查报告 / 证据：diff 导出于 `.pi/visual-review/round-26/ui-diff.txt`（gitignored）
 - 说明：仅完成纯代码层视觉审查，**未验证真实渲染**；不阻塞 PR 的前提是结论为 `CODE_ONLY_PASS`
 
+> **追加 `SCREENSHOT` 审查（2026-08-27 下午，截图后补）**：用户当日在真实派发中逐张回传 15 张截图
+> （无法另存文件，由主会话从会话 transcript 提取 base64 落盘至
+> `.pi/visual-review/round-26/evidence/`，含 `MANIFEST.md` 角色清单）。`SCREENSHOT` 模式审查结论：
+> **已提供证据的用例范围内 PASS（用例 1 变体 / 3 / 4 / 5 / 6 / 9），无确证阻断项**。
+> 覆盖事实包括：S-8 三处行内片段收敛在真实渲染中全部成立、状态色只点不铺（失败卡与失败行均无
+> 红边框红底）、左竖线 + 缩进从属区、展开区小号弱色正文、行/头两级 tooltip 内容与代码一致、
+> 汇总点与行点同源取色（全结算含失败正确转红）。
+>
+> **本追加结论不等于完整 `PASS`，不得宣称完成全部截图视觉验证**。未验证清单：用例 2（hover 底色，
+> 判 `INSUFFICIENT_EVIDENCE`，若坐实无反馈须按红线 9 立阻断）、用例 7（900×700 窄窗）、用例 8
+> （无子代理会话回归）、深色主题整组、用例 1 严格版（「1 运行」橙点）、排队/停止/未知三种点色、
+> 用例 5 的 header 悬停。环境偏差如实记录：浅色主题（清单原要求深色优先）、窗口 ~2000×1281
+> （非 1440×900）、两张含用户手绘红框。审查器另核实出 MANIFEST 初版 img-07/08 标注互换
+> （主会话按时间戳推断角色未逐张验证——同根因清单再 +1；「逐张核实」防线按设计接住），已就地勘误。
+> 本轮正式门禁结论维持 `CODE_ONLY_PASS` 不回写。
+
 ### 视觉审查过程
 
 | 轮 | 结论 | 阻断项 | 处置 |
@@ -180,7 +196,26 @@ caret 区间会随时间漂移的问题。
 | 回看 | `subagent_result_entries_decode_into_subagent_blocks_for_replay` 走完整 `render_path` 链路，从磁盘 JSONL 还原成子代理卡片并归并成任务 |
 | 唯一通道（生产形态） | real-pi 测试 `third_party_subagent_tool_is_excluded_while_other_extensions_survive`：**不带** `--no-extensions`，密封 agent 目录装「注册 `subagent` / `subagent_wait` / `subagent_supervisor` 三个工具的第三方样板 + 注册普通工具的用户扩展」，`-e` 内核 + `--exclude-tools <三名单>` 后由 probe 扩展回报 `getAllTools()` —— 三个第三方工具名均不可见，`Agent` / `StopAgent` / `AgentStatus` 与 `r26_user_other` 可见，`get_commands` 仍含第三方样板注册的命令（扩展本身照常加载）。真实 pi 0.84.2 实跑 exit 0 |
 
-> **T3（桌面端真实派发）未做** —— 需要真实模型调用与人工操作，本轮未执行，不得视为已验收。
+> ~~**T3（桌面端真实派发）未做** —— 需要真实模型调用与人工操作，本轮未执行，不得视为已验收。~~
+> → **2026-08-27 下午已完成**，见下方「T3 验收实测」。
+
+### T3 验收实测（2026-08-27 下午，真实派发）
+
+用户以 `cargo run -p gpui-pi`（debug 构建）+ 「跟随 pi」预设 + DeepSeek V4 Flash 真实派发，
+全程截图证据落盘 `.pi/visual-review/round-26/evidence/`（15 张 + `MANIFEST.md`）。共 6 个
+`Agent` 工具后台子代理（4 完成 / 2 失败），T3 三要素逐一有实证：
+
+| 要素 | 实证 |
+|---|---|
+| 派发 | 模型在用户全局 `npm:pi-subagents` 照常加载的条件下调用内核 `Agent` 工具（img-02 派发表格 + 面板出现）；对照 img-01（改动前旧构建，模型挑走第三方 `subagent`，面板整块不渲染）——**「唯一通道」在生产环境实证生效**，与 real-pi 自动化测试互为印证 |
+| 状态流转与统计 | 面板行「运行中（橙点）→ 耗时（绿点）/ 失败（红点）」全程可见（img-02→03→05→10）；行 tooltip 完整统计两次实拍（`11 轮 · 28 次工具 · 2m48s · $0.0490`、`4 轮 · 10 次工具 · 1m37s · $0.0148`）；折叠头 tooltip `2 失败 · 4 完成`（img-15）；结果卡折叠/展开均正常（img-06/12/14），完成卡展开区完整渲染 12m06s 长任务的 Markdown 报告 |
+| 失败不拖垮父会话 | 两个子代理被用户侧 DeepSeek 网关中止（卡片展开可见 `Error: Explore (variflight-ticket/virtual_deepseek): The operation was aborted.`，img-12）；父会话未受影响，模型自行识别失败并重派，重派任务完成（img-10 四绿两红全结算） |
+
+过程中另暴露并当轮修复一个**非本功能**的阻断问题：debug 构建启动即主线程栈溢出
+（`0xc00000fd`，与会话内容无关，空 agent 目录也必崩；release 正常）。定位为 Windows 主线程
+默认 1MB 栈不够 GPUI debug 布局深度，`crates/app/build.rs` 追加 `/STACK:8388608` 修复
+（commit `108c685`），修复后 debug 版沙箱与真实数据均稳定。用户测试期间的「黑屏/崩溃」
+均源于此，非子代理功能缺陷。
 
 > **T2 的一处实测盲区（2026-08-27 由一次真实截图暴露）**：上表「扩展确实加载」用的命令是
 > `pi --mode rpc --no-extensions -e <vendor 路径>`，把内核**隔离**出来验；而生产路径
