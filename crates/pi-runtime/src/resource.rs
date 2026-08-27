@@ -162,10 +162,14 @@ impl Default for MemoryLimits {
             max_processes_per_runtime: Some(64),
             // 单棵树 4GiB ≈ 实测占用的 10 倍，只拦真正的失控，不误伤正常会话。
             runtime_memory_bytes: Some(4 * 1024 * 1024 * 1024),
-            // 每个子代理槽 1GiB：子代理与父会话共享同一个 pi 进程，多出来的主要是各自
-            // 的上下文与工具输出。按静止 Runtime 实测 ≈377MiB 的量级，1GiB 已是宽裕的
-            // 上界；内核默认并发 4 时整棵树的上限落在 8GiB，仍远低于失控级别。
-            subagent_slot_bytes: Some(1024 * 1024 * 1024),
+            // 每个子代理槽 256MiB。子代理是**进程内**会话，边际开销只有它自己的上下文
+            // 与工具输出，不含 pi 运行时本身（静止 Runtime 实测的 ≈377MiB 里绝大部分是
+            // 共享的运行时，不会随子代理线性增长）。
+            //
+            // 这个数要和 `subagent_config` 的预留槽数一起看：默认配置下预留 16 槽，
+            // 整棵树的上限落在 4GiB + 4GiB = 8GiB。再往上就不是"兜底"而是形同虚设了 ——
+            // 一台 16GB 的机器上，20GiB 的上限永远不会触发。
+            subagent_slot_bytes: Some(256 * 1024 * 1024),
             sample_interval: Duration::from_millis(500),
         }
     }

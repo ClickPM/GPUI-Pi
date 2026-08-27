@@ -51,15 +51,25 @@ pub enum SubagentStatus {
 }
 
 impl SubagentStatus {
+    /// 解析内核 `record.lifecycle.status` 的取值。
+    ///
+    /// 这七个是**权威全集**，逐字抄自内核 `src/types.ts` 的
+    /// `AgentStatus = "queued" | "running" | "completed" | "turn_limited" | "aborted"
+    /// | "stopped" | "error"`。不要凭印象加同义拼写：R26 第一版就是照着字段名
+    /// `max_turns` 猜了 `turn_limit` / `turnLimit` / `turn-limit` 三个，而内核实际发的是
+    /// `turn_limited` —— 三个都没命中，真实的收尾状态全掉进 `Unknown`，
+    /// 而 `Unknown` 的 `is_settled()` 为 false，面板会把已经结束的任务永远算成"运行中"。
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         match raw.trim() {
             "queued" => Self::Queued,
             "running" => Self::Running,
-            "completed" | "complete" | "done" => Self::Completed,
-            "error" | "failed" => Self::Error,
-            "stopped" | "aborted" | "cancelled" | "canceled" => Self::Stopped,
-            "turn_limit" | "turnLimit" | "turn-limit" => Self::TurnLimit,
+            "completed" => Self::Completed,
+            "turn_limited" => Self::TurnLimit,
+            // `aborted`（父会话中断）与 `stopped`（StopAgent）对用户是同一件事：
+            // 没跑完，但不是故障。
+            "aborted" | "stopped" => Self::Stopped,
+            "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -783,13 +793,39 @@ mod tests {
     }
 
     #[test]
+    fn every_status_the_kernel_can_emit_is_recognized() {
+        // 逐字对齐内核 src/types.ts 的 AgentStatus 全集。任何一个落进 Unknown 都会让
+        // 面板把已结束的任务永远算成"运行中"（Unknown 的 is_settled() 为 false）。
+        let expected = [
+            ("queued", SubagentStatus::Queued, false),
+            ("running", SubagentStatus::Running, false),
+            ("completed", SubagentStatus::Completed, true),
+            ("turn_limited", SubagentStatus::TurnLimit, true),
+            ("aborted", SubagentStatus::Stopped, true),
+            ("stopped", SubagentStatus::Stopped, true),
+            ("error", SubagentStatus::Error, true),
+        ];
+        for (raw, status, settled) in expected {
+            assert_eq!(SubagentStatus::parse(raw), status, "raw={raw}");
+            assert_eq!(
+                SubagentStatus::parse(raw).is_settled(),
+                settled,
+                "raw={raw}"
+            );
+            assert!(
+                !matches!(SubagentStatus::parse(raw), SubagentStatus::Unknown(_)),
+                "raw={raw} 不该落进 Unknown"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_status_is_preserved_instead_of_being_folded_into_completed() {
         assert_eq!(
             SubagentStatus::parse("hibernating"),
             SubagentStatus::Unknown("hibernating".to_owned())
         );
         assert!(!SubagentStatus::parse("hibernating").is_settled());
-        assert!(SubagentStatus::parse("turn_limit").is_settled());
     }
 
     #[test]

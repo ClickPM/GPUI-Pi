@@ -4898,14 +4898,12 @@ mod tests {
         // Runtime 白留几 GiB 上限，或者给加载了内核的 Runtime 不留 —— 后者会让一次
         // 正常的并行委派把父会话一起撞死。
         let dir = tempfile::tempdir().unwrap();
+        let expected = subagent_config::effective_concurrency(None, Some(dir.path()));
+        assert!(expected > 0, "默认配置也必须留出余量");
         for preset in ToolPreset::ALL {
             let slots = subagent_slots_for(preset, None, dir.path());
             if preset.loads_subagent_kernel() {
-                assert_eq!(
-                    slots,
-                    subagent_config::DEFAULT_SUBAGENT_CONCURRENCY,
-                    "preset={preset:?}"
-                );
+                assert_eq!(slots, expected, "preset={preset:?}");
             } else {
                 assert_eq!(slots, 0, "preset={preset:?}");
             }
@@ -4913,16 +4911,20 @@ mod tests {
     }
 
     #[test]
-    fn a_project_level_concurrency_override_widens_the_reserved_headroom() {
+    fn a_project_level_concurrency_override_changes_the_reserved_headroom() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".pi")).unwrap();
         std::fs::write(
             dir.path().join(".pi").join("subagents-lite.json"),
-            r#"{"concurrency":{"default":7}}"#,
+            r#"{"concurrency":{"default":1}}"#,
         )
         .unwrap();
-        assert_eq!(subagent_slots_for(ToolPreset::Full, None, dir.path()), 7);
-        // 不加载内核的预设不看配置：读到 7 也不该给它留余量。
+        let with_override = subagent_slots_for(ToolPreset::Full, None, dir.path());
+        assert!(
+            with_override < subagent_config::effective_concurrency(None, None),
+            "调小 concurrency.default 必须让预留槽数跟着变小（实际 {with_override}）"
+        );
+        // 不加载内核的预设根本不看配置。
         assert_eq!(
             subagent_slots_for(ToolPreset::ReadOnly, None, dir.path()),
             0

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Div, InteractiveElement as _, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _,
+    StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex, v_flex};
 use pi_render::{SubagentStatus, SubagentTask};
@@ -16,6 +16,12 @@ use pi_render::{SubagentStatus, SubagentTask};
 use crate::theme::dim_foreground;
 
 type ToggleHandler = Arc<dyn Fn(&mut App)>;
+
+/// 展开态任务列表的最大高度（约 7 行）。
+///
+/// 面板挂在 composer 正上方，它长多高就等于从输入区抢走多少。取 7 行是因为一屏内
+/// 同时在跑的任务通常只有个位数；更多的是历史，滚动看即可。
+const EXPANDED_LIST_MAX_HEIGHT: f32 = 168.;
 
 /// 折叠态那一行的汇总文案。
 ///
@@ -124,11 +130,22 @@ pub fn render_subagent_tasks(
                     ),
             )
             .when(expanded, |panel| {
-                panel.children(
-                    tasks
-                        .iter()
-                        .map(|task| render_task_row(task, cx))
-                        .collect::<Vec<_>>(),
+                // 展开区必须有高度上限并可滚动：一个长会话能攒下几十条历史子代理任务，
+                // 无约束地把每一行都塞进 composer 上方，会把输入框整个顶出窗口 ——
+                // 在 900×700 这种小窗口上尤其明显，而那正是用户最需要 composer 的时候。
+                panel.child(
+                    v_flex()
+                        .id(SharedString::from("subagent-task-list"))
+                        .debug_selector(|| "subagent-task-list".into())
+                        .min_w_0()
+                        .max_h(px(EXPANDED_LIST_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .children(
+                            tasks
+                                .iter()
+                                .map(|task| render_task_row(task, cx))
+                                .collect::<Vec<_>>(),
+                        ),
                 )
             }),
     )
