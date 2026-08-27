@@ -7,28 +7,26 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Div, InteractiveElement as _, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px,
+    App, Div, InteractiveElement as _, ParentElement as _, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _,
 };
-use gpui_component::{ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex, scroll::ScrollableElement as _,
+    tooltip::Tooltip, v_flex,
+};
 use pi_render::{SubagentStatus, SubagentTask};
 
 use crate::theme::dim_foreground;
 
 type ToggleHandler = Arc<dyn Fn(&mut App)>;
 
-/// 展开态任务列表的最大高度（约 7 行）。
+/// 折叠态那一行的汇总：行内一个片段 + tooltip 里的分桶明细。
 ///
-/// 面板挂在 composer 正上方，它长多高就等于从输入区抢走多少。取 7 行是因为一屏内
-/// 同时在跑的任务通常只有个位数；更多的是历史，滚动看即可。
-const EXPANDED_LIST_MAX_HEIGHT: f32 = 168.;
-
-/// 折叠态那一行的汇总文案。
-///
-/// 规范 S-8 限制一行最多 3 个文本片段，所以整段汇总只当**一个**片段：内部的
-/// 「2 运行 · 1 排队」不拆成独立文本节点。
+/// 规范 S-8 的判定规则明确「`·` 分隔的每一段**各算一个**」，所以不能把
+/// 「2 运行 · 1 排队 · 1 失败」拼成一串就当作一个片段。行内只放最该被看见的一项，
+/// 完整分桶交给 tooltip（条款：被 tooltip 承载的内容不计入片段数）。
 #[must_use]
-pub fn subagent_summary(tasks: &[SubagentTask]) -> String {
+pub fn subagent_summary(tasks: &[SubagentTask]) -> crate::chat::SubagentStatsText {
     let mut running = 0_usize;
     let mut queued = 0_usize;
     let mut failed = 0_usize;
@@ -42,23 +40,32 @@ pub fn subagent_summary(tasks: &[SubagentTask]) -> String {
             _ => running += 1,
         }
     }
-    let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} 运行"));
-    }
-    if queued > 0 {
-        parts.push(format!("{queued} 排队"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} 失败"));
-    }
-    if done > 0 {
-        parts.push(format!("{done} 完成"));
-    }
-    if parts.is_empty() {
-        format!("{} 个任务", tasks.len())
-    } else {
-        parts.join(" · ")
+    let buckets = [
+        (running, "运行"),
+        (queued, "排队"),
+        (failed, "失败"),
+        (done, "完成"),
+    ];
+    let detail = buckets
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+
+    // 行内优先「还在动的」：运行 > 排队 > 失败 > 完成。用户扫一眼最想知道的是
+    // 「还有几个没好」，而不是已经完成了几个。
+    let inline = buckets.iter().find(|(count, _)| *count > 0).map_or_else(
+        || format!("{} 个任务", tasks.len()),
+        |(count, label)| format!("{count} {label}"),
+    );
+    crate::chat::SubagentStatsText {
+        inline,
+        detail: if detail.is_empty() {
+            format!("{} 个任务", tasks.len())
+        } else {
+            detail
+        },
     }
 }
 
@@ -80,6 +87,8 @@ pub fn render_subagent_tasks(
     }
     let active = has_active(tasks);
     let summary = subagent_summary(tasks);
+    let summary_detail = summary.detail.clone();
+    let summary_has_more = summary_detail != summary.inline;
 
     Some(
         v_flex()
@@ -94,30 +103,34 @@ pub fn render_subagent_tasks(
                     .debug_selector(|| "subagent-panel-toggle".into())
                     .gap_1p5()
                     .cursor_pointer()
+                    // 规范 § 4.4：折叠头必须有 hover 反馈。
+                    .hover(|row| row.text_color(cx.theme().foreground))
+                    .when(summary_has_more, |row| {
+                        let detail = summary_detail.clone();
+                        row.tooltip(move |window, cx| {
+                            Tooltip::new(detail.clone()).build(window, cx)
+                        })
+                    })
                     .on_click(move |_, _, cx| {
                         if let Some(handler) = &on_toggle {
                             handler(cx);
                         }
                     })
-                    .child(
-                        div()
-                            .size_2()
-                            .flex_none()
-                            .rounded_full()
-                            // 状态色只点不铺（规范 S-4）。
-                            .bg(if active {
-                                cx.theme().warning
-                            } else {
-                                cx.theme().muted_foreground
-                            }),
-                    )
+                    // 状态色只点不铺（规范 S-4）；配色与任务行同源，避免同一状态
+                    // 在汇总点和行内点上呈现两种颜色。
+                    .child(crate::chat::status_dot(if active {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    }))
+                    // 两个文本片段：标题 + 行内汇总。完整分桶在 tooltip 里（S-8）。
                     .child(div().text_xs().font_semibold().child("子代理"))
                     .child(div().flex_1())
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(summary),
+                            .child(summary.inline),
                     )
                     .child(
                         Icon::new(if expanded {
@@ -133,13 +146,17 @@ pub fn render_subagent_tasks(
                 // 展开区必须有高度上限并可滚动：一个长会话能攒下几十条历史子代理任务，
                 // 无约束地把每一行都塞进 composer 上方，会把输入框整个顶出窗口 ——
                 // 在 900×700 这种小窗口上尤其明显，而那正是用户最需要 composer 的时候。
+                //
+                // 高度走 gpui 既有刻度而不是 `px(n)`：红线 4 的 px 白名单里没有这个值，
+                // 自造像素尺寸要先改规范文档走评审。滚动条走 `overflow_y_scrollbar()`
+                // （规范 S-19），裸 `overflow_y_scroll()` 没有任何「还有内容」的线索。
                 panel.child(
                     v_flex()
                         .id(SharedString::from("subagent-task-list"))
                         .debug_selector(|| "subagent-task-list".into())
                         .min_w_0()
-                        .max_h(px(EXPANDED_LIST_MAX_HEIGHT))
-                        .overflow_y_scroll()
+                        .max_h_40()
+                        .overflow_y_scrollbar()
                         .children(
                             tasks
                                 .iter()
@@ -151,19 +168,30 @@ pub fn render_subagent_tasks(
     )
 }
 
-/// 单条任务行：状态点 + 类型/描述 + 右侧统计。三个文本片段，正好卡在 S-8 上限。
-fn render_task_row(task: &SubagentTask, cx: &App) -> Div {
+/// 单条任务行：状态点 + 类型 + 描述 + **一项**统计 —— 三个文本片段，卡在 S-8 上限。
+fn render_task_row(task: &SubagentTask, cx: &App) -> Stateful<Div> {
     let color = crate::chat::subagent_status_color(&task.status, cx);
     let stats = crate::chat::subagent_stats_summary(&task.stats);
+    let row_id = SharedString::from(format!("subagent-task-{}", task.key));
     h_flex()
+        .id(row_id)
         .debug_selector(|| "subagent-task-row".into())
         .min_w_0()
         .gap_1p5()
         .py_0p5()
-        .child(div().size_2().flex_none().rounded_full().bg(color))
+        .when_some(stats.as_ref(), |row, stats| {
+            // 完整统计明细进 tooltip（S-8：tooltip 内容不计入片段数）。
+            let detail = stats.detail.clone();
+            row.tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+        })
+        .child(crate::chat::status_dot(color))
         .child(
             div()
-                .flex_none()
+                // 类型名最终可回落到模型写的 `agent` 工具参数，长度不受控；
+                // 不加约束时它会先于描述抢走宽度，把右侧统计挤出可视区。
+                .min_w_0()
+                .max_w_32()
+                .truncate()
                 .text_xs()
                 .font_semibold()
                 .child(task.agent_type.clone()),
@@ -183,7 +211,7 @@ fn render_task_row(task: &SubagentTask, cx: &App) -> Div {
                 .text_xs()
                 .text_color(dim_foreground(cx))
                 // 未结算的任务还没有统计，那就先显示状态词，别留一片空白。
-                .child(stats.unwrap_or_else(|| task.status.label().to_owned())),
+                .child(stats.map_or_else(|| task.status.label().to_owned(), |stats| stats.inline)),
         )
 }
 
@@ -217,10 +245,12 @@ mod tests {
             task(SubagentStatus::Error),
             task(SubagentStatus::Completed),
         ];
-        assert_eq!(
-            subagent_summary(&tasks),
-            "2 运行 · 1 排队 · 1 失败 · 1 完成"
-        );
+        let summary = subagent_summary(&tasks);
+        // 行内恒为**一个**片段（S-8：`·` 分隔的每段各算一个，拼串不能规避上限）。
+        assert_eq!(summary.inline, "2 运行");
+        assert!(!summary.inline.contains('·'));
+        // 完整分桶进 tooltip，条款明确 tooltip 内容不计入片段数。
+        assert_eq!(summary.detail, "2 运行 · 1 排队 · 1 失败 · 1 完成");
         assert!(has_active(&tasks));
     }
 
@@ -232,7 +262,9 @@ mod tests {
             task(SubagentStatus::TurnLimit),
         ];
         assert!(!has_active(&tasks));
-        assert_eq!(subagent_summary(&tasks), "3 完成");
+        let summary = subagent_summary(&tasks);
+        assert_eq!(summary.inline, "3 完成");
+        assert_eq!(summary.detail, "3 完成");
     }
 
     #[test]
@@ -241,6 +273,6 @@ mod tests {
         // 对不上任务条数，比多算一个正在跑的更难排查。
         let tasks = vec![task(SubagentStatus::Unknown("hibernating".to_owned()))];
         assert!(has_active(&tasks));
-        assert_eq!(subagent_summary(&tasks), "1 运行");
+        assert_eq!(subagent_summary(&tasks).inline, "1 运行");
     }
 }

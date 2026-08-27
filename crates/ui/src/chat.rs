@@ -19,6 +19,7 @@ use gpui_component::{
     h_flex, h_resizable, resizable_panel,
     scroll::ScrollableElement as _,
     text::TextView,
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -63,7 +64,7 @@ fn subordinate_column(cx: &App) -> Div {
 }
 
 /// 状态点（规范 4.5）：8px 圆点，是卡片里唯一允许上状态色的地方。
-fn status_dot(color: Hsla) -> Div {
+pub(crate) fn status_dot(color: Hsla) -> Div {
     div().size_2().flex_none().rounded_full().bg(color)
 }
 
@@ -165,30 +166,43 @@ pub(crate) fn subagent_status_color(status: &SubagentStatus, cx: &App) -> Hsla {
     }
 }
 
-/// 统计摘要，按「有什么显示什么」拼成一行。
+/// 子代理统计的两种呈现：行内一个片段 + tooltip 里的完整明细。
 ///
-/// 规范 S-8 限制一行最多 3 个文本片段，所以这里整体只当**一个**片段（自己内部用 ·
-/// 连接的短标记不再拆成独立文本节点），完整明细留给展开区。
-pub(crate) fn subagent_stats_summary(stats: &SubagentStats) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(turns) = stats.turn_count {
-        match stats.max_turns {
-            Some(max) => parts.push(format!("{turns}/{max} 轮")),
-            None => parts.push(format!("{turns} 轮")),
-        }
-    }
-    if let Some(tools) = stats.tool_uses {
-        parts.push(format!("{tools} 次工具"));
-    }
-    if let Some(duration) = stats.duration_ms {
-        parts.push(format_duration_ms(duration));
-    }
-    if let Some(cost) = stats.cost
-        && cost > 0.
-    {
-        parts.push(format!("${cost:.4}"));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+/// 规范 S-8 的判定规则写得很死：「**一个独立的文本节点算一个片段**；`·` 分隔的每一段
+/// **各算一个**；被 tooltip 承载的内容**不计入**」。也就是说把四项统计用 `·` 拼成一个
+/// 字符串**并不能**把它变成一个片段 —— 那条「各算一个」正是为了堵这条路。
+/// R26 第一版就是这么写的，还在注释里把被条款排除的读法当成了合规依据。
+///
+/// 所以这里只往行内放**最有信息量的一项**，其余全部交给 tooltip：
+/// 已结算的任务最关心「跑了多久」，还没结算的关心「跑到第几轮」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentStatsText {
+    /// 行内显示，恒为一个片段（内部不含 `·`）。
+    pub inline: String,
+    /// tooltip 全量明细；只有一项时与 `inline` 相同，此时调用方可以不挂 tooltip。
+    pub detail: String,
+}
+
+pub(crate) fn subagent_stats_summary(stats: &SubagentStats) -> Option<SubagentStatsText> {
+    let turns = stats.turn_count.map(|turns| match stats.max_turns {
+        Some(max) => format!("{turns}/{max} 轮"),
+        None => format!("{turns} 轮"),
+    });
+    let duration = stats.duration_ms.map(format_duration_ms);
+    let tools = stats.tool_uses.map(|tools| format!("{tools} 次工具"));
+    let cost = stats
+        .cost
+        .filter(|cost| *cost > 0.)
+        .map(|cost| format!("${cost:.4}"));
+
+    // 行内优先耗时（结算后最常看的一项），没有就退到轮次。
+    let inline = duration.clone().or_else(|| turns.clone())?;
+    let detail = [turns, tools, duration, cost]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Some(SubagentStatsText { inline, detail })
 }
 
 /// 毫秒 → 人读时长。超过一分钟就不再显示小数秒，长任务看分秒比看 `183.4s` 直观。
@@ -1182,7 +1196,7 @@ fn render_subagent(
     let status_label = card.status.label().to_owned();
     let toggle_key = key.clone();
     let item_id = message_item_id(&toggle_key);
-    // 摘要行合计 ≤3 个文本片段（规范 S-8）：描述、短 id、统计。
+    // 摘要行三个片段：描述、短 id、**一项**统计（其余明细进 tooltip，见 S-8 判定规则）。
     let summary = card
         .description
         .clone()
@@ -1204,6 +1218,8 @@ fn render_subagent(
                 .debug_selector(|| "subagent-card-toggle".into())
                 .gap_1p5()
                 .cursor_pointer()
+                // 规范 § 4.4：折叠头必须有 hover 反馈，否则可点区域不可发现。
+                .hover(|row| row.text_color(cx.theme().foreground))
                 .on_click(move |_, _, cx| {
                     if let Some(handler) = &on_toggle_tool {
                         handler(toggle_key.clone(), item_id.clone(), cx);
@@ -1231,44 +1247,65 @@ fn render_subagent(
                         .text_color(cx.theme().muted_foreground),
                 ),
         )
-        .child(
-            h_flex()
-                .min_w_0()
-                .gap_1p5()
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(summary),
-                )
-                .when_some(card.short_id.clone(), |row, short_id| {
-                    // 短 id 是 dim 级元信息（规范 S-16 第 3 档），用于和面板里的任务对上号。
-                    row.child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(crate::theme::dim_foreground(cx))
-                            .child(short_id),
-                    )
-                })
-                .when_some(stats_summary, |row, stats| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(crate::theme::dim_foreground(cx))
-                            .child(stats),
-                    )
-                }),
-        )
+        // 摘要行最多 3 个文本片段（规范 S-8）：描述 + 短 id + **一项**统计。
+        // 统计的完整明细挂 tooltip —— 条款明确「被 tooltip 承载的内容不计入」。
+        .when(!summary.is_empty() || stats_summary.is_some(), |view| {
+            view.child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .when(!summary.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(summary.clone()),
+                        )
+                    })
+                    .when(summary.is_empty(), |row| row.child(div().flex_1()))
+                    .when_some(card.short_id.clone(), |row, short_id| {
+                        // 短 id 是 dim 级元信息（规范 S-16 第 3 档），用于和面板里的任务对上号。
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(crate::theme::dim_foreground(cx))
+                                .child(short_id),
+                        )
+                    })
+                    .when_some(stats_summary, |row, stats| {
+                        let detail = stats.detail.clone();
+                        let has_more = detail != stats.inline;
+                        row.child(
+                            div()
+                                // tooltip 需要一个有 id 的可交互元素（与 git_workspace
+                                // 里 Git 状态码那处同一写法）。
+                                .id(SharedString::from(format!("subagent-stats-{key}")))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(crate::theme::dim_foreground(cx))
+                                .when(has_more, |node| {
+                                    node.tooltip(move |window, cx| {
+                                        Tooltip::new(detail.clone()).build(window, cx)
+                                    })
+                                })
+                                .child(stats.inline),
+                        )
+                    }),
+            )
+        })
         .when(expanded, |view| {
             view.child(
                 subordinate_column(cx)
                     .debug_selector(|| "subagent-card-details".into())
                     .gap_2()
+                    // 规范 § 5.3：从属区整体走 text_xs + 弱色，与 thinking 展开区同构。
+                    // 不显式声明会继承消息容器的 text_sm，比同区其他行大一档。
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
                     .when_some(card.stop_reason.clone(), |column, reason| {
                         column.child(
                             div()
@@ -2200,6 +2237,90 @@ mod tests {
             .expect("工具卡 header 必须有状态点");
         assert!(dot.size.width > px(0.) && dot.size.height > px(0.));
         assert!(visual.debug_bounds("tool-card-details").is_some());
+    }
+
+    /// 子代理卡片：默认折叠只出 header 与摘要，展开才出明细；状态点是唯一上状态色的地方。
+    #[gpui::test]
+    fn subagent_card_collapses_by_default_and_expands_into_a_subordinate_column(
+        cx: &mut TestAppContext,
+    ) {
+        let card = pi_render::SubagentCard {
+            agent_type: "scout".to_owned(),
+            description: Some("找调用点".to_owned()),
+            short_id: Some("a1b2c3d4".to_owned()),
+            agent_id: None,
+            status: SubagentStatus::Completed,
+            stop_reason: None,
+            worktree_path: None,
+            output_file: Some("/tmp/pi-agent-outputs/a1b2c3d4.log".to_owned()),
+            result: "找到三处".to_owned(),
+            stats: pi_render::SubagentStats {
+                turn_count: Some(3),
+                duration_ms: Some(1500),
+                ..pi_render::SubagentStats::default()
+            },
+        };
+        let assistant = message(
+            "a",
+            MessageRole::Assistant,
+            vec![Block::Subagent(Box::new(card))],
+        );
+        let document = Arc::new(ConversationDocument {
+            session_id: "subagent".to_owned(),
+            source_path: PathBuf::from("subagent.jsonl"),
+            cwd: PathBuf::new(),
+            messages: Arc::from(vec![assistant.clone()]),
+            items: Arc::from(vec![ConversationItem::Message(assistant)]),
+            minimap: Arc::from([]),
+            diagnostics: Arc::from([]),
+        });
+
+        let mut visual = render_chat(cx, document.clone(), Vec::new(), None);
+        assert!(visual.debug_bounds("subagent-card").is_some());
+        let dot = visual
+            .debug_bounds("subagent-card-status-dot")
+            .expect("子代理卡 header 必须有状态点");
+        assert!(dot.size.width > px(0.) && dot.size.height > px(0.));
+        assert!(
+            visual.debug_bounds("subagent-card-details").is_none(),
+            "默认必须折叠"
+        );
+
+        let mut expanded = render_chat(cx, document, vec!["a:subagent:0".to_owned()], None);
+        assert!(expanded.debug_bounds("subagent-card-details").is_some());
+    }
+
+    /// S-8：统计行内恒为一个片段，`·` 明细只出现在 tooltip 串里。
+    #[gpui::test]
+    fn subagent_stats_keep_the_inline_row_to_a_single_fragment(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let full = pi_render::SubagentStats {
+                turn_count: Some(5),
+                max_turns: Some(10),
+                tool_uses: Some(12),
+                duration_ms: Some(63_000),
+                cost: Some(0.0123),
+                ..pi_render::SubagentStats::default()
+            };
+            let text = subagent_stats_summary(&full).expect("有统计就该有文案");
+            assert!(
+                !text.inline.contains('·'),
+                "行内不得拼多段（S-8：· 分隔的每段各算一个）：{}",
+                text.inline
+            );
+            assert_eq!(text.inline, "1m03s");
+            assert_eq!(text.detail, "5/10 轮 · 12 次工具 · 1m03s · $0.0123");
+
+            // 只有一项时 detail 与 inline 相同，调用方据此不挂 tooltip。
+            let only_turns = pi_render::SubagentStats {
+                turn_count: Some(2),
+                ..pi_render::SubagentStats::default()
+            };
+            let text = subagent_stats_summary(&only_turns).unwrap();
+            assert_eq!(text.inline, text.detail);
+            assert!(subagent_stats_summary(&pi_render::SubagentStats::default()).is_none());
+        });
     }
 
     /// T2 ②（其二）：整卡边框是 border 系，不随工具状态变化。

@@ -12,7 +12,7 @@ mod subagent_panel;
 mod tab_bar;
 pub mod theme;
 
-pub use chat::{ChatMinimap, ChatWindow, MarkdownBody, MessageView};
+pub use chat::{ChatMinimap, ChatWindow, MarkdownBody, MessageView, SubagentStatsText};
 pub use file_workspace::{WorkspaceContentTab, WorkspaceContentTabs};
 pub use git_workspace::{
     DiffView, GitChangeItem, GitChangeKind, GitChangesModel, GitChangesView, TurnWrittenFiles,
