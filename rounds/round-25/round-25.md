@@ -2,7 +2,7 @@
 
 <!-- 保存为 rounds/round-25/round-25.md；该轮其他管理产出也放在同一目录。 -->
 
-> 执行方：Windows · 状态：已完成（代码审查十一轮收敛，视觉审查 `CODE_ONLY_PASS`；待推送与 PR）
+> 执行方：Windows · 状态：已完成 · PR [#35](https://github.com/cking000bigdemon/GPUI-Pi/pull/35) · CI 阻断 job 通过
 
 ## 目标
 
@@ -320,6 +320,13 @@
 ```
 
 这是**依赖边**的记录（pi-rpc 现在也依赖 windows-sys），不是版本漂移：`windows-sys 0.61.2` 早已在 lock 中（`pi-data` 在用），本轮没有新增任何 package、没有改动任何版本号，`check-pins.ps1` 全绿。立项文档那句表述略理想化 —— 给一个此前不依赖某 crate 的成员新增依赖，必然会在 lock 里留下这一行。已按事实记录，不视为触红线 2。
+
+### CI
+
+PR [#35](https://github.com/cking000bigdemon/GPUI-Pi/pull/35)，唯一阻断 job `windows (阻断)` 的
+`T1 全量验收` **通过**（[run 32962261545](https://github.com/cking000bigdemon/GPUI-Pi/actions/runs/32962261545)，20m11s）。
+CI runner 关闭本机缓存（`GPUI_PI_CACHE: OFF`）、每次全新联网拉取 vendor，因此这也顺带验证了
+本轮的 `vendor` 门禁与钉版本在干净机器上成立。
 
 ### 一次 validation 失败及其判定（如实记录）
 
