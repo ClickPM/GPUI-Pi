@@ -22,6 +22,23 @@ pub use protocol::*;
 /// 改这里等于换内核版本 —— 必须同步 `docs/立项文档.md` § 二 与两个 fetch 脚本。
 pub const PINNED_PI_VERSION: &str = "0.84.2";
 
+/// 钉死的子代理执行内核版本（npm 包 `pi-subagents-lite`）。
+///
+/// 改这里等于换子代理内核 —— 必须同步 `docs/立项文档.md` § 二、
+/// `scripts/fetch-pi-subagents-lite.ps1` 与 `pins/` 下的 manifest 基线。
+pub const PINNED_SUBAGENTS_LITE_VERSION: &str = "1.13.0";
+
+/// 子代理执行内核在 `vendor/` 下的目录名。
+#[must_use]
+pub fn subagent_kernel_dir_name() -> String {
+    format!("pi-subagents-lite-{PINNED_SUBAGENTS_LITE_VERSION}")
+}
+
+/// 子代理执行内核向模型暴露的工具名。
+///
+/// 顺序与 `pi-subagents-lite` 的 `registerTools()` 注册顺序一致，便于和它的源码对读。
+pub const SUBAGENT_TOOL_NAMES: [&str; 3] = ["Agent", "StopAgent", "AgentStatus"];
+
 /// 当前平台下 pi 可执行文件的文件名。
 pub const fn pi_binary_name() -> &'static str {
     if cfg!(windows) { "pi.exe" } else { "pi" }

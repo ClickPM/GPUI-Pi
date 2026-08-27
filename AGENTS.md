@@ -27,10 +27,11 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 .\scripts\fetch-pi.ps1
 .\scripts\fetch-pi-source.ps1
 .\scripts\fetch-pi-web.ps1
+.\scripts\fetch-pi-subagents-lite.ps1
 .\scripts\check-pins.ps1
 ```
 
-开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/` 均存在，且 `check-pins` 全绿。每个 worktree 的本地目录必须独立准备，上游参考源码走本 worktree 自己的 fetch 脚本。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、创建共享目录链接（红线 6），或读取主 checkout / 其他 worktree 的 `vendor/` 顶替。临时只读参考可以直接读外部绝对路径，但不得挂载进 worktree，且这一口径只适用于 `vendor/` 之外的资源（如 gpui-component clone）——上游对照在门禁通过前后都只走本 worktree 自己的 `vendor/`。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
+开始实现前必须同时确认 `vendor/pi/pi.exe`、`vendor/upstream/pi-0.84.2/`、`vendor/upstream/pi-web-0.8.9/`、`vendor/pi-subagents-lite-1.13.0/` 均存在，且 `check-pins` 全绿。每个 worktree 的本地目录必须独立准备，上游参考源码走本 worktree 自己的 fetch 脚本。任何一项缺失或准备失败都立即停止并呼人；禁止先寻找替代源码路径、边开发边补、创建共享目录链接（红线 6），或读取主 checkout / 其他 worktree 的 `vendor/` 顶替。临时只读参考可以直接读外部绝对路径，但不得挂载进 worktree，且这一口径只适用于 `vendor/` 之外的资源（如 gpui-component clone）——上游对照在门禁通过前后都只走本 worktree 自己的 `vendor/`。这样每轮从第一分钟起就有完整运行时和钉死对照源码，不再把实现时间浪费在寻找缺失的 `vendor`。
 
 本机缓存：fetch 脚本默认走 `D:\tmp\gpui-pi-cache`（环境变量 `GPUI_PI_CACHE` 可改路径，设 `OFF` 禁用；CI 已禁用）——缓存命中时只做本地校验与拷贝，不联网；缓存缺失或校验失败才联网拉取，并在缓存目录内覆盖更新。缓存目录位于仓库之外，`vendor` 里始终是每 worktree 独立的真实拷贝，不创建任何链接（红线 6 不受影响）。
 
@@ -131,7 +132,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 ## Post-v1 有界运行时（R21–R27）
 
 - 权威拆分见 `docs/立项文档.md` § 七 阶段 E；对应 GitHub Issue 为 #27。项目所有者已于 2026-08-23 选择**口径 B**：先实施阶段 E，M4 顺延到 M5 之后，附录 A 验收基线须在 R24 后重建。
-- 实施顺序固定为：R21 集中化 → R22 Actor/背压 → R23 Scheduler/Park → R24 多会话 UI → R25 Windows Job Object/内存 → R26 只读子代理 → R27 mutating writer/worktree 隔离。**R22 背压未通过前禁止开放多会话**。
+- 实施顺序固定为：R21 集中化 → R22 Actor/背压 → R23 Scheduler/Park → R24 多会话 UI → R25 Windows Job Object/内存 → R26 内建子代理（集成 `pi-subagents-lite`）→ R27 mutating writer/worktree 隔离。**R22 背压未通过前禁止开放多会话**。
 - `RuntimeManager` 是应用级共享服务，跨窗口、Workspace、用户 Session、内建子代理和 maintenance job 共用总预算；禁止在 `ChatPanel` 或单个窗口内各建一套 Manager。
 - app 生产代码创建用户 Session、内建子代理或 maintenance `pi --mode rpc`（包括历史 HTML 导出）必须经过 `RuntimeManager`；`pi-rpc` 自身隔离测试可直接创建 `Client`。Provider 登录等一次性非 RPC CLI 不计入 Session Runtime。Maintenance job 走独立小配额，**不占用户会话运行槽**。
 - **重启决策权归 Manager**：经 `RuntimeManager` 创建的 Runtime 一律把 `pi-rpc` 的 `max_restarts` 设为 0，崩溃恢复走 Manager 状态机。确需保留底层自动重启的场景，必须订阅 `LifecycleEvent::Restarting / Restarted` 并把该次重启计入运行槽与内存预算——绝不允许底层在 Manager 判 `Failed`、释放运行槽之后自行拉起进程。
@@ -139,6 +140,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 - `SessionHandle` 不得暴露 raw `Client`、可变 reducer、无界 receiver 或 app 专用 `PumpMessage`；UI 通过稳定 `RuntimeId`、Snapshot revision 与 Dirty 通知消费状态。Pi `session_id` 可后置校准，不作为不可变 Handle 主键。
 - **两类子代理，边界不许含糊**：Scheduler 的并发与深度配额只覆盖 **Manager 派发**的子代理；pi 内核与 extension 自行 spawn 的子代理绕过配额（官方 `subagent` 示例扩展对每次调用 spawn 一个 `pi --mode json -p --no-session`，且支持 `tasks` 数组并行）。因此 R26 验收不得表述为"所有子代理"。反过来也不得说这类进程"无法强制控制"——它们在 Runtime 的进程树 / Job Object 内，R25 的进程数与内存硬限制对其有效；真正做不到的只是**按任务语义限流**。
 - R26/R27 自建子代理的立项理由必须成立且写明：有会话文件（可恢复、可回看）、有进度与结果 UI、mutating 任务有 worktree 隔离。子代理会话用钉死协议已有的 `new_session { parentSession }` 把父子关系落盘，不得只存在 Manager 内存里。
+- **R26 勘误（2026-08-27，所有者裁定）**：R26 不自建子代理，改为集成 `npm:pi-subagents-lite@1.13.0` 作为执行内核（vendor 钉死 + `-e <本地路径>` 注入）。该内核是**第三类**子代理 —— 进程内执行（不 spawn 子进程，R25 进程数配额恒不触发、内存却全计入父 Runtime）、会话 `SessionManager.inMemory` **不落盘**（"可恢复"本轮拿不到，禁止在任何验收里声称拿到）、自带 UI 全走 `ctx.ui.custom()` / `setWidget` 组件工厂而在 RPC 模式失效。可用事实来源只有 `tool_execution_*` 事件、`subagent-result` 的 `custom_message` 条目、`details.outputFile` transcript 三样；配额只能是配置式上限（`.pi/subagents-lite.json`）加 R25 内存兜底，**不得表述为派发式调度**。完整口径见 `docs/立项文档.md` § 二「R26 新增外部依赖的口径」与 § 三「R26 勘误」。
 - R21 的「`ChatPanel` 会话态收敛为 `SessionUiState`」属本轮授权范围，**不受红线 3 约束**——R21 已要改遍 `active` / `reducer` 的全部引用点，留到 R24 等于同一批代码改两遍。
 - R25 的内存与进程数采样必须经可注入的 `ResourceProbe` 抽象，水位策略用 fake probe 做确定性测试（与 R23 的 fake clock 同构），避免只能手测而撞红线 4。Job Object 所需 API 在已有的 `windows-sys` 内，加 feature 即可，**不改 `Cargo.lock`、不触红线 2**。
 - Issue 中并发数、Warm 数量、Idle TTL 与内存水位是可配置初始值，后续按 Windows 实测调整；不得把建议值硬编码成不可变产品契约。
@@ -176,6 +178,7 @@ pi 编程智能体的**原生桌面客户端**：GPUI + gpui-component 画界面
 | 用途 | 位置 |
 |---|---|
 | 功能对照基线 pi-web 0.8.9 | 固定 `vendor/upstream/pi-web-0.8.9/`；运行 `.\\scripts\\fetch-pi-web.ps1` 准备，身份钉 `v0.8.9` / `2a6e53710f6409e0cceb3de839a62f8cdf3ca3ca`（`pins/pi-web-0.8.9.manifest` 全量校验） |
+| **子代理执行内核 pi-subagents-lite 1.13.0**（R26 起，**运行时依赖**，非只读参考） | 固定 `vendor/pi-subagents-lite-1.13.0/`；运行 `.\\scripts\\fetch-pi-subagents-lite.ps1` 准备，身份钉 npm `1.13.0` + `@sinclair/typebox 0.34.52`，两个 tarball 各按 sha512 integrity 校验（`pins/pi-subagents-lite-1.13.0.manifest` 全量校验 1133 个文件）。由 `pi -e <该目录>` 加载，禁止改用 `pi install` / `pi -e npm:<spec>` |
 | pi 0.84.2 源码（协议、trust 等实现权威参考） | 固定使用 `vendor/upstream/pi-0.84.2/`；运行 `.\\scripts\\fetch-pi-source.ps1` 准备，身份钉 `v0.84.2` / `914cf1472e715297caa30db4b9535d534a9eb718`（`.gpui-pi-source-pin` marker + `pins/pi-0.84.2.manifest` 全量校验）；禁止引用会自动更新的 Pi Agent 安装目录 |
 | RPC 协议权威文档 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/rpc.md`，或 pi 发布包内 `vendor/pi/docs/rpc.md` |
 | 会话文件格式 | `vendor/upstream/pi-0.84.2/packages/coding-agent/docs/session-format.md`，或 pi 发布包内 `vendor/pi/docs/session-format.md` |
