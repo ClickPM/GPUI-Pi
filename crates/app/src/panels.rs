@@ -231,15 +231,6 @@ pub struct SessionUiState {
     /// 与 `minimap_visible` 一样按会话隔离：并行会话里只有一个在跑子代理时，
     /// 不该因为在那边展开过，切回来就把另一个会话的 composer 也顶下去一截。
     subagent_panel_expanded: bool,
-    /// 子代理任务列表，按**文档身份**记忆化。
-    ///
-    /// `collect_tasks` 会把每个任务的完整结果文本一起克隆出来（单条上限 512KB），
-    /// 而 `render` 每帧都跑。不记忆化就等于每帧复制一遍本会话全部子代理产出 ——
-    /// 在 16–33ms 的合帧节奏下，一个有几条长结果的会话足以把主线程拖住。
-    ///
-    /// 缓存里连 `Arc<ConversationDocument>` 一起存：既用它做 `ptr_eq` 判定，也顺带
-    /// 保证被比较的那份文档还活着，不会出现"旧文档释放后新文档复用同一地址"的误命中。
-    subagent_tasks: Option<(Arc<ConversationDocument>, Arc<[pi_render::SubagentTask]>)>,
     expanded_tools: HashSet<String>,
     expanded_processes: HashSet<String>,
     rpc_success: Option<String>,
@@ -317,7 +308,6 @@ impl SessionUiState {
             minimap_visible: true,
             // 默认折叠：绝大多数会话没有子代理，折叠态只占一行汇总，不抢 composer 的高度。
             subagent_panel_expanded: false,
-            subagent_tasks: None,
             expanded_tools: HashSet::new(),
             expanded_processes: HashSet::new(),
             rpc_success: None,
@@ -3523,29 +3513,23 @@ impl ChatPanel {
 
     /// 当前可见文档里的子代理任务。
     ///
-    /// 任务是文档的纯函数，所以缓存**只按文档身份失效**：不需要跟着切标签、分支预览、
-    /// 流式帧各写一条失效规则 —— 那几条路径换的都是文档本身，`ptr_eq` 一比就知道。
-    fn subagent_tasks(&mut self) -> Arc<[pi_render::SubagentTask]> {
-        let Some(document) = self
-            .branch_preview_document
+    /// 每帧现算，**刻意不做缓存**。曾经按 `Arc::ptr_eq(document)` 记忆化过一版，但
+    /// `SessionHandle::snapshot()` 每次都 `Arc::new(reducer.document())` —— 运行期每一帧
+    /// 都是新 `Arc`，缓存恰好在它声称要优化的场景里永远不命中，只剩下「钉住一份过期
+    /// 文档不让它释放」的副作用（后台标签尤其明显：失焦那一刻的文档会被无限期持有，
+    /// 让负载释放退化成写时复制）。
+    ///
+    /// 现算之所以够便宜，是因为 [`pi_render::SubagentTask`] 刻意不带 `prompt` / `result`
+    /// 这两个大字段：一次扫描 + 每个任务几个短字符串，与遍历文档本身同量级。
+    fn subagent_tasks(&self) -> Vec<pi_render::SubagentTask> {
+        self.branch_preview_document
             .as_ref()
             .or_else(|| match &self.status {
                 ChatStatus::Ready(document) => Some(document),
                 _ => None,
             })
-            .cloned()
-        else {
-            self.subagent_tasks = None;
-            return Arc::from(Vec::new());
-        };
-        if let Some((cached_document, tasks)) = &self.subagent_tasks
-            && Arc::ptr_eq(cached_document, &document)
-        {
-            return Arc::clone(tasks);
-        }
-        let tasks: Arc<[pi_render::SubagentTask]> = Arc::from(pi_render::collect_tasks(&document));
-        self.subagent_tasks = Some((document, Arc::clone(&tasks)));
-        tasks
+            .map(|document| pi_render::collect_tasks(document))
+            .unwrap_or_default()
     }
 
     fn update_workspace_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
@@ -3774,8 +3758,6 @@ impl Render for ChatPanel {
             .as_ref()
             .map(|document| ChatStatus::Ready(document.clone()))
             .unwrap_or_else(|| self.status.clone());
-        // 在进入 builder 链之前算完：`subagent_tasks` 要 `&mut self`（它维护按文档
-        // 身份的记忆化缓存），链里已经在按不可变借用读 `self`，两者不能同时进行。
         let subagent_panel = {
             let tasks = self.subagent_tasks();
             gpui_pi_ui::render_subagent_tasks(
@@ -7791,32 +7773,35 @@ mod tests {
     }
 
     #[gpui::test]
-    fn subagent_tasks_are_memoized_per_document_and_dropped_with_it(cx: &mut TestAppContext) {
-        // `collect_tasks` 会克隆每个任务的完整结果文本，而 render 每帧都要问一次。
-        // 这条钉住"同一份文档只算一次"，别让长结果在每帧被复制一遍。
+    fn subagent_tasks_carry_no_bulk_payload_so_recomputing_every_frame_is_cheap(
+        cx: &mut TestAppContext,
+    ) {
+        // 任务列表每帧现算，所以它必须**不含**大字段：结果正文归 `Block::Subagent`
+        // 卡片（那一份是记账、可释放的），任务只带标识与统计。
+        // 先前那版带 `result` 且靠 `Arc::ptr_eq` 记忆化，而 `snapshot()` 每次都造新 Arc，
+        // 缓存在运行期恒不命中 —— 等于每帧深拷贝一遍全部子代理产出。
         let (_visual, panel) = render_status_with_panel(cx, ChatStatus::Ready(document("hello")));
         panel.update(cx, |panel, _| {
-            let document = subagent_document();
-            panel.status = ChatStatus::Ready(Arc::clone(&document));
-
-            let first = panel.subagent_tasks();
-            let second = panel.subagent_tasks();
-            assert_eq!(first.len(), 1);
-            assert!(
-                Arc::ptr_eq(&first, &second),
-                "同一份文档必须复用同一份任务列表"
-            );
-
-            // 换一份文档必须重算。
             panel.status = ChatStatus::Ready(subagent_document());
-            let third = panel.subagent_tasks();
-            assert!(!Arc::ptr_eq(&first, &third));
-            assert_eq!(third.len(), 1);
+            let tasks = panel.subagent_tasks();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].agent_type, "reviewer");
+            assert_eq!(tasks[0].status, pi_render::SubagentStatus::Completed);
 
-            // 文档消失时缓存要一起放掉，别拖着一份已经没人看的文档不释放。
+            // 任务本身的字符串量级必须与「一条摘要」相当，不能是正文的副本。
+            let footprint: usize = tasks
+                .iter()
+                .map(|task| {
+                    task.key.len()
+                        + task.agent_type.len()
+                        + task.description.len()
+                        + task.stop_reason.as_deref().map_or(0, str::len)
+                })
+                .sum();
+            assert!(footprint < 512, "单条任务的字符串足迹过大：{footprint}");
+
             panel.status = ChatStatus::Empty;
             assert!(panel.subagent_tasks().is_empty());
-            assert!(panel.subagent_tasks.is_none());
         });
     }
 

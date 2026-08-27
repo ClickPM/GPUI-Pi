@@ -4913,20 +4913,25 @@ mod tests {
     #[test]
     fn a_project_level_concurrency_override_changes_the_reserved_headroom() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".pi")).unwrap();
+        // 项目层受 trust 门禁，而门禁要 `agent_dir` 才能查 trust store —— 传 `None`
+        // 一律按不可信处理，项目配置不会生效。这里给一个真实的 agent_dir。
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
         std::fs::write(
-            dir.path().join(".pi").join("subagents-lite.json"),
+            cwd.join(".pi").join("subagents-lite.json"),
             r#"{"concurrency":{"default":1}}"#,
         )
         .unwrap();
-        let with_override = subagent_slots_for(ToolPreset::Full, None, dir.path());
+        let with_override = subagent_slots_for(ToolPreset::Full, Some(&agent_dir), &cwd);
         assert!(
             with_override < subagent_config::effective_concurrency(None, None),
             "调小 concurrency.default 必须让预留槽数跟着变小（实际 {with_override}）"
         );
         // 不加载内核的预设根本不看配置。
         assert_eq!(
-            subagent_slots_for(ToolPreset::ReadOnly, None, dir.path()),
+            subagent_slots_for(ToolPreset::ReadOnly, Some(&agent_dir), &cwd),
             0
         );
     }

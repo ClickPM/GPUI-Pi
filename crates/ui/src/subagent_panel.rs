@@ -199,13 +199,11 @@ mod tests {
             tool_call_id: None,
             agent_type: "scout".to_owned(),
             description: "d".to_owned(),
-            prompt: None,
             background: true,
             worktree_path: None,
             output_file: None,
             status,
             stop_reason: None,
-            result: None,
             stats: SubagentStats::default(),
         }
     }

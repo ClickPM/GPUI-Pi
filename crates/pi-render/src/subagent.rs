@@ -16,7 +16,7 @@
 
 use serde_json::Value;
 
-use crate::{Block, ConversationDocument, ToolCard, ToolOutput, ToolStatus};
+use crate::{Block, ConversationDocument, ToolCard, ToolStatus};
 
 /// 子代理执行内核向模型注册的工具名。与 `pi_rpc::SUBAGENT_TOOL_NAMES` 同源，
 /// 但这里不依赖 `pi-rpc`：`pi-render` 是 app / ui 与 pi-runtime 共享的类型层。
@@ -65,10 +65,15 @@ impl SubagentStatus {
             "queued" => Self::Queued,
             "running" => Self::Running,
             "completed" => Self::Completed,
-            "turn_limited" => Self::TurnLimit,
-            // `aborted`（父会话中断）与 `stopped`（StopAgent）对用户是同一件事：
-            // 没跑完，但不是故障。
-            "aborted" | "stopped" => Self::Stopped,
+            // 两个都是轮次上限终态，别被词义骗了（内核 `src/status-note.ts:5-6`）：
+            //   turn_limited = "wrapped up at the turn limit — output may be partial"
+            //                  （撞到软上限后被 steer 要求收尾，自己结束）
+            //   aborted      = "hit the turn limit before completion; output may be incomplete"
+            //                  （连 graceTurns 也耗尽，`agent-runner.ts:614` 直接 session.abort()）
+            // `aborted` **不是**"父会话中断" —— 用户中断、StopAgent、watchdog 三条路径
+            // 统统落在 `stopped`（`agent-manager.ts` 的 stopAgent，带 stoppedBy 区分）。
+            "turn_limited" | "aborted" => Self::TurnLimit,
+            "stopped" => Self::Stopped,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -144,8 +149,6 @@ pub struct SubagentTask {
     pub agent_type: String,
     /// 一行任务描述，内核缺省时取 prompt 首行。
     pub description: String,
-    /// 派发时给出的完整 prompt；从结果条目回看时拿不到。
-    pub prompt: Option<String>,
     /// 是否后台任务（前台任务的结果内联在工具结果里）。
     pub background: bool,
     /// 跨仓 worktree 路径（R27 才做 Manager 侧强制，这里只透传）。
@@ -154,10 +157,15 @@ pub struct SubagentTask {
     pub output_file: Option<String>,
     pub status: SubagentStatus,
     pub stop_reason: Option<String>,
-    /// 子代理最终产出的文本。
-    pub result: Option<String>,
     pub stats: SubagentStats,
 }
+
+// 刻意**不带** `prompt` 与 `result`：
+//
+// 两者都可能很大（结果正文上限 512KiB），而任务列表是每帧从文档重新扫出来的 —— 带上
+// 它们等于每帧深拷贝一遍全部子代理产出。更要命的是那份副本**逃出了文档负载预算**：
+// `budget.rs` 刚把 `Block::Subagent` 的正文压成占位文案，任务列表里却还躺着完整原文。
+// 需要正文的地方读 `Block::Subagent` 卡片本身，那一份是记账、可释放的。
 
 impl SubagentTask {
     fn new(key: String, agent_type: String, description: String) -> Self {
@@ -167,13 +175,11 @@ impl SubagentTask {
             tool_call_id: None,
             agent_type,
             description,
-            prompt: None,
             background: false,
             worktree_path: None,
             output_file: None,
             status: SubagentStatus::Running,
             stop_reason: None,
-            result: None,
             stats: SubagentStats::default(),
         }
     }
@@ -290,11 +296,14 @@ fn ingest_agent_tool(tasks: &mut Vec<SubagentTask>, card: &ToolCard) {
         .and_then(|d| string_field(d, "type"))
         .or_else(|| string_field(&card.arguments, "agent"))
         .unwrap_or_else(|| "general-purpose".to_owned());
-    let prompt = string_field(&card.arguments, "prompt");
     let description = details
         .and_then(|d| string_field(d, "description"))
         .or_else(|| string_field(&card.arguments, "description"))
-        .or_else(|| prompt.as_deref().and_then(first_line))
+        .or_else(|| {
+            string_field(&card.arguments, "prompt")
+                .as_deref()
+                .and_then(first_line)
+        })
         .unwrap_or_else(|| "（无描述）".to_owned());
 
     let index = upsert(tasks, &key, || {
@@ -304,17 +313,24 @@ fn ingest_agent_tool(tasks: &mut Vec<SubagentTask>, card: &ToolCard) {
     task.agent_type = agent_type;
     task.description = description;
     task.tool_call_id = Some(card.id.clone());
-    if task.prompt.is_none() {
-        task.prompt = prompt;
-    }
     if agent_id.is_some() {
         task.agent_id = agent_id;
     }
-    task.background = card
-        .arguments
-        .get("run_in_background")
-        .and_then(Value::as_bool)
-        .unwrap_or(task.background);
+
+    // 是否后台，以 `details.agentId` 在不在为准，`run_in_background` 参数只作兜底。
+    //
+    // 内核的判据是 `runInBackground || store.agent.forceBackground`
+    // （`tool-execution.ts:199`）—— 用户在配置里打开 `forceBackground` 后，模型不传
+    // 这个参数也会走后台分支。而 `agentId` 只在后台分支被塞进 details（`:229`），
+    // 前台那条 `buildAgentDetails(record, { includeStats: true })` 从不含它，
+    // 所以它恰好是后台分支的**充分且必要**标记。
+    task.background = task.agent_id.is_some()
+        || card
+            .arguments
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(task.background);
+
     if let Some(path) = string_field(&card.arguments, "worktree_path")
         .or_else(|| details.and_then(|d| string_field(d, "worktreePath")))
     {
@@ -327,40 +343,47 @@ fn ingest_agent_tool(tasks: &mut Vec<SubagentTask>, card: &ToolCard) {
         }
     }
 
-    // 状态优先取 details.status（后台派发确认会带 queued / running）；
-    // 没有就按工具本身的结果状态判定 —— 前台任务失败时内核是直接抛异常的。
+    // 状态优先取 details.status（后台派发确认会带 queued / running）。
+    //
+    // 没有 details 时**不能**凭工具本身的 Success 判成"已完成"：负载预算会把被裁消息的
+    // `details` 剪掉（`budget.rs`），而后台派发的工具结果正文只是一句"已受理"，
+    // 那次调用本来就是 Success —— 照着它判会把一个还在跑的子代理显示成已完成。
+    // 只有能确认是前台任务（结果就在工具正文里）时，工具状态才是可信的终态信号。
     task.status = match details.and_then(|d| string_field(d, "status")) {
         Some(raw) => SubagentStatus::parse(&raw),
+        None if task.background => task.status.clone(),
         None => match card.status {
             ToolStatus::Pending => SubagentStatus::Running,
             ToolStatus::Error => SubagentStatus::Error,
             ToolStatus::Success | ToolStatus::Empty => SubagentStatus::Completed,
         },
     };
-
-    // 前台任务的产出就在工具结果正文里；后台派发的正文只是一句"已受理"，
-    // 真正的结果要等 subagent-result 条目，所以这里不覆盖已有结果。
-    if !task.background
-        && let Some(text) = tool_output_text(card)
-    {
-        task.result = Some(text);
-    }
 }
 
 fn ingest_stop_agent_tool(tasks: &mut [SubagentTask], card: &ToolCard) {
     let Some(target) = string_field(&card.arguments, "agent_id") else {
         return;
     };
-    // 模型通常写短 id，所以按前缀匹配；已经结算的任务不再改写 —— StopAgent 对一个
-    // 刚好完成的任务返回成功，不代表它是"被停止"的。
-    for task in tasks.iter_mut() {
-        let matches = task
-            .agent_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with(&target) || target.starts_with(id));
-        if matches && !task.status.is_settled() && card.status != ToolStatus::Error {
-            task.status = SubagentStatus::Stopped;
-        }
+    if card.status == ToolStatus::Error {
+        return;
+    }
+    // 模型通常写标题里那个 8 位短 id，而完整 id 有 17 位，所以方向是单一的：
+    // 完整 id 以模型给的串开头。反向匹配（`target.starts_with(id)`）没有对应场景。
+    //
+    // 只有**唯一命中**才改写。内核 `stopAgent` 是按 `getRecord(agentId)` 精确中止一个
+    // （`tool-execution.ts`），前缀撞车时我们无从知道是哪一个，宁可不改也不能把
+    // 几条任务一起标成已停止 —— 那会凭空造出"用户停了三个"的假象。
+    let mut hits = tasks
+        .iter_mut()
+        .filter(|task| {
+            task.agent_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(&target))
+                && !task.status.is_settled()
+        })
+        .collect::<Vec<_>>();
+    if let [task] = hits.as_mut_slice() {
+        task.status = SubagentStatus::Stopped;
     }
 }
 
@@ -399,7 +422,6 @@ fn ingest_result_card(tasks: &mut Vec<SubagentTask>, card: &SubagentCard) {
     task.background = true;
     task.status = card.status.clone();
     task.stop_reason.clone_from(&card.stop_reason);
-    task.result = Some(card.result.clone());
     task.stats.merge_from_stats(&card.stats);
 }
 
@@ -480,19 +502,6 @@ fn upsert(tasks: &mut Vec<SubagentTask>, key: &str, make: impl FnOnce() -> Subag
     tasks.len() - 1
 }
 
-fn tool_output_text(card: &ToolCard) -> Option<String> {
-    let mut text = String::new();
-    for output in &card.output {
-        if let ToolOutput::Text(chunk) = output {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(chunk);
-        }
-    }
-    (!text.trim().is_empty()).then_some(text)
-}
-
 fn first_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
@@ -536,7 +545,7 @@ fn take_if_some<T: Copy>(slot: &mut Option<T>, other: Option<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Message;
+    use crate::{Message, ToolOutput};
     use serde_json::json;
 
     fn tool_card(id: &str, name: &str, arguments: Value, details: Option<Value>) -> ToolCard {
@@ -693,10 +702,8 @@ mod tests {
         assert_eq!(task.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(task.agent_type, "scout");
         assert_eq!(task.description, "找鉴权");
-        assert_eq!(task.prompt.as_deref(), Some("找出所有鉴权代码"));
         assert!(task.background);
         assert_eq!(task.status, SubagentStatus::Completed);
-        assert_eq!(task.result.as_deref(), Some("三处"));
         assert_eq!(task.stats.turn_count, Some(4));
         assert_eq!(task.stats.tool_uses, Some(9));
         assert_eq!(
@@ -717,7 +724,6 @@ mod tests {
         assert_eq!(tasks[0].key, "99887766");
         assert_eq!(tasks[0].agent_type, "reviewer");
         assert!(tasks[0].background);
-        assert_eq!(tasks[0].result.as_deref(), Some("没问题"));
     }
 
     #[test]
@@ -734,7 +740,6 @@ mod tests {
         assert_eq!(tasks[0].key, "tool:call_2");
         assert!(!tasks[0].background);
         assert_eq!(tasks[0].status, SubagentStatus::Completed);
-        assert_eq!(tasks[0].result.as_deref(), Some("两处小问题"));
         assert_eq!(tasks[0].description, "审一下 diff");
     }
 
@@ -751,7 +756,6 @@ mod tests {
         card.output = vec![ToolOutput::Text("Agent failed: boom".to_owned())];
         let tasks = collect_tasks(&document(vec![Block::Tool(card)]));
         assert_eq!(tasks[0].status, SubagentStatus::Error);
-        assert_eq!(tasks[0].result.as_deref(), Some("Agent failed: boom"));
     }
 
     #[test]
@@ -800,8 +804,10 @@ mod tests {
             ("queued", SubagentStatus::Queued, false),
             ("running", SubagentStatus::Running, false),
             ("completed", SubagentStatus::Completed, true),
+            // 两个轮次上限终态，别按词义归类：aborted 是「graceTurns 也耗尽后被硬杀」，
+            // 不是「父会话中断」——后者走 stopped（内核 status-note.ts:5-6）。
             ("turn_limited", SubagentStatus::TurnLimit, true),
-            ("aborted", SubagentStatus::Stopped, true),
+            ("aborted", SubagentStatus::TurnLimit, true),
             ("stopped", SubagentStatus::Stopped, true),
             ("error", SubagentStatus::Error, true),
         ];
@@ -848,5 +854,111 @@ mod tests {
     fn non_subagent_tools_are_ignored_entirely() {
         let bash = tool_card("call_8", "bash", json!({"command": "ls"}), None);
         assert!(collect_tasks(&document(vec![Block::Tool(bash)])).is_empty());
+    }
+
+    #[test]
+    fn the_default_configuration_has_no_transcript_path_and_still_merges_by_short_id() {
+        // outputTranscript 默认是 false（内核 config-io.ts:65），而 outputFile 只在
+        // nudge 那条路径的 details 里出现（tool-execution.ts:46-50）—— 也就是说
+        // **默认配置下结果条目根本没有 outputFile**，agent_id 恒为 None。
+        // 之前几处 fixture 全都塞了 outputFile，把这条真实默认路径漏成了零覆盖。
+        let dispatch = tool_card(
+            "call_a",
+            AGENT_TOOL,
+            json!({"prompt": "查一下", "run_in_background": true}),
+            Some(json!({"type": "scout", "agentId": "abcdef0123456789a", "status": "running"})),
+        );
+        let result = decode_result_card(
+            "[Subagent \"scout\" abcdef01 completed]\n\n查到了",
+            // 没有 outputFile，也没有 agentId —— nudge 的 details 从不含 agentId。
+            Some(&json!({"type": "scout", "status": "completed", "turnCount": 2})),
+        );
+        assert_eq!(result.agent_id, None, "默认配置下反推不出完整 agent id");
+        assert_eq!(result.short_id.as_deref(), Some("abcdef01"));
+
+        let tasks = collect_tasks(&document(vec![
+            Block::Tool(dispatch),
+            Block::Subagent(Box::new(result)),
+        ]));
+        assert_eq!(tasks.len(), 1, "必须靠短 id 归并成一条：{tasks:#?}");
+        assert_eq!(tasks[0].agent_id.as_deref(), Some("abcdef0123456789a"));
+        assert_eq!(tasks[0].status, SubagentStatus::Completed);
+        assert_eq!(tasks[0].output_file, None);
+    }
+
+    #[test]
+    fn a_background_dispatch_whose_details_were_released_is_not_reported_as_completed() {
+        // 负载预算会把被裁消息的 details 剪掉，只留身份字段。后台派发的工具调用本身
+        // 是 Success，照着工具状态判会把一个还在跑的子代理显示成已完成 —— 那正是
+        // 「面板说完成了、其实还在跑」这类最难发现的错误。
+        let dispatch = tool_card(
+            "call_b",
+            AGENT_TOOL,
+            json!({"prompt": "长任务", "run_in_background": true}),
+            // budget.rs 释放后保留下来的那一小撮身份字段。
+            Some(json!({"agentId": "0011223344556677a", "status": "running"})),
+        );
+        let tasks = collect_tasks(&document(vec![Block::Tool(dispatch)]));
+        assert_eq!(tasks[0].status, SubagentStatus::Running);
+
+        // 连 status 都没了的极端情况：仍然不能凭工具 Success 判成完成。
+        let stripped = tool_card(
+            "call_c",
+            AGENT_TOOL,
+            json!({"prompt": "长任务", "run_in_background": true}),
+            Some(json!({"agentId": "0011223344556677a"})),
+        );
+        let tasks = collect_tasks(&document(vec![Block::Tool(stripped)]));
+        assert_eq!(
+            tasks[0].status,
+            SubagentStatus::Running,
+            "后台任务缺 status 时应保持未结算，而不是被工具状态判成完成"
+        );
+    }
+
+    #[test]
+    fn force_background_is_recognized_from_details_rather_than_the_tool_argument() {
+        // 用户打开 agent.forceBackground 后，模型不传 run_in_background 也会走后台
+        // 分支；此时唯一可靠的标记是 details.agentId（内核只在后台分支塞它）。
+        let card = tool_card(
+            "call_d",
+            AGENT_TOOL,
+            json!({"prompt": "任务"}),
+            Some(json!({"agentId": "aabbccddeeff00112", "status": "queued"})),
+        );
+        let tasks = collect_tasks(&document(vec![Block::Tool(card)]));
+        assert!(tasks[0].background, "有 agentId 就必须按后台任务处理");
+        assert_eq!(tasks[0].status, SubagentStatus::Queued);
+    }
+
+    #[test]
+    fn stop_agent_leaves_everything_alone_when_the_prefix_is_ambiguous() {
+        // 内核只按精确 id 中止一个；前缀撞车时我们无从知道是哪一个，
+        // 宁可不改也不能一次把几条都标成已停止。
+        let make = |call: &str, id: &str| {
+            tool_card(
+                call,
+                AGENT_TOOL,
+                json!({"prompt": "p", "run_in_background": true}),
+                Some(json!({"agentId": id, "status": "running"})),
+            )
+        };
+        let tasks = collect_tasks(&document(vec![
+            Block::Tool(make("c1", "ab00000000000000a")),
+            Block::Tool(make("c2", "ab11111111111111b")),
+            Block::Tool(tool_card(
+                "c3",
+                STOP_AGENT_TOOL,
+                json!({"agent_id": "ab"}),
+                None,
+            )),
+        ]));
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.status == SubagentStatus::Running),
+            "前缀有歧义时不该改写任何一条：{tasks:#?}"
+        );
     }
 }

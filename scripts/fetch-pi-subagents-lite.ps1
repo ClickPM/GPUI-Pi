@@ -73,8 +73,11 @@ function Expand-NpmTarball([string]$Url, [string]$ExpectedSha512, [string]$TmpRo
 $Download = {
     param([string]$TmpRoot)
 
-    $PkgRoot = Expand-NpmTarball $PkgUrl $PkgSha512 $TmpRoot "$PkgName-$PkgVersion"
-    $TbRoot  = Expand-NpmTarball $TypeboxUrl $TypeboxSha512 $TmpRoot "typebox-$TypeboxVer"
+    # 标签故意取得极短：临时目录里的路径要在下面走一次全量 manifest 校验，而校验
+    # 用的 .NET Framework API 收 MAX_PATH（259）。vendor 树里最长的相对路径本身就有
+    # 97 字符，标签每长一个字符，能容纳的仓库路径就短一个字符。
+    $PkgRoot = Expand-NpmTarball $PkgUrl $PkgSha512 $TmpRoot "pkg"
+    $TbRoot  = Expand-NpmTarball $TypeboxUrl $TypeboxSha512 $TmpRoot "tb"
 
     Write-Host "==> Place @sinclair/typebox as the only vendored node_modules entry"
     $TbDest = Join-Path $PkgRoot "node_modules\@sinclair\typebox"
@@ -131,7 +134,10 @@ if ($CacheRoot) {
 # 3) 兜底（缓存不可用）：临时目录建在目标父目录下、同卷，发布走同一个「拷贝 + 复验」函数。
 $VendorRoot = Split-Path -Parent $Dest
 New-Item -ItemType Directory -Path $VendorRoot -Force | Out-Null
-$TmpRoot = Join-Path $VendorRoot (".fetch-tmp-" + [guid]::NewGuid())
+# 目录名取 8 位十六进制而不是完整 GUID：这条路径下的文件同样要过 MAX_PATH 校验，
+# 一个 36 字符的 GUID 会白白吃掉 28 字符预算，把兜底路径顶到 259 以上。
+# （CI 设 GPUI_PI_CACHE=OFF，走的正是这条；只因 CI 的仓库前缀短才没先暴露。）
+$TmpRoot = Join-Path $VendorRoot (".t" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Path $TmpRoot | Out-Null
 try {
     $Verified = & $Download $TmpRoot

@@ -32,7 +32,7 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 ## 交付物
 
 ### A. 依赖钉死
-- `scripts/fetch-pi-subagents-lite.ps1` —— 按 registry `dist.integrity` 校验 tarball、解包、`npm install --omit=dev --legacy-peer-deps --ignore-scripts` 只补 `@sinclair/typebox`，走 `GPUI_PI_CACHE` 缓存
+- `scripts/fetch-pi-subagents-lite.ps1` —— 直接下载并解包**两个**钉死 tarball（`pi-subagents-lite@1.13.0` + `@sinclair/typebox@0.34.52`），各按 registry `dist.integrity` 校验；**不调用 npm**，走 `GPUI_PI_CACHE` 缓存
 - `pins/pi-subagents-lite-1.13.0.manifest` —— 全量文件校验基线
 - `scripts/check-pins.ps1` —— 增加该包的校验段
 - `docs/立项文档.md` / `CLAUDE.md` / `AGENTS.md` / `ROUNDS.md` —— 口径同步（**已完成**）
@@ -48,7 +48,7 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 > `docs/立项文档.md` § 七 R26 行已同步。
 
 ### C. 任务模型（纯逻辑，无 GPUI）
-- `crates/pi-render/src/subagent.rs` —— `SubagentTask` 与状态归并；输入只认三个事实来源：`tool_execution_*` 事件、`subagent-result` `custom_message` 条目、`details.outputFile`
+- `crates/pi-render/src/subagent.rs` —— `SubagentTask` 与状态归并；输入只认三个事实来源：`tool_execution_*` 事件、`subagent-result` `custom_message` 条目、`details.outputFile`。**刻意不带结果正文与 prompt**：那两个字段 UI 零引用，却会在每帧重算时复制一份刚被负载预算压下去的内容
 - 从会话文件重建历史子代理结果（回看路径）
 
 ### D. UI
@@ -131,7 +131,8 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 | `@sinclair/typebox` tarball sha512 | `sha512-XiMQh7qqVlxZzcVD+kkGMNGMzcTrDMLWI7S4x7z1MkCkbDPrekpZXEUK0eZqZFMuHQg2a2DZOcDIh9o5v3Gonw==` |
 | manifest 文件数 | 1133（59 个包内文件 + 1075 个 typebox 文件 − 1 个 marker） |
 | vendor 树最长绝对路径 | 203 字符（仓库前缀 106 + `node_modules/@sinclair/typebox/build/esm/type/constructor-parameters/…` 97） |
-| fetch 三条路径 | 冷启动（联网）/ 缓存命中 / vendor 快路径均实测 `exit=0` |
+| fetch 四条路径 | 缓存命中 / vendor 快路径 / 冷启动建缓存 / **无缓存兜底（`GPUI_PI_CACHE=OFF`，CI 走的正是这条）** 均实测 `exit=0` |
+| 兜底路径长度 | 缩短临时目录名与解包标签后 267 → **209**（`MaxPathLimit` = 259） |
 
 **踩的坑（一）：manifest 被静默截断成 62 个文件。** 第一版 bootstrap 跑在很深的 scratchpad 路径下，
 `Directory.EnumerateFiles` 枚举出的长路径超过 `MAX_PATH`，`File.OpenRead` 逐个抛异常却没有中断循环，
@@ -179,12 +180,52 @@ caret 区间会随时间漂移的问题。
 第 3 条正是「宁可显示陌生词也不把上游状态悄悄归错」。写了注释、也写了测试，但测试用的是我猜的拼写，
 所以自测全绿而实际全错。**凡是照抄上游取值集的地方，必须回源码逐字核对，不能从字段名反推。**
 
-**第 2 轮起：Claude 子代理审查**（项目所有者 2026-08-27 指定，本任务内改变 CLAUDE.md § 代码审查工具路由的默认选择）。
-审查器保持只读并与 writer 隔离；整改仍由本轮 writer（主会话）承担，审查工具切换不改变 writer 归属。
+**第 2 轮：Claude 子代理审查**（项目所有者 2026-08-27 指定，本任务内改变 CLAUDE.md § 代码审查工具路由的默认选择）。
+三个只读子代理并行，视角互不重叠：上游契约一致性 / 资源边界与安全 / 红线与约定符合度。
+隔离已验证：审查结束后 `git log`、`git stash list`、`git reflog` 均无审查器留下的任何改动。
+整改仍由本轮 writer（主会话）承担 —— 审查工具切换不改变 writer 归属。
+
+共 15 条 findings，**12 条成立并整改，3 条经核对判为可接受并写明理由**：
+
+| # | 级别 | finding | 处理 |
+|---|---|---|---|
+| 1 | P1 | 实时路径的 `subagent-result` 原始副本既不计入预算也释放不掉 | **成立**。内核发的 `content` 是**字符串**，而 `releasable_raw_bytes` / `release_raw_message` 第一行都在 `as_array()` 上早退 → `completed` 里那份原文随后台任务数无界增长。这正是 R25 给工具结果补三件套要堵的洞，子代理走的不是 `toolCall` item，一条都没覆盖。新增 `subagent_result_text()`，两条路径都按 `customType` 认它，释放口径与工具输出一致 |
+| 2 | P2 | 预算释放 `tool.details = None` 抹掉 `agentId`，任务在面板里裂成两条且状态错 | **成立**。后台派发的 `agentId` 只存在于 details。改为按名字保留 `agentId`/`status`/`type` 三个定长身份字段；并让缺 `details` 的后台任务**保持未结算**，不再凭工具 `Success` 判成已完成 |
+| 3 | P2 | 记忆化在运行期恒不命中，等于每帧深拷贝全部子代理产出 | **成立**。`snapshot()` 每次 `Arc::new(...)` 都是新 Arc，`ptr_eq` 缓存恰好在自己声称要优化的场景里永远失效，只剩「钉住过期文档不让释放」的副作用。**根治办法是改数据形状**：`SubagentTask` 去掉 UI 零引用的 `prompt` / `result` 两个大字段，现算即变廉价，缓存连同其副作用一起删掉 |
+| 4 | P2 | 并发配置分层语义与内核不符（两个子代理独立发现） | **成立**，见下方「同一类错误的第 3、4 例」 |
+| 5 | P2 | `aborted` 被当成「父会话中断」 | **成立**，见下方 |
+| 6 | P2 | 立项文档 § 二 描述的是被放弃的 `npm install` 方案 | **成立**。§ 二 那段写于切换到双 tarball 方案**之前**，切换后只在任务卡「踩的坑」里记了，没回头改授权基线，导致同一份任务卡自相矛盾。已改写 |
+| 7 | P2 | 无缓存兜底路径超 MAX_PATH，且「三条路径均实测」不实 | **成立**。兜底路径 267 > 259 限制，在本 worktree 必然抛错；而 CI 恰好设 `GPUI_PI_CACHE: OFF` 走的就是这条，只因 CI 仓库前缀短才没暴露。缩短临时目录名与解包标签（267 → 209），并**实际执行**了 `GPUI_PI_CACHE=OFF` 全流程 |
+| 8 | P3 | 项目层配置缺 trust 门禁 | **成立**。内核只在 `isProjectTrusted()` 为真时读项目层；无条件读等于让仓库内容影响宿主内存上限。改为经 `pi_data::read_project_trust_status` 门禁，读不出状态时按不可信处理 |
+| 9 | P3 | `forceBackground` 开启时前台调用也走后台，只看工具参数会误判 | **成立**。改用 `details.agentId` 判定 —— 内核只在后台分支塞它，是充分必要标记 |
+| 10 | P3 | `details.outputFile` 默认不存在，三处 fixture 全覆盖开启态 | **成立**。默认 `outputTranscript = false`，且 `outputFile` 只在 nudge 路径出现。归并逻辑经核对本就靠短 id 兜住，但补了默认路径的测试 |
+| 11 | P3 | `StopAgent` 双向前缀匹配会一次改写多条 | **成立**。改为单向（完整 id 以模型给的串开头）且**仅唯一命中时**才改写 |
+| 12 | P3 | 默认配置顶满 `MAX_RESERVED_SLOTS`，`configured_total` 恒被吞 | **成立**。`ASSUMED_UNCONFIGURED_MODEL_POOLS` 由 4 下调到 2，让默认值之上仍有可观察空间 |
+| 13 | P3 | 实时路径无 `display` 过滤，回放路径有 | **不改，记录理由**。子代理结果内核硬编码 `display: true`，不受影响；该不对称在 R26 之前就存在（原先落 `Unknown` 也照样渲染），属前序轮次问题，按红线 3 记入 backlog 而非本轮顺手改 |
+| 14 | P3 | `SubagentCard` 里 `result` 之外的字符串不计入预算 | **不改，记录理由**。它们都来自 `details` 的短字段（类型名、状态词、路径），唯一不可控的 `description` 来自模型写的工具参数，量级是一行摘要。计入却不释放反而会让预算永远降不下来（`budget.rs` 注释里写明的坑） |
+| 15 | P3 | 后台标签的任务缓存会钉住过期文档 | **随 #3 一并消失**（缓存已整体删除） |
+
+### 同一类错误，一轮之内出现了 4 次
+
+| # | 我的错假设 | 内核实际 | 出处 |
+|---|---|---|---|
+| 1 | `turn_limit` / `turnLimit` / `turn-limit` | `turn_limited` | 从字段名 `max_turns` 反推 |
+| 2 | `aborted` = 父会话中断 | `aborted` = **轮次上限硬杀**，与 `turn_limited` 同族；`stopped` 才是被谁停掉 | 从英文词义反推 |
+| 3 | 并发配置整层替换 | **按键合并**：`default` 覆盖、`providers`/`models` 取并集 | 没读 `mergeRawConcurrency` |
+| 4 | `details.outputFile` 总是存在 | 只在 nudge 路径 + `outputTranscript`（默认 false）时才有 | 拿开启态当默认态 |
+
+第 2 例最值得记：我在第 1 轮**刚因为 `turn_limited` 被抓**，整改时却把它的孪生状态又归错了桶 ——
+而 `aborted` 与 `turn_limited` 的权威注释就并列写在内核 `status-note.ts` 的相邻两行。
+第 4 例则是「自测与实现共用同一个非默认假设」的第三次重演：三处 fixture 全塞了 `outputFile`，
+默认配置下的真实路径零覆盖。
+
+**结论性教训（已写进本轮，后续轮次沿用）**：凡是照抄上游取值集、字段存在性、或合并语义的地方，
+必须**回源码逐字核对并在注释里引出处**，不得从字段名、英文词义或"看起来合理"反推 ——
+自己造的测试挡不住自己造的错误假设，只会把它钉得更牢。
 
 ### validation
 
-`.\scripts\validate.ps1` 全量，**exit 0**，32 个测试目标共 **551 passed / 0 failed**，clippy `-D warnings` 零警告：
+`.\scriptsalidate.ps1` 全量（两轮独立代码审查整改后的最终一次），**exit 0**，共 **567 passed / 0 failed**，clippy `-D warnings` 零警告：
 
 ```
 ### 范围：全工作区（含 gpui / gpui-component 编译）
@@ -207,6 +248,6 @@ OK   pi-subagents-lite content matches baseline manifest (1133 files)
 validate exit=0
 ```
 
-本轮新增测试（37 条）分布：`pi-render` 子代理模型 15 + 会话回放 2 + 实时路径 2、
-`pi-runtime` 注入与预设 6 + 并发配置 5 + 内存余量 4、`gpui-pi` 面板 2、`gpui-pi-ui` 汇总 3。
+本轮新增测试覆盖：`pi-render` 子代理模型（含四条专为「上游假设」设的回归：内核状态全集、默认无 transcript 路径、details 被预算裁剪后的后台任务、StopAgent 前缀歧义）、会话回放、
+实时路径与回放路径一致性、负载预算纳入子代理正文；`pi-runtime` 注入与预设、并发配置按键合并与 trust 门禁、内存余量；`gpui-pi` 面板显隐与任务足迹；`gpui-pi-ui` 汇总计数。
 

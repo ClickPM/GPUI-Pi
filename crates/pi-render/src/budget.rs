@@ -212,10 +212,16 @@ pub(crate) fn release_payload(message: &mut Message) -> (usize, usize) {
                 }
             }
             Block::Tool(tool) => {
-                // 结构化详情先无条件放掉。它是被计入预算的，而一张"输出为空、详情很大"
-                // 的卡片（合法的空结果 + 非 patch 结构化详情）会在下面那个 `continue`
-                // 上原样溜走 —— 预算算得到它、却永远释放不掉。
-                tool.details = None;
+                // 结构化详情先放掉。它是被计入预算的，而一张"输出为空、详情很大"的卡片
+                // （合法的空结果 + 非 patch 结构化详情）会在下面那个 `continue` 上原样
+                // 溜走 —— 预算算得到它、却永远释放不掉。
+                //
+                // 唯一的例外是内建子代理的派发卡片：后台派发的 `agentId` **只**存在于
+                // details 里（内核 `tool-execution.ts:229`），它同时是任务面板归并同一次
+                // 派发的主键。整份抹掉会让一次派发在面板里裂成两条，其中一条还会因为
+                // 丢了 `status` 而把在跑的子代理显示成已完成。所以这里按名字保留一小撮
+                // **定长**身份字段，其余照旧释放。
+                tool.details = retained_tool_details(&tool.name, tool.details.take());
                 if tool.output.is_empty() {
                     continue;
                 }
@@ -254,6 +260,26 @@ pub(crate) fn release_payload(message: &mut Message) -> (usize, usize) {
         }
     }
     (images, outputs)
+}
+
+/// 释放工具 details 时需要保留的身份字段。
+///
+/// 只保留短小且不可再生的标识：`agentId` 是 17 字符，`status` / `type` 是短枚举词，
+/// 三者加起来不到 100 字节，不构成负载；而它们一旦丢失就无法从别处恢复。
+const RETAINED_SUBAGENT_DETAIL_KEYS: [&str; 3] = ["agentId", "status", "type"];
+
+fn retained_tool_details(tool_name: &str, details: Option<Value>) -> Option<Value> {
+    if tool_name != crate::AGENT_TOOL {
+        return None;
+    }
+    let details = details?;
+    let mut kept = serde_json::Map::new();
+    for key in RETAINED_SUBAGENT_DETAIL_KEYS {
+        if let Some(value) = details.get(key) {
+            kept.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!kept.is_empty()).then(|| Value::Object(kept))
 }
 
 fn release_image(image: &mut ImageBlock) -> bool {
