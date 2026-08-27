@@ -128,6 +128,18 @@ pub struct MemoryLimits {
     pub max_processes_per_runtime: Option<u32>,
     /// 每个 Runtime 进程树的提交内存硬上限（Job Object）。
     pub runtime_memory_bytes: Option<u64>,
+    /// 每个子代理并发槽为 Runtime 额外预留的内存余量。
+    ///
+    /// R26 的子代理执行内核**在 pi 进程内**开会话，不 spawn 子进程：进程数硬上限对它
+    /// 恒不触发，内存却全部计进父 Runtime 那一棵树。`runtime_memory_bytes` 是按
+    /// 「一个会话的 Runtime」标定的，若不为子代理加余量，一次正常的三路并行审查就可能
+    /// 把**父会话**一起撞死在硬上限上 —— 那是最糟的失败形态：用户看到的是自己的会话
+    /// 崩了，而不是某个子代理被拦下。
+    ///
+    /// 余量按内核**配置的并发槽数**静态计入（见 [`crate::subagent_config`]），在 Runtime
+    /// 创建时一次算定，不随运行中的子代理数动态调整 —— Job Object 的上限本来就该在
+    /// 进程被放行之前就位（R25 的挂起-纳管-放行顺序），事后再调只会重新引入竞态。
+    pub subagent_slot_bytes: Option<u64>,
     /// 两次真实采样之间的最小间隔；`ZERO` 表示每次都重新采样（测试用）。
     pub sample_interval: Duration,
 }
@@ -150,6 +162,10 @@ impl Default for MemoryLimits {
             max_processes_per_runtime: Some(64),
             // 单棵树 4GiB ≈ 实测占用的 10 倍，只拦真正的失控，不误伤正常会话。
             runtime_memory_bytes: Some(4 * 1024 * 1024 * 1024),
+            // 每个子代理槽 1GiB：子代理与父会话共享同一个 pi 进程，多出来的主要是各自
+            // 的上下文与工具输出。按静止 Runtime 实测 ≈377MiB 的量级，1GiB 已是宽裕的
+            // 上界；内核默认并发 4 时整棵树的上限落在 8GiB，仍远低于失控级别。
+            subagent_slot_bytes: Some(1024 * 1024 * 1024),
             sample_interval: Duration::from_millis(500),
         }
     }
@@ -163,6 +179,7 @@ impl MemoryLimits {
             resume_available_bytes: self.resume_available_bytes.max(self.low_available_bytes),
             max_processes_per_runtime: self.max_processes_per_runtime.filter(|value| *value > 0),
             runtime_memory_bytes: self.runtime_memory_bytes.filter(|value| *value > 0),
+            subagent_slot_bytes: self.subagent_slot_bytes.filter(|value| *value > 0),
             ..self
         }
     }
@@ -176,10 +193,23 @@ impl MemoryLimits {
         }
     }
 
-    pub(crate) fn job_limits(self) -> pi_rpc::JobLimits {
+    /// 为一个 Runtime 算 Job Object 上限。
+    ///
+    /// `slots` 是内核**配置的**并发上限（`concurrency.default`），不是当前在跑的数量：
+    /// 上限必须在进程放行之前就位，事后再调等于把 R25 好不容易消掉的竞态请回来。
+    /// 不加载内核的 Runtime（maintenance 导出、只读预设）传 `0`，上限保持原样。
+    pub(crate) fn job_limits_with_subagent_slots(self, slots: u32) -> pi_rpc::JobLimits {
+        let job_memory_bytes = match (self.runtime_memory_bytes, self.subagent_slot_bytes) {
+            (Some(base), Some(slot)) if slots > 0 => {
+                Some(base.saturating_add(slot.saturating_mul(u64::from(slots))))
+            }
+            // 基线上限本身没配（= 不限内存）时不能凭余量凭空造出一个上限，
+            // 否则「关掉内存硬限」这个配置会被子代理路径偷偷打开。
+            (base, _) => base,
+        };
         pi_rpc::JobLimits {
             max_active_processes: self.max_processes_per_runtime,
-            job_memory_bytes: self.runtime_memory_bytes,
+            job_memory_bytes,
         }
     }
 
@@ -351,7 +381,9 @@ mod tests {
         assert!(!governor.under_pressure(Duration::ZERO));
         assert!(!governor.report().enabled);
         assert_eq!(
-            limits.job_limits().max_active_processes,
+            limits
+                .job_limits_with_subagent_slots(0)
+                .max_active_processes,
             MemoryLimits::default().max_processes_per_runtime,
             "关掉水位不应连 Job Object 硬上限一起关掉"
         );
@@ -373,10 +405,63 @@ mod tests {
         let limits = MemoryLimits {
             max_processes_per_runtime: Some(0),
             runtime_memory_bytes: Some(0),
+            subagent_slot_bytes: Some(0),
             ..MemoryLimits::default()
         }
         .sanitized();
-        assert_eq!(limits.job_limits().max_active_processes, None);
-        assert_eq!(limits.job_limits().job_memory_bytes, None);
+        let job = limits.job_limits_with_subagent_slots(4);
+        assert_eq!(job.max_active_processes, None);
+        assert_eq!(job.job_memory_bytes, None);
+    }
+
+    #[test]
+    fn subagent_slots_widen_the_tree_ceiling_but_zero_slots_leave_it_alone() {
+        let limits = MemoryLimits {
+            runtime_memory_bytes: Some(4 * GIB),
+            subagent_slot_bytes: Some(GIB),
+            ..MemoryLimits::default()
+        }
+        .sanitized();
+        assert_eq!(
+            limits.job_limits_with_subagent_slots(0).job_memory_bytes,
+            Some(4 * GIB),
+            "不加载内核的 Runtime 必须与 R25 完全一致"
+        );
+        assert_eq!(
+            limits.job_limits_with_subagent_slots(4).job_memory_bytes,
+            Some(8 * GIB)
+        );
+    }
+
+    #[test]
+    fn subagent_headroom_never_invents_a_ceiling_where_none_was_configured() {
+        // 「关掉内存硬限」是显式配置，子代理路径不许把它偷偷打开。
+        let limits = MemoryLimits {
+            runtime_memory_bytes: None,
+            subagent_slot_bytes: Some(GIB),
+            ..MemoryLimits::default()
+        }
+        .sanitized();
+        assert_eq!(
+            limits.job_limits_with_subagent_slots(8).job_memory_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn an_absurd_slot_count_saturates_instead_of_wrapping_to_a_tiny_ceiling() {
+        // 溢出回绕会把上限算成一个极小的数，那比不设上限更糟 —— 会话刚起来就被打死。
+        let limits = MemoryLimits {
+            runtime_memory_bytes: Some(u64::MAX - 1),
+            subagent_slot_bytes: Some(u64::MAX / 2),
+            ..MemoryLimits::default()
+        }
+        .sanitized();
+        assert_eq!(
+            limits
+                .job_limits_with_subagent_slots(u32::MAX)
+                .job_memory_bytes,
+            Some(u64::MAX)
+        );
     }
 }

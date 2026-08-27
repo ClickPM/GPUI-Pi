@@ -33,8 +33,8 @@ type ForkMessageHandler = Arc<dyn Fn(String, &mut App)>;
 
 use pi_render::{
     AnsiColor, AnsiStyle, AnsiText, Block, CodeBlock, ConversationDocument, ConversationItem,
-    FrontmatterCard, ImageBlock, ImageState, Message, MessageRole, ProcessGroup, ToolCard,
-    ToolOutput, ToolStatus,
+    FrontmatterCard, ImageBlock, ImageState, Message, MessageRole, ProcessGroup, SubagentCard,
+    SubagentStats, SubagentStatus, ToolCard, ToolOutput, ToolStatus,
 };
 
 fn detail_key(message_id: &str, block_index: usize, kind: &str) -> String {
@@ -148,6 +148,56 @@ fn tool_status_style(status: ToolStatus, cx: &App) -> (&'static str, Hsla) {
         ToolStatus::Success => ("success", cx.theme().success),
         ToolStatus::Error => ("error", cx.theme().danger),
         ToolStatus::Empty => ("empty", cx.theme().muted_foreground),
+    }
+}
+
+/// 子代理状态 → 状态点颜色（规范 S-4：状态色只出现在点上，不描边、不铺底）。
+pub(crate) fn subagent_status_color(status: &SubagentStatus, cx: &App) -> Hsla {
+    match status {
+        SubagentStatus::Queued => cx.theme().muted_foreground,
+        SubagentStatus::Running => cx.theme().warning,
+        SubagentStatus::Completed => cx.theme().success,
+        SubagentStatus::Error => cx.theme().danger,
+        // 主动停止与达到轮次上限都是「没跑完但也不是故障」，用 warning 而不是 danger，
+        // 免得一屏里正常收尾的任务和真出错的任务看起来一样严重。
+        SubagentStatus::Stopped | SubagentStatus::TurnLimit => cx.theme().warning,
+        SubagentStatus::Unknown(_) => cx.theme().info,
+    }
+}
+
+/// 统计摘要，按「有什么显示什么」拼成一行。
+///
+/// 规范 S-8 限制一行最多 3 个文本片段，所以这里整体只当**一个**片段（自己内部用 ·
+/// 连接的短标记不再拆成独立文本节点），完整明细留给展开区。
+pub(crate) fn subagent_stats_summary(stats: &SubagentStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(turns) = stats.turn_count {
+        match stats.max_turns {
+            Some(max) => parts.push(format!("{turns}/{max} 轮")),
+            None => parts.push(format!("{turns} 轮")),
+        }
+    }
+    if let Some(tools) = stats.tool_uses {
+        parts.push(format!("{tools} 次工具"));
+    }
+    if let Some(duration) = stats.duration_ms {
+        parts.push(format_duration_ms(duration));
+    }
+    if let Some(cost) = stats.cost
+        && cost > 0.
+    {
+        parts.push(format!("${cost:.4}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// 毫秒 → 人读时长。超过一分钟就不再显示小数秒，长任务看分秒比看 `183.4s` 直观。
+fn format_duration_ms(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1000;
+    if total_seconds >= 60 {
+        format!("{}m{:02}s", total_seconds / 60, total_seconds % 60)
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1000.)
     }
 }
 
@@ -1032,6 +1082,16 @@ fn render_block(
                 cx,
             )
         }
+        Block::Subagent(card) => {
+            let key = detail_key(message_id, block_index, "subagent");
+            render_subagent(
+                (**card).clone(),
+                key.clone(),
+                expanded_tools.contains(&key),
+                on_toggle_tool,
+                cx,
+            )
+        }
         Block::Diff(diff) => subordinate_column(cx)
             .child(crate::render_diff_block(Arc::new(diff.clone()), cx))
             .into_any_element(),
@@ -1104,6 +1164,147 @@ fn tool_key(message_id: &str, block_index: usize, tool_id: &str) -> String {
     } else {
         format!("{message_id}:tool:{tool_id}")
     }
+}
+
+/// 子代理结果卡片（规范 5.2 的卡片骨架 + 5.3 的左竖线展开区）。
+///
+/// 与工具卡片同构而不是另起一套视觉：子代理结果在消息流里就是「一次委派的产出」，
+/// 读者的扫描路径应该和读工具卡一致 —— 状态点、名字、右侧状态文字、一行摘要，
+/// 明细收进展开区。
+fn render_subagent(
+    card: SubagentCard,
+    key: String,
+    expanded: bool,
+    on_toggle_tool: Option<DetailToggleHandler>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let color = subagent_status_color(&card.status, cx);
+    let status_label = card.status.label().to_owned();
+    let toggle_key = key.clone();
+    let item_id = message_item_id(&toggle_key);
+    // 摘要行合计 ≤3 个文本片段（规范 S-8）：描述、短 id、统计。
+    let summary = card
+        .description
+        .clone()
+        .unwrap_or_else(|| card.result.lines().next().unwrap_or_default().to_owned());
+    let stats_summary = subagent_stats_summary(&card.stats);
+
+    v_flex()
+        .id(SharedString::from(format!("subagent-card-{key}")))
+        .debug_selector(|| "subagent-card".into())
+        .min_w_0()
+        .gap_1p5()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(card_border(cx))
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("subagent-toggle-{key}")))
+                .debug_selector(|| "subagent-card-toggle".into())
+                .gap_1p5()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    if let Some(handler) = &on_toggle_tool {
+                        handler(toggle_key.clone(), item_id.clone(), cx);
+                    }
+                })
+                .child(status_dot(color).debug_selector(|| "subagent-card-status-dot".into()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_semibold()
+                        .child(format!("子代理 · {}", card.agent_type)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status_label),
+                )
+                .child(
+                    Icon::new(disclosure_icon(expanded))
+                        .size_4()
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap_1p5()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(summary),
+                )
+                .when_some(card.short_id.clone(), |row, short_id| {
+                    // 短 id 是 dim 级元信息（规范 S-16 第 3 档），用于和面板里的任务对上号。
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(crate::theme::dim_foreground(cx))
+                            .child(short_id),
+                    )
+                })
+                .when_some(stats_summary, |row, stats| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(crate::theme::dim_foreground(cx))
+                            .child(stats),
+                    )
+                }),
+        )
+        .when(expanded, |view| {
+            view.child(
+                subordinate_column(cx)
+                    .debug_selector(|| "subagent-card-details".into())
+                    .gap_2()
+                    .when_some(card.stop_reason.clone(), |column, reason| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("结束原因：{reason}")),
+                        )
+                    })
+                    .when_some(card.worktree_path.clone(), |column, path| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::theme::dim_foreground(cx))
+                                .child(format!("worktree：{path}")),
+                        )
+                    })
+                    .when_some(card.output_file.clone(), |column, path| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::theme::dim_foreground(cx))
+                                .child(format!("transcript：{path}")),
+                        )
+                    })
+                    .when(!card.result.trim().is_empty(), |column| {
+                        column.child(
+                            MarkdownBody::new(
+                                SharedString::from(format!("subagent-result-{key}")),
+                                card.result.clone(),
+                            )
+                            .into_any_element(),
+                        )
+                    }),
+            )
+        })
+        .into_any_element()
 }
 
 fn render_thinking(

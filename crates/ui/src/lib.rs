@@ -8,6 +8,7 @@ mod git_workspace;
 mod project_trust_dialog;
 mod session_tabs;
 mod shell;
+mod subagent_panel;
 mod tab_bar;
 pub mod theme;
 
@@ -20,4 +21,5 @@ pub use git_workspace::{
 pub use project_trust_dialog::project_trust_dialog;
 pub use session_tabs::{SessionTabItem, SessionTabState, SessionTabs};
 pub use shell::AppShell;
+pub use subagent_panel::{render_subagent_tasks, subagent_summary};
 pub use tab_bar::WorkspaceTabBar;

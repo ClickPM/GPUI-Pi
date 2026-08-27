@@ -1000,9 +1000,37 @@ fn render_live_message(
     let role = match value.get("role").and_then(Value::as_str) {
         Some("user") => MessageRole::User,
         Some("assistant") => MessageRole::Assistant,
+        // 扩展经 `sendMessage` 注入的消息在 agent 层就是 `role: "custom"`，且带着
+        // `customType` / `details`。R26 之前它掉进 Unknown 只当纯文本渲染。
+        Some("custom") => MessageRole::Custom,
         Some(_) => MessageRole::Unknown,
         None => return None,
     };
+    let custom_type = value.get("customType").and_then(Value::as_str);
+
+    // 子代理结果：实时路径必须和从会话文件回看的结果**渲染成同一种块**。
+    // 否则同一条结果在流式时是一段纯文本、重开会话后才变成子代理卡片，任务面板也要
+    // 等到重新读盘才认得它 —— 正文和面板对不上，而且只在"后台子代理刚完成"这一小段
+    // 时间窗里复现，是最难查的那类不一致。
+    if custom_type == Some(crate::SUBAGENT_RESULT_CUSTOM_TYPE)
+        && let Some(content) = value.get("content")
+    {
+        let text = crate::content_plain_text(content);
+        let card = crate::decode_result_card(&text, value.get("details"));
+        return Some(Message {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("live-{sequence}"), ToOwned::to_owned),
+            role,
+            timestamp: None,
+            label: Some(crate::SUBAGENT_RESULT_CUSTOM_TYPE.to_owned()),
+            model: None,
+            written_files: Vec::new(),
+            blocks: vec![Block::Subagent(Box::new(card))],
+        });
+    }
+
     let mut blocks = Vec::new();
     match value.get("content") {
         Some(Value::String(text)) => blocks.push(Block::Markdown(crate::MarkdownBlock {

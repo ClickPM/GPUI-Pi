@@ -3,6 +3,7 @@ pub mod clock;
 mod effects;
 pub mod resource;
 pub mod scheduler;
+pub mod subagent_config;
 
 pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
 pub use clock::{Clock, FakeClock, SystemClock};
@@ -40,8 +41,8 @@ use std::{
 use pi_rpc::{
     AssistantMessageEvent, AvailableModelsData, Client, ClientConfig, ClientEvent, CloneData,
     Command, CommandsData, CompactionResult, EventDetach, EventStream, ExportPathData,
-    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, JobLimits, Model,
-    NotifyType, RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
+    ExtensionUiRequest, ExtensionUiResponse, ForkData, ImageContent, ImageKind, Model, NotifyType,
+    RpcEvent, RpcSessionState, RpcSlashCommand, StreamingBehavior, ThinkingLevel,
     ThinkingLevelsData, TreeData, WidgetPlacement,
 };
 
@@ -864,8 +865,12 @@ struct RuntimeTuning {
     effects: EffectLimits,
     event_frame: Duration,
     event_backlog_bytes: usize,
-    /// 进程树硬上限；随 Runtime 创建固化，经 `clamp_manager_config` 透传给 `pi-rpc`。
-    job: JobLimits,
+    /// 已收敛的内存/进程数参数；`clamp_manager_config` 据此按是否加载子代理内核
+    /// 算出该 Runtime 的 Job Object 上限。
+    ///
+    /// 存参数而不是存算好的 `JobLimits`：R26 起同一套 tuning 会派生出两种上限
+    /// （带子代理余量 / 不带），把计算留到调用点才不会有人拿错那一份。
+    memory: MemoryLimits,
 }
 
 impl RuntimeTuning {
@@ -876,7 +881,7 @@ impl RuntimeTuning {
             effects: limits.effects.sanitized(),
             event_frame: clamp_event_frame(limits.event_frame),
             event_backlog_bytes: limits.event_backlog_bytes.max(1),
-            job: limits.memory.sanitized().job_limits(),
+            memory: limits.memory.sanitized(),
         }
     }
 }
@@ -1834,6 +1839,7 @@ impl SessionHandle {
                     publish_tool_restart_failure(&entry, old_epoch, preset, error);
                     return;
                 }
+                let session_cwd = cwd.clone();
                 let (mut config, diagnostic) =
                     active_session_config(binary, session_path, cwd, preset);
                 let agent_dir = entry.state.lock().unwrap().agent_dir.clone();
@@ -1843,7 +1849,11 @@ impl SessionHandle {
                         agent_dir.as_os_str().to_owned(),
                     ));
                 }
-                clamp_manager_config(&mut config, entry.tuning);
+                clamp_manager_config_with_subagent_slots(
+                    &mut config,
+                    entry.tuning,
+                    subagent_slots_for(preset, agent_dir.as_deref(), &session_cwd),
+                );
                 let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
                 let client = match Client::spawn(config) {
                     Ok(client) => client,
@@ -2578,7 +2588,15 @@ impl RuntimeManager {
                 agent_dir.as_os_str().to_owned(),
             ));
         }
-        clamp_manager_config(&mut config, self.inner.tuning);
+        clamp_manager_config_with_subagent_slots(
+            &mut config,
+            self.inner.tuning,
+            subagent_slots_for(
+                descriptor.tool_preset,
+                descriptor.agent_dir.as_deref(),
+                &descriptor.cwd,
+            ),
+        );
         let calibration_path = Arc::new(Mutex::new(config.initial_session.clone()));
         let client = Client::spawn(config).map_err(|error| error.to_string())?;
         let events = client.subscribe();
@@ -3561,12 +3579,37 @@ fn shutdown_entry(entry: &RuntimeEntry) {
 }
 
 fn clamp_manager_config(config: &mut ClientConfig, tuning: RuntimeTuning) {
+    clamp_manager_config_with_subagent_slots(config, tuning, 0);
+}
+
+/// 该 Runtime 要为子代理预留几个并发槽的内存余量。
+///
+/// 与「有没有注入内核」同一个判据（[`ToolPreset::loads_subagent_kernel`]）：没注入内核
+/// 就不可能有进程内子代理，余量为 0；注入了就按内核**配置的**并发上限预留。
+/// 配置只读不写（见 [`subagent_config`] 模块头），读不到就落到内核默认值。
+fn subagent_slots_for(preset: ToolPreset, agent_dir: Option<&Path>, cwd: &Path) -> u32 {
+    if preset.loads_subagent_kernel() {
+        subagent_config::effective_concurrency(agent_dir, Some(cwd))
+    } else {
+        0
+    }
+}
+
+/// R25：经 Manager 创建的每一个 Runtime 都带自己的 Job Object 硬上限 —— 用户会话、
+/// 内建子代理、maintenance 导出一视同仁。这里是唯一落点，新增创建路径只要走
+/// 这个函数就自动被纳管，不会漏掉一棵没人管的进程树。
+///
+/// R26 增加 `subagent_slots`：加载了子代理内核的 Runtime 需要为内核**进程内**开的
+/// 子代理会话预留内存余量，否则一次正常的并行委派会把父会话一起撞死在硬上限上。
+/// 不加载内核的路径传 `0`，行为与 R25 完全一致。
+fn clamp_manager_config_with_subagent_slots(
+    config: &mut ClientConfig,
+    tuning: RuntimeTuning,
+    subagent_slots: u32,
+) {
     config.max_restarts = 0;
     config.event_backlog_bytes = tuning.event_backlog_bytes;
-    // R25：经 Manager 创建的每一个 Runtime 都带自己的 Job Object 硬上限 —— 用户会话、
-    // 内建子代理、maintenance 导出一视同仁。这里是唯一落点，新增创建路径只要走
-    // `clamp_manager_config` 就自动被纳管，不会漏掉一棵没人管的进程树。
-    config.job_limits = tuning.job;
+    config.job_limits = tuning.memory.job_limits_with_subagent_slots(subagent_slots);
 }
 
 fn publish_if_current(entry: &RuntimeEntry, epoch: u64, kind: RuntimeEffectKind) {
@@ -4847,6 +4890,43 @@ mod tests {
         );
         // 降级后仍要能开会话：只是少了第二个 -e。
         assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 1);
+    }
+
+    #[test]
+    fn only_kernel_loading_presets_reserve_subagent_memory_headroom() {
+        // 判据必须与「注入不注入内核」严格同源，否则会出现两种错配：给不加载内核的
+        // Runtime 白留几 GiB 上限，或者给加载了内核的 Runtime 不留 —— 后者会让一次
+        // 正常的并行委派把父会话一起撞死。
+        let dir = tempfile::tempdir().unwrap();
+        for preset in ToolPreset::ALL {
+            let slots = subagent_slots_for(preset, None, dir.path());
+            if preset.loads_subagent_kernel() {
+                assert_eq!(
+                    slots,
+                    subagent_config::DEFAULT_SUBAGENT_CONCURRENCY,
+                    "preset={preset:?}"
+                );
+            } else {
+                assert_eq!(slots, 0, "preset={preset:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_level_concurrency_override_widens_the_reserved_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".pi")).unwrap();
+        std::fs::write(
+            dir.path().join(".pi").join("subagents-lite.json"),
+            r#"{"concurrency":{"default":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(subagent_slots_for(ToolPreset::Full, None, dir.path()), 7);
+        // 不加载内核的预设不看配置：读到 7 也不该给它留余量。
+        assert_eq!(
+            subagent_slots_for(ToolPreset::ReadOnly, None, dir.path()),
+            0
+        );
     }
 
     #[test]

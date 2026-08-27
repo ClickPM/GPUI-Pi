@@ -875,3 +875,73 @@ fn orphan_tool_results_are_counted_and_released() {
         "孤儿工具结果仍然超预算（{after} 字节）—— 计入了却没人触发压制，等于没有上界"
     );
 }
+
+#[test]
+fn a_background_subagent_result_renders_as_a_card_live_not_just_after_reload() {
+    // 内核用 `pi.sendMessage({ customType: "subagent-result", .. })` 把后台任务的结果
+    // 送回父会话；在 agent 层它就是一条 `role: "custom"` 消息，带着 customType 与 details。
+    // 实时渲染必须和从会话文件回看得到**同一种块**，否则同一条结果在流式时是纯文本、
+    // 重开会话后才变成卡片，任务面板也要等读盘才认得它。
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply_batch([
+        LiveEvent::AgentStart,
+        LiveEvent::MessageEnd {
+            message: json!({
+                "role": "custom",
+                "id": "c1",
+                "customType": "subagent-result",
+                "display": true,
+                "content": "[Subagent \"scout\" a1b2c3d4 completed]\n\n找到三处调用点",
+                "details": {
+                    "type": "scout",
+                    "description": "找调用点",
+                    "status": "completed",
+                    "turnCount": 3,
+                    "outputFile": "/tmp/pi-agent-outputs/a1b2c3d4e5f6.log"
+                }
+            }),
+        },
+    ]);
+    let document = reducer.document();
+    let card = document
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .find_map(|block| match block {
+            Block::Subagent(card) => Some(card.clone()),
+            _ => None,
+        })
+        .expect("实时路径也必须还原成子代理卡片");
+    assert_eq!(card.agent_type, "scout");
+    assert_eq!(card.status, pi_render::SubagentStatus::Completed);
+    assert_eq!(card.result, "找到三处调用点");
+    assert_eq!(card.stats.turn_count, Some(3));
+
+    // 任务面板读的是同一份文档，所以流式期间就能列出这条任务。
+    let tasks = pi_render::collect_tasks(&document);
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].agent_id.as_deref(), Some("a1b2c3d4e5f6"));
+    assert_eq!(tasks[0].status, pi_render::SubagentStatus::Completed);
+}
+
+#[test]
+fn other_custom_messages_still_render_as_plain_content_live() {
+    let mut reducer = LiveSessionReducer::empty("s", "fixture.jsonl");
+    reducer.apply_batch([LiveEvent::MessageEnd {
+        message: json!({
+            "role": "custom",
+            "id": "c1",
+            "customType": "some-other-extension",
+            "content": "普通自定义消息",
+        }),
+    }]);
+    let document = reducer.document();
+    assert!(
+        !document
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .any(|block| matches!(block, Block::Subagent(_)))
+    );
+    assert_eq!(document.messages[0].role, MessageRole::Custom);
+}
