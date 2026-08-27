@@ -64,6 +64,13 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 > 替用户改写它们属于未经请求地修改其持久配置，因此最终口径改为**只读**：Manager 读取生效上限，据此为加载内核的 Runtime 预留内存余量；
 > 真正的强制仍来自 R25 的 Job Object 兜底。`docs/立项文档.md` § 三勘误与 § 七 R26 行已同步。
 
+### F. 唯一子代理通道（2026-08-27 所有者补充裁定，当轮实施）
+
+- 背景：BACKLOG #41 —— 生产路径不传 `--no-extensions`，用户全局自装的 `npm:pi-subagents`（工具名 `subagent`）与内核同场加载，真实派发时模型挑走了第三方工具，内建面板整块未被触发。所有者当日改判：不再留给独立产品决策轮，当轮采用核实过的出路 ①。
+- `pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES` —— 已知第三方子代理工具名名单（`subagent` / `subagent_wait` / `subagent_supervisor`，即 npm:pi-subagents@0.56.0 在父会话注册的全部三个工具，逐名对着扩展源码核实后才准入列；`contact_supervisor` 有子进程门禁、刻意不入列）；
+- `active_session_config_with_sources` 对**每个** `ToolPreset` 恒追加 `--exclude-tools <名单>`：对四个显式预设是 allowlist 之外的冗余保险，真正的洞在不下发 `--tools` 的 `Inherit`；
+- 边界：进程级参数只作用于本应用拉起的 `pi --mode rpc`，不碰用户终端 pi、不写任何用户配置；第三方扩展**本身**照常加载（仅其子代理工具被过滤），用户其他扩展与工具不受影响。
+
 ## 验收
 
 | 级别 | 检查 | 命令 / 期望 |
@@ -74,6 +81,7 @@ GPUI-Pi 随包携带钉死的 `pi-subagents-lite@1.13.0` 作为子代理执行�
 | T2 | 扩展确实加载 | `pi --mode rpc -e <vendor 路径>` 的 `get_commands` 含 `agents` 命令，stderr 无错误，且 `~/.pi` 无新增写入 |
 | T2 | 预设与子代理的关系 | `Inherit` 注入内核且不下发 `--tools`；`Default` / `Full` 注入且允许列表含 `Agent` / `StopAgent` / `AgentStatus`；`ReadOnly` / `None` 既不注入也不放行（防提权） |
 | T2 | 回看 | 父会话文件中的 `subagent-result` 条目能被 `pi-render` 还原成子代理任务并在面板展示 |
+| T2 | 唯一通道（生产形态） | 不带 `--no-extensions` 时：`subagent` / `subagent_wait` / `subagent_supervisor` 对模型均不可见，内核 `Agent` 三件套与用户其他扩展工具可见，第三方扩展本身照常加载 |
 | T3 | 真实派发 | 桌面端发起一次子代理任务，面板显示状态流转与统计，失败时父会话仍可继续 |
 
 ## 禁止
@@ -170,6 +178,7 @@ caret 区间会随时间漂移的问题。
 | `~/.pi` 无新增写入 | 运行前后对 `~/.pi` 递归 `find` 取快照逐条 diff：**24884 → 24884，新增 0 条**（红线 5） |
 | 预设与子代理工具的关系 | 由 `crates/pi-runtime` 的 `active_session_config_always_loads_host_extension_without_changing_tool_presets` 等 4 条用例覆盖五个预设 |
 | 回看 | `subagent_result_entries_decode_into_subagent_blocks_for_replay` 走完整 `render_path` 链路，从磁盘 JSONL 还原成子代理卡片并归并成任务 |
+| 唯一通道（生产形态） | real-pi 测试 `third_party_subagent_tool_is_excluded_while_other_extensions_survive`：**不带** `--no-extensions`，密封 agent 目录装「注册 `subagent` / `subagent_wait` / `subagent_supervisor` 三个工具的第三方样板 + 注册普通工具的用户扩展」，`-e` 内核 + `--exclude-tools <三名单>` 后由 probe 扩展回报 `getAllTools()` —— 三个第三方工具名均不可见，`Agent` / `StopAgent` / `AgentStatus` 与 `r26_user_other` 可见，`get_commands` 仍含第三方样板注册的命令（扩展本身照常加载）。真实 pi 0.84.2 实跑 exit 0 |
 
 > **T3（桌面端真实派发）未做** —— 需要真实模型调用与人工操作，本轮未执行，不得视为已验收。
 
@@ -187,7 +196,10 @@ caret 区间会随时间漂移的问题。
 > 已记 `rounds/BACKLOG.md` #41，两条可选出路（定向 `--exclude-tools` / `--no-extensions`）
 > 均属产品级行为变更、超出本轮范围，经所有者裁定留给独立产品决策轮。
 >
-> **截图取证的临时办法**：让模型显式点名 `Agent` 工具（见 [`截图用例.md`](截图用例.md) 公共前置）。
+> **同日后续（所有者改判，当轮收口）**：上一段的「留给独立产品决策轮」当日被推翻 ——
+> 所有者裁定当轮实施出路 ①，见交付物 F。该盲区随之被真正关掉：新增的生产形态
+> real-pi 测试不带 `--no-extensions`、带第三方样板扩展同场，见上表「唯一通道（生产形态）」行。
+> 此后截图取证**不再依赖**「显式点名 `Agent` 工具」的临时办法：`subagent` 已对模型不可见。
 
 ### 与内核的三处口径修正
 
@@ -266,9 +278,31 @@ caret 区间会随时间漂移的问题。
 必须**回源码逐字核对并在注释里引出处**，不得从字段名、英文词义或"看起来合理"反推 ——
 自己造的测试挡不住自己造的错误假设，只会把它钉得更牢。
 
+**第 3 轮：Claude 子代理审查（交付物 F 增量，2026-08-27）** —— 单个只读审查器，首轮结论 **BLOCK**，
+3 条 findings 全部成立并整改（复核结论见表后）：
+
+| # | 级别 | finding | 处理 |
+|---|---|---|---|
+| 1 | P1 | denylist 注释「`subagent` 是 npm:pi-subagents 唯一注册的工具」不实 | **成立，且正是上表教训的又一例**：我只 grep 到 `index.ts:672` 就写下「唯一」，审查器对着**同一份源码**往下读 46 行即推翻 —— `:718` 无条件 `registerWaitTool`（`subagent_wait`），`session_start` 里 `supervisorChannel.start()` 在父会话注册 `subagent_supervisor`。已亲验后把两名补入名单（`contact_supervisor` 有子进程门禁、刻意不入列并注明），fixture 补齐三工具样板，所有断言与六份文档同步 |
+| 2 | P3 | BACKLOG #41 同格里「均不采用，留给独立产品决策轮」未划线，与文末收口结论矛盾 | **成立**。补划线并指向文末改判 |
+| 3 | P3 | 截图用例「第三方子代理扩展的工具对模型已不可见」是全称 overclaim | **成立**（与 #1 同根）。名单补齐后该句成立，措辞改为点名扩展与三个工具名 |
+
+审查器同时逐条核对了五处上游行号断言（四处半准确）、生产 spawn 路径覆盖（含 warm pool
+`switch_session` 复用后排除集仍生效、历史导出带 `--no-extensions` 不构成漏洞）、
+单测无放宽（红线 4）、镜像一致性 —— 均无问题。
+
+**复核（同一审查器，第二轮）：最终结论 PASS**。三条 findings 的整改逐条与源码证据吻合、
+无新的未验证断言、断言强度全部变强或持平、镜像逐字节一致。另提 4 条不阻断残留（N1 validation
+节数字过期、N2 测试头注释仍写单数、N3 门禁行号 300 应为 301、N4 验收表 T2 行未同步三名单），
+已全部处理——N3 的行号我重新数过源码确认为 301。审查器声明未复跑测试（只读约束），
+测试通过口径以本节 validation 记录为准。
+
 ### validation
 
-`.\scripts\validate.ps1` 全量（两轮独立代码审查整改后的最终一次），**exit 0**，共 **567 passed / 0 failed**，clippy `-D warnings` 零警告：
+`.\scripts\validate.ps1` 全量（第 3 轮审查整改后重跑，含交付物 F 新增用例），**exit 0**，`VALIDATE OK`，
+共 **572 passed / 0 failed**，clippy `-D warnings` 零警告；real-pi 集成测试
+`third_party_subagent_tool_is_excluded_while_other_extensions_survive` 另以真实 pi 0.84.2 实跑通过
+（`--ignored` 单跑，1 passed）。下面保留两轮审查整改后那次（567 passed）的原始回显：
 
 ```
 ### 范围：全工作区（含 gpui / gpui-component 编译）

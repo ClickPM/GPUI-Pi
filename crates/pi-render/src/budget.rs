@@ -279,7 +279,7 @@ fn retained_tool_details(tool_name: &str, details: Option<Value>) -> Option<Valu
             kept.insert(key.to_owned(), value.clone());
         }
     }
-    (!kept.is_empty()).then(|| Value::Object(kept))
+    (!kept.is_empty()).then_some(Value::Object(kept))
 }
 
 fn release_image(image: &mut ImageBlock) -> bool {

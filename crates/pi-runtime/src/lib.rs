@@ -4067,6 +4067,16 @@ fn active_session_config_with_sources(
         }
     }
     tool_preset.append_args(&mut config.args);
+    // 所有者裁定（2026-08-27）：内建内核是本应用唯一的子代理通道，已知第三方子代理
+    // 工具名对每个预设恒拉黑。对下发 `--tools` 允许列表的四个预设这是冗余保险
+    // （allowlist 本就挡在外面）；真正的洞在 `Inherit` —— 它不下发 `--tools`，用户
+    // 全局装的 pi-subagents 之类会与内核同场，模型可能挑走第三方工具（R26 实测
+    // 撞过一次，见 BACKLOG #41 收口）。`--exclude-tools` 是进程级参数，只作用于
+    // 本应用拉起的 pi，不碰用户终端 pi；用户其他扩展及其工具不受影响。
+    config.args.push("--exclude-tools".into());
+    config
+        .args
+        .push(pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES.join(",").into());
     let diagnostic = if diagnostics.is_empty() {
         None
     } else {
@@ -4775,12 +4785,21 @@ mod tests {
                 Some("project-command-environment.ts")
             );
             assert_eq!(diagnostic.is_some(), loads_kernel, "preset={preset:?}");
+            // 每个预设尾部恒带第三方子代理工具的拉黑对（所有者裁定 2026-08-27）。
+            let exclusion = [
+                "--exclude-tools",
+                "subagent,subagent_wait,subagent_supervisor",
+            ]
+            .map(std::ffi::OsString::from);
             match allowlist {
-                Some(allowlist) => assert_eq!(
-                    &config.args[3..],
-                    &["--tools", allowlist].map(std::ffi::OsString::from)
-                ),
-                None => assert_eq!(config.args.len(), 3),
+                Some(allowlist) => {
+                    let mut tail = ["--tools", allowlist]
+                        .map(std::ffi::OsString::from)
+                        .to_vec();
+                    tail.extend(exclusion);
+                    assert_eq!(&config.args[3..], &tail[..]);
+                }
+                None => assert_eq!(&config.args[3..], &exclusion),
             }
         }
     }
@@ -4809,6 +4828,8 @@ mod tests {
                 kernel_dir.path().into(),
                 "--tools".into(),
                 "bash,read,edit,write,grep,find,ls,Agent,StopAgent,AgentStatus".into(),
+                "--exclude-tools".into(),
+                "subagent,subagent_wait,subagent_supervisor".into(),
             ]
         );
     }
@@ -4871,6 +4892,42 @@ mod tests {
         assert!(diagnostic.is_none());
         assert!(!config.args.iter().any(|arg| arg == "--tools"));
         assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 2);
+    }
+
+    #[test]
+    fn third_party_subagent_tools_are_excluded_for_every_preset() {
+        // 拉黑必须对全部预设成立：四个显式预设靠 allowlist 已经挡住只是巧合式防护，
+        // `Inherit` 不下发 `--tools`，没有这条 denylist 时第三方 `subagent` 会与内建
+        // `Agent` 同场竞争（R26 实测就是这么撞上的）。同时钉死 denylist 与内建三件套
+        // 名字不相交 —— pi 的排除是精确名匹配，一旦交叉就等于拉黑自己。
+        for third_party in pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES {
+            assert!(
+                !pi_rpc::SUBAGENT_TOOL_NAMES.contains(&third_party),
+                "denylist 不得包含内建子代理工具名：{third_party}"
+            );
+        }
+        for preset in ToolPreset::ALL {
+            let (config, _) = active_session_config_with_sources(
+                PathBuf::from("pi.exe"),
+                None,
+                PathBuf::from("project"),
+                preset,
+                || Ok(PathBuf::from("host.ts")),
+                || PathBuf::from("kernel-not-prepared"),
+            );
+            let denylist = config
+                .args
+                .iter()
+                .skip_while(|arg| *arg != "--exclude-tools")
+                .nth(1)
+                .cloned()
+                .unwrap_or_else(|| panic!("preset={preset:?} 缺 --exclude-tools"));
+            assert_eq!(
+                denylist,
+                std::ffi::OsString::from(pi_rpc::THIRD_PARTY_SUBAGENT_TOOL_NAMES.join(",")),
+                "preset={preset:?}"
+            );
+        }
     }
 
     #[test]
@@ -4984,7 +5041,14 @@ mod tests {
         );
         assert_eq!(
             config.args,
-            ["--no-context-files", "--tools", "read,grep,find,ls"].map(std::ffi::OsString::from)
+            [
+                "--no-context-files",
+                "--tools",
+                "read,grep,find,ls",
+                "--exclude-tools",
+                "subagent,subagent_wait,subagent_supervisor",
+            ]
+            .map(std::ffi::OsString::from)
         );
         assert_eq!(
             diagnostic.as_deref(),

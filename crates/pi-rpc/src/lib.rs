@@ -39,6 +39,30 @@ pub fn subagent_kernel_dir_name() -> String {
 /// 顺序与 `pi-subagents-lite` 的 `registerTools()` 注册顺序一致，便于和它的源码对读。
 pub const SUBAGENT_TOOL_NAMES: [&str; 3] = ["Agent", "StopAgent", "AgentStatus"];
 
+/// 已知第三方子代理扩展注册的工具名 —— 生产会话恒以 `--exclude-tools` 拉黑。
+///
+/// 所有者裁定（2026-08-27）：内建内核是本应用唯一的子代理通道；用户全局安装的其他
+/// 子代理扩展照常加载（其余功能不受影响），但其工具对模型不可见。逐名来源必须
+/// 对着扩展源码核实后才准入列。当前名单覆盖 npm:pi-subagents@0.56.0 在**父会话**
+/// 注册的全部三个工具：
+/// - `subagent`：派发工具（`src/extension/index.ts:672`，`:716` 注册）；
+/// - `subagent_wait`：等待工具，`index.ts:718` 无条件调 `registerWaitTool`
+///   （`src/runs/background/wait-tool.ts:10` 定名、`:35` 无条件注册 ——
+///   `enabled=false` 只改行为为立即返回，不跳过注册）；
+/// - `subagent_supervisor`：监督工具，`session_start` 里 `supervisorChannel.start()`
+///   最终在父会话注册（`src/intercom/native-supervisor-channel.ts:22` 定名、`:638` 注册）。
+///
+/// 刻意**不**入列的：`contact_supervisor` 只在该扩展自行 spawn 的子进程内注册
+/// （`native-supervisor-channel.ts:301` 有 `readChildMetadata()` 门禁），
+/// 不会出现在本应用拉起的会话里。
+///
+/// pi 的排除是大小写敏感的精确名集合（`args.ts:128` → `sdk.ts:251` 的
+/// `new Set(excludeTools)`），且对扩展注册的工具同样生效（`agent-session.ts:2468-2478`
+/// 对 `getAllRegisteredTools()` 应用 `isAllowedTool`），不会误伤内建内核的
+/// [`SUBAGENT_TOOL_NAMES`] 三件套。
+pub const THIRD_PARTY_SUBAGENT_TOOL_NAMES: [&str; 3] =
+    ["subagent", "subagent_wait", "subagent_supervisor"];
+
 /// 当前平台下 pi 可执行文件的文件名。
 pub const fn pi_binary_name() -> &'static str {
     if cfg!(windows) { "pi.exe" } else { "pi" }
