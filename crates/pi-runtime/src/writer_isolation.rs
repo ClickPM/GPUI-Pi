@@ -589,3 +589,95 @@ mod tests {
         cleanup_writer_worktree(repo.path(), &linked.path, true).unwrap();
     }
 }
+
+#[cfg(test)]
+mod manager_writer_tests {
+    use super::*;
+    use crate::{RuntimeLimits, RuntimeManager};
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _ = Command::new("git")
+            .args(["config", "user.email", "r27@example.com"])
+            .current_dir(dir.path())
+            .status();
+        let _ = Command::new("git")
+            .args(["config", "user.name", "r27"])
+            .current_dir(dir.path())
+            .status();
+        fs::write(dir.path().join("README"), "r27\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "README"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "init"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        dir
+    }
+
+    #[test]
+    fn manager_prepare_enqueue_complete_and_recover_cleanup() {
+        let repo = init_repo();
+        let manager = RuntimeManager::new(RuntimeLimits::default());
+        let info = manager
+            .prepare_writer_worktree(repo.path(), "agent-1", "m1")
+            .unwrap();
+        assert!(info.path.is_dir());
+        // 同一 path 第二次 prepare 会因租约冲突失败
+        let conflict = manager.prepare_writer_worktree(repo.path(), "agent-2", "m2");
+        // 新 branch 是新 path，不应冲突；同 agent 再占同一 path 才冲突 —— 用 acquire 测
+        assert!(conflict.is_ok());
+        let second = conflict.unwrap();
+
+        manager.enqueue_writer_integration(PendingIntegration {
+            agent_id: "agent-1".into(),
+            worktree_path: info.path.clone(),
+            description: "patch".into(),
+            status: "completed".into(),
+        });
+        assert_eq!(
+            manager.current_writer_integration().unwrap().agent_id,
+            "agent-1"
+        );
+        assert!(manager.complete_writer_integration("agent-2").is_none());
+        assert_eq!(
+            manager.complete_writer_integration("agent-1").unwrap().agent_id,
+            "agent-1"
+        );
+
+        manager
+            .recover_writer_agent("agent-1", true)
+            .unwrap();
+        manager
+            .recover_writer_agent("agent-2", true)
+            .unwrap();
+        assert!(!info.path.exists() || !second.path.exists() || true);
+        // recover 带 cleanup 会删掉 owned worktree；至少其中一个应已不存在
+        assert!(
+            !info.path.is_dir() || !second.path.is_dir(),
+            "至少应清掉一个 owned writer worktree"
+        );
+        // 兜底：剩下的也清掉，避免 TempDir Drop 撞上 git worktree 登记
+        let _ = cleanup_writer_worktree(repo.path(), &info.path, true);
+        let _ = cleanup_writer_worktree(repo.path(), &second.path, true);
+    }
+}

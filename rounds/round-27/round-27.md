@@ -69,4 +69,21 @@ mutating 子代理必须在独立 git worktree 内写入；同一 worktree 同�
 
 ## 本轮实测
 
-<!-- 完成后回填 -->
+### 环境
+
+- Cloud Agent（Linux）：vendor 门禁经 `PROCESSOR_ARCHITECTURE=AMD64` + `SystemRoot` tar shim 通过 `check-pins`；`pi.exe` 无法本机自检版本（Exec format error），源码/内核/web 钉死校验全绿。
+- 完整 `validate.ps1` / real-pi T2–T3 依赖 Windows CI。
+
+### 逻辑单测（Linux）
+
+| 套件 | 结果 |
+|---|---|
+| `pi-runtime` `writer_isolation` | 8 passed |
+| `pi-runtime` Manager writer API | 1 passed |
+| `pi-rpc` `host_extension` | 5 passed（含 writer-isolation 源码契约） |
+| `pi-runtime` `active_session_config*` | 相关用例全绿（writer `-e` 排在内核前） |
+| `gpui-pi-ui` `serial_integration_hint` | 1 passed |
+
+### PR
+
+https://github.com/ClickPM/GPUI-Pi/pull/1
