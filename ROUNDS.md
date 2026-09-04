@@ -32,7 +32,7 @@
 | **R24** | 有界多用户 Session UI 接线 | Windows | ✅ 已完成（14 轮 codex 独立审查共 30 条 findings，29 条成立并全部整改、1 条经核对不成立且已记明理由；人工验收暴露的挂起崩溃已定位到「进程交接跑在 GPUI 主线程上」并修复；视觉审查 `PASS`，见 [`rounds/round-24/round-24.md`](rounds/round-24/round-24.md)） | [#34](https://github.com/cking000bigdemon/GPUI-Pi/pull/34) | 2026-08-26 |
 | **R25** | Windows Job Object + 进程树与内存治理 | Windows | ✅ 已完成（codex 独立审查**十一轮**共 32 条 findings：30 条成立并整改、1 条涉及红线 2 文档口径由所有者裁定、1 条经核算为结构性下界部分不采纳并写明论证；视觉审查 `CODE_ONLY_PASS`，**非独立**，见 [`rounds/round-25/round-25.md`](rounds/round-25/round-25.md)） | [#35](https://github.com/cking000bigdemon/GPUI-Pi/pull/35) | 2026-08-26 |
 | **R26** | 内建子代理（集成 `pi-subagents-lite` 为执行内核） | Windows | ✅ 已完成（vendor 钉死双 tarball + `-e` 注入；所有者同日补充裁定「内建内核为唯一子代理通道」，恒拉黑 npm:pi-subagents 在父会话注册的全部三个工具、用户其他扩展不受影响，生产形态 real-pi 测试关掉 T2 盲区。三轮独立代码审查：codex 4 条全部整改，Claude 子代理 15 条中 12 条整改、3 条写明理由，增量审查 BLOCK→3 条整改→复核 PASS；「未验证断言当事实」同根因错误一轮累计 12 次，教训与约束见 [`rounds/round-26/round-26.md`](rounds/round-26/round-26.md)。视觉审查 `CODE_ONLY_PASS`，追加 `SCREENSHOT` 审查在已提供证据范围内 PASS（用例 2/7/8 等未验证，如实列明）；T3 真实派发三要素全部实证（6 子代理 4 完成 2 失败，失败不拖垮父会话）。另修复 debug 构建主线程栈溢出（`/STACK:8388608`）） | — | — |
-| **R27** | mutating 子代理 + worktree writer 隔离 | Windows | ⬜ | — | — |
+| **R27** | mutating 子代理 + worktree writer 隔离 | Windows | 🚧 进行中 | — | — |
 
 ## 里程碑
 
