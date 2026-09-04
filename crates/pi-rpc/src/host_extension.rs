@@ -256,6 +256,10 @@ mod tests {
             "block: true",
             "explore",
             "gpui-pi/writer-",
+            // 后台 Agent：租约挂到 agentId，避免 tool_result 立刻释放导致并发 writer
+            "leaseByAgentId",
+            "run_in_background",
+            "subagent-result",
         ] {
             assert!(
                 WRITER_ISOLATION_SOURCE.contains(needle),

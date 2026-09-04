@@ -1820,10 +1820,21 @@ impl ChatPanel {
         let document = snapshot.document;
         self.sync_list_document(&document, settled);
         self.status = ChatStatus::Ready(document);
+        self.sync_writer_isolation_queue();
         if self.active_epoch != snapshot.epoch {
             return false;
         }
         false
+    }
+
+    /// 把可见文档里的 mutating worktree 任务同步进 RuntimeManager 串行集成队列。
+    fn sync_writer_isolation_queue(&self) {
+        let Some(cwd) = self.composer_cwd.as_ref() else {
+            return;
+        };
+        let tasks = self.subagent_tasks();
+        self.runtime_manager
+            .sync_writer_integrations_from_tasks(cwd, &tasks);
     }
 
     /// 把运行时的背压淘汰暴露给用户。
@@ -2968,6 +2979,7 @@ impl ChatPanel {
                 self.branch_preview_document = Some(Arc::new(document));
                 self.rpc_success = None;
                 self.rpc_error = None;
+                self.sync_writer_isolation_queue();
             }
             Ok(None) => {
                 self.rpc_success = None;
@@ -2984,6 +2996,7 @@ impl ChatPanel {
     fn clear_branch_preview(&mut self, cx: &mut Context<Self>) {
         self.branch_preview_leaf = None;
         self.branch_preview_document = None;
+        self.sync_writer_isolation_queue();
         cx.notify();
     }
 

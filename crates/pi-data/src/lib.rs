@@ -47,8 +47,8 @@ pub use files::{
 };
 pub use git::{
     GitDiffUnsupported, GitError, GitFileDiff, GitFileStatus, GitFileStatusKind, GitStatusSnapshot,
-    WorktreeInfo, WorktreeSnapshot, add_worktree, git_file_diff, git_status, list_worktrees,
-    remove_worktree,
+    WorktreeInfo, WorktreeSnapshot, add_worktree, git_file_diff, git_status, git_toplevel,
+    list_worktrees, remove_worktree,
 };
 pub use model_config::{
     AuthCapability, AuthKind, AuthSummary, CliAuthStatus, ModelApi, ModelConfigDocument,

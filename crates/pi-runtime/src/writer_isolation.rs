@@ -13,7 +13,7 @@
 //! - 完成后进入串行集成队列，父会话一次只审查一项。
 
 use pi_data::{
-    GitError, WorktreeInfo, add_worktree, project_identity_key, remove_worktree,
+    GitError, WorktreeInfo, add_worktree, git_toplevel, project_identity_key, remove_worktree,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -260,21 +260,43 @@ impl WriterIsolation {
         self.integrations.retain(|item| item.agent_id != agent_id);
         self.release(agent_id)
     }
+
+    /// 按 agent_id / tool_call_id 查看租约（不释放）。
+    #[must_use]
+    pub fn lease_for(&self, agent_id: &str) -> Option<&WriterLease> {
+        self.leases.values().find(|lease| {
+            lease.agent_id == agent_id
+                || lease.tool_call_id.as_deref().is_some_and(|id| id == agent_id)
+        })
+    }
 }
 
 /// 父 cwd 与候选 path 是否同一 checkout（不算独立）。
+///
+/// 以 `git rev-parse --show-toplevel` 为准：linked worktree 的 toplevel 不同即独立。
+/// 仅用路径前缀会漏检「cwd 已在仓库子目录、候选却是仓库根」这类同 checkout 场景。
 #[must_use]
 pub fn is_independent_worktree(parent_cwd: &Path, worktree_path: &Path) -> bool {
-    let parent = dunce_canonical(parent_cwd);
-    let candidate = dunce_canonical(worktree_path);
-    if project_identity_key(&parent) == project_identity_key(&candidate) {
-        return false;
+    match (
+        git_toplevel(parent_cwd).ok().flatten(),
+        git_toplevel(worktree_path).ok().flatten(),
+    ) {
+        (Some(parent_top), Some(candidate_top)) => {
+            dunce_canonical(&parent_top) != dunce_canonical(&candidate_top)
+        }
+        _ => {
+            // git 不可用时 fail closed：同 identity、互为祖先目录 → 不独立。
+            let parent = dunce_canonical(parent_cwd);
+            let candidate = dunce_canonical(worktree_path);
+            if project_identity_key(&parent) == project_identity_key(&candidate) {
+                return false;
+            }
+            if candidate.starts_with(&parent) || parent.starts_with(&candidate) {
+                return false;
+            }
+            true
+        }
     }
-    // 候选是父路径的子目录（未单独 worktree）也不算独立。
-    if candidate.starts_with(&parent) {
-        return false;
-    }
-    true
 }
 
 /// 分配一条 Manager 拥有的 writer worktree（分支 `gpui-pi/writer-<label>`）。
@@ -507,6 +529,21 @@ mod tests {
         iso.check_mutating_path(parent, Some(&linked.path))
             .unwrap();
         cleanup_writer_worktree(parent, &linked.path, true).unwrap();
+    }
+
+    #[test]
+    fn subdirectory_cwd_and_repo_root_are_not_independent() {
+        let repo = init_repo();
+        let sub = repo.path().join("crates").join("app");
+        fs::create_dir_all(&sub).unwrap();
+        assert!(
+            !is_independent_worktree(&sub, repo.path()),
+            "cwd 在仓库子目录、候选是仓库根时仍是同一 checkout"
+        );
+        let linked = allocate_writer_worktree(repo.path(), "indep").unwrap();
+        assert!(is_independent_worktree(&sub, &linked.path));
+        assert!(is_independent_worktree(repo.path(), &linked.path));
+        cleanup_writer_worktree(repo.path(), &linked.path, true).unwrap();
     }
 
     #[test]

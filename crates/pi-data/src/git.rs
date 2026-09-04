@@ -481,6 +481,14 @@ fn checked_directory(path: &Path) -> Result<PathBuf, GitError> {
     Ok(dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
+/// 返回 `cwd` 所属 worktree 的 toplevel（`git rev-parse --show-toplevel`）。
+///
+/// linked worktree 与主 checkout 的 toplevel **不同**；判断「是否同一工作树」应比较本值，
+/// 不要用路径前缀（父 cwd 在 `repo/crates/app`、候选是 `repo` 时前缀判断会误判）。
+pub fn git_toplevel(cwd: impl AsRef<Path>) -> Result<Option<PathBuf>, GitError> {
+    repository_root(cwd.as_ref())
+}
+
 fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
     let output = run_git_allow_failure(
         cwd,

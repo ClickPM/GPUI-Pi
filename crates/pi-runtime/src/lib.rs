@@ -2083,6 +2083,7 @@ impl RuntimeManager {
     /// 为 mutating 子代理预先分配独立 writer worktree，并登记租约。
     ///
     /// 日常路径由 host 扩展在 `tool_call` 里自动分配；本 API 供 UI / 测试显式准备。
+    /// 租约登记失败时立刻按红线 6 清理刚创建的 worktree，避免孤儿目录。
     pub fn prepare_writer_worktree(
         &self,
         parent_cwd: &Path,
@@ -2090,22 +2091,63 @@ impl RuntimeManager {
         label: &str,
     ) -> Result<pi_data::WorktreeInfo, IsolationError> {
         let info = allocate_writer_worktree(parent_cwd, label)?;
+        let acquire_result = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation
+                .acquire(
+                    AgentWriteClass::Mutating,
+                    parent_cwd,
+                    &info.path,
+                    agent_id,
+                    None,
+                    true,
+                )
+                .map(|_| ())
+        };
+        if let Err(err) = acquire_result {
+            let _ = cleanup_writer_worktree(parent_cwd, &info.path, true);
+            return Err(err);
+        }
+        Ok(info)
+    }
+
+    /// 追踪已存在的 writer worktree（例如 host 扩展自动分配的），登记为可清理租约。
+    ///
+    /// 已有同一 agent 租约时为幂等成功。
+    pub fn track_writer_worktree(
+        &self,
+        parent_cwd: &Path,
+        agent_id: &str,
+        worktree_path: &Path,
+        owned: bool,
+    ) -> Result<(), IsolationError> {
         let mut isolation = self.inner.writer_isolation.lock().unwrap();
+        if isolation.lease_for(agent_id).is_some() {
+            return Ok(());
+        }
         isolation.acquire(
             AgentWriteClass::Mutating,
             parent_cwd,
-            &info.path,
+            worktree_path,
             agent_id,
             None,
-            true,
+            owned,
         )?;
-        Ok(info)
+        self.inner.watch.publish();
+        Ok(())
     }
 
     /// 子代理结束后入队串行集成；队头才是父会话当前应审查的一项。
     pub fn enqueue_writer_integration(&self, item: PendingIntegration) {
-        self.inner.writer_isolation.lock().unwrap().enqueue_integration(item);
-        self.inner.watch.publish();
+        let changed = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            let before = isolation.pending_integrations().len();
+            isolation.enqueue_integration(item);
+            isolation.pending_integrations().len() != before
+        };
+        if changed {
+            self.inner.watch.publish();
+        }
     }
 
     /// 父会话完成对队头的审查（接受或丢弃）。
@@ -2122,27 +2164,66 @@ impl RuntimeManager {
         item
     }
 
-    /// 取消 / 失败恢复：释放租约，可选清理 Manager 拥有的 worktree。
+    /// 审查完成并清理对应 worktree（覆盖 host 分配与 Manager 分配）。
+    pub fn complete_writer_integration_and_cleanup(
+        &self,
+        agent_id: &str,
+        parent_cwd: &Path,
+    ) -> Result<Option<PendingIntegration>, IsolationError> {
+        let item = self.complete_writer_integration(agent_id);
+        let lease = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation.recover_agent(agent_id)
+        };
+        let path = item
+            .as_ref()
+            .map(|pending| pending.worktree_path.clone())
+            .or_else(|| lease.as_ref().map(|lease| lease.worktree_path.clone()));
+        if let Some(path) = path {
+            let cwd = lease
+                .as_ref()
+                .map(|lease| lease.parent_cwd.as_path())
+                .unwrap_or(parent_cwd);
+            cleanup_writer_worktree(cwd, &path, true)?;
+        }
+        self.inner.watch.publish();
+        Ok(item)
+    }
+
+    /// 取消 / 失败恢复：可选清理 worktree；**先清理再释放租约**，避免 cleanup 失败后目录失控。
     pub fn recover_writer_agent(
         &self,
         agent_id: &str,
         cleanup: bool,
     ) -> Result<Option<WriterLease>, IsolationError> {
+        let lease_snapshot = {
+            let isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation.lease_for(agent_id).cloned()
+        };
+        if cleanup {
+            if let Some(lease) = lease_snapshot.as_ref() {
+                if lease.owned {
+                    cleanup_writer_worktree(&lease.parent_cwd, &lease.worktree_path, true)?;
+                }
+            }
+        }
         let lease = self
             .inner
             .writer_isolation
             .lock()
             .unwrap()
             .recover_agent(agent_id);
-        if cleanup {
-            if let Some(lease) = lease.as_ref() {
-                if lease.owned {
-                    cleanup_writer_worktree(&lease.parent_cwd, &lease.worktree_path, true)?;
-                }
-            }
-        }
         self.inner.watch.publish();
         Ok(lease)
+    }
+
+    /// 按路径清理 writer worktree（host 分配、无租约时的兜底入口；必经 `remove_worktree`）。
+    pub fn cleanup_writer_path(
+        &self,
+        parent_cwd: &Path,
+        worktree_path: &Path,
+    ) -> Result<(), IsolationError> {
+        cleanup_writer_worktree(parent_cwd, worktree_path, true)
     }
 
     /// 当前串行集成队头（供 UI）。
@@ -2153,6 +2234,57 @@ impl RuntimeManager {
             .unwrap()
             .current_integration()
             .cloned()
+    }
+
+    /// 把文档里已结算的 mutating + worktree 任务同步进 Manager 集成队列，并追踪/回收租约。
+    ///
+    /// UI 每帧可调用：入队幂等；失败/取消任务释放租约并清理 owned worktree。
+    pub fn sync_writer_integrations_from_tasks(
+        &self,
+        parent_cwd: &Path,
+        tasks: &[pi_render::SubagentTask],
+    ) {
+        for task in tasks {
+            let agent_key = task
+                .agent_id
+                .as_deref()
+                .or(task.tool_call_id.as_deref())
+                .unwrap_or(task.key.as_str());
+            let Some(worktree) = task.worktree_path.as_deref() else {
+                continue;
+            };
+            if classify_agent(&task.agent_type, None) != AgentWriteClass::Mutating {
+                continue;
+            }
+            let path = PathBuf::from(worktree);
+            if !task.status.is_settled() {
+                let _ = self.track_writer_worktree(parent_cwd, agent_key, &path, true);
+                continue;
+            }
+            match task.status {
+                pi_render::SubagentStatus::Completed => {
+                    let _ = self.track_writer_worktree(parent_cwd, agent_key, &path, true);
+                    self.enqueue_writer_integration(PendingIntegration {
+                        agent_id: agent_key.to_owned(),
+                        worktree_path: path,
+                        description: if task.description.is_empty() {
+                            task.agent_type.clone()
+                        } else {
+                            task.description.clone()
+                        },
+                        status: task.status.label().to_owned(),
+                    });
+                }
+                pi_render::SubagentStatus::Error
+                | pi_render::SubagentStatus::Stopped
+                | pi_render::SubagentStatus::TurnLimit => {
+                    if self.recover_writer_agent(agent_key, true).ok().flatten().is_none() {
+                        let _ = self.cleanup_writer_path(parent_cwd, &path);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// 登记一个会话，**不启动任何进程**：新会话直接是 `Parked`。

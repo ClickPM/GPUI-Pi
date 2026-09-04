@@ -58,14 +58,14 @@ mutating 子代理必须在独立 git worktree 内写入；同一 worktree 同�
 
 本轮若 diff 触及 `crates/ui/**` 或 `crates/app/**` 视图代码则触发。
 
-- 视觉审查模式：待定
-- 视觉审查结论：待定
-- 截图验证：待定
-- 兜底原因：待定
-- `requested_at`：待定
-- `deadline`：待定
-- 审查报告 / 证据：待定
-- 说明：待定
+- 视觉审查模式：CODE_ONLY
+- 视觉审查结论：CODE_ONLY_PASS
+- 截图验证：未提供（SCREENSHOT_NOT_PROVIDED）
+- 兜底原因：TIMEOUT_30M
+- `requested_at`：2026-09-04T22:46:16+00:00
+- `deadline`：2026-09-04T23:21:16+00:00
+- 审查报告 / 证据：主会话按 `.agents/visual-reviewer.md` 做 CODE_ONLY；`subagent_panel` 串行集成提示与 worktree tooltip 均走 `cx.theme()` token / `text_xs` / `max_h_40`+scrollbar，未见硬编码色或布局阻断项
+- 说明：仅完成纯代码层视觉审查，未验证真实渲染；不阻塞 PR
 
 ## 本轮实测
 
@@ -78,7 +78,7 @@ mutating 子代理必须在独立 git worktree 内写入；同一 worktree 同�
 
 | 套件 | 结果 |
 |---|---|
-| `pi-runtime` `writer_isolation` | 8 passed |
+| `pi-runtime` `writer_isolation` | 10 passed（含 subdirectory toplevel 独立判定） |
 | `pi-runtime` Manager writer API | 1 passed |
 | `pi-rpc` `host_extension` | 5 passed（含 writer-isolation 源码契约） |
 | `pi-runtime` `active_session_config*` | 相关用例全绿（writer `-e` 排在内核前） |
@@ -87,3 +87,11 @@ mutating 子代理必须在独立 git worktree 内写入；同一 worktree 同�
 ### PR
 
 https://github.com/ClickPM/GPUI-Pi/pull/1
+
+### 审查整改（本轮续做）
+
+- host `writer-isolation.ts`：后台 Agent 租约挂到 `agentId`，至 `subagent-result` / `StopAgent` / `session_shutdown` 才释放。
+- `is_independent_worktree`：改用 `git_toplevel`，修复「cwd 在子目录、path 为仓库根」漏检。
+- `prepare_writer_worktree`：acquire 失败立刻 `remove_worktree`；`recover_writer_agent` 先清理再释租约。
+- Manager：`track_writer_worktree` / `complete_writer_integration_and_cleanup` / `sync_writer_integrations_from_tasks`；ChatPanel 在 snapshot / 分支预览路径同步集成队列。
+
