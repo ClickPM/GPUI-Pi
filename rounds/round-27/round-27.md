@@ -1,6 +1,6 @@
 # Round 27 — mutating 子代理与 worktree writer 隔离
 
-> 执行方：Windows · 状态：进行中
+> 执行方：Windows · 状态：✅ 已完成（已合并 main）
 
 ## 目标
 
@@ -86,7 +86,11 @@ mutating 子代理必须在独立 git worktree 内写入；同一 worktree 同�
 
 ### PR
 
-https://github.com/ClickPM/GPUI-Pi/pull/1
+https://github.com/ClickPM/GPUI-Pi/pull/1 — **已合并**（2026-09-05T03:51:52Z，merge commit `20f2de9`）。
+
+### CI
+
+合并前 GitHub Actions **未产生任何 check / workflow run**（仓库 `CI` workflow 虽为 `active`，但 `workflow_runs` 总数为 0）。完整 Windows `validate.ps1` / real-pi T2–T3 **尚未在 CI 上实证**；Linux 侧逻辑单测与 pins 校验已绿。
 
 ### 审查整改（本轮续做）
 
