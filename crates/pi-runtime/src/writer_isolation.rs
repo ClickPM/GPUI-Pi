@@ -43,15 +43,12 @@ pub enum AgentWriteClass {
 #[must_use]
 pub fn classify_agent(agent_type: &str, tools: Option<&[String]>) -> AgentWriteClass {
     let type_key = agent_type.trim().to_ascii_lowercase();
-    if BUILTIN_READ_ONLY_TYPES
-        .iter()
-        .any(|name| *name == type_key.as_str())
-    {
+    if BUILTIN_READ_ONLY_TYPES.contains(&type_key.as_str()) {
         return AgentWriteClass::ReadOnly;
     }
     match tools {
         None => AgentWriteClass::Mutating,
-        Some(list) if list.is_empty() => AgentWriteClass::ReadOnly,
+        Some([]) => AgentWriteClass::ReadOnly,
         Some(list) => {
             if list.iter().any(|tool| {
                 MUTATING_TOOL_NAMES
@@ -91,7 +88,9 @@ pub enum IsolationError {
     /// mutating 任务缺少独立 worktree。
     MissingWorktree,
     /// 路径落在父 checkout / 主树上，不算独立。
-    NotIndependent { path: PathBuf },
+    NotIndependent {
+        path: PathBuf,
+    },
     /// 该 worktree 已有活跃 writer。
     WriterConflict {
         path: PathBuf,
@@ -143,7 +142,6 @@ impl WriterIsolation {
         Self::default()
     }
 
-    #[must_use]
     pub fn active_leases(&self) -> impl Iterator<Item = &WriterLease> {
         self.leases.values()
     }
@@ -168,19 +166,21 @@ impl WriterIsolation {
         let Some(path) = worktree_path else {
             return Err(IsolationError::MissingWorktree);
         };
-        if !is_independent_worktree(parent_cwd, path) {
-            return Err(IsolationError::NotIndependent {
-                path: path.to_path_buf(),
-            });
+        // 先 canonicalize 再算 identity：Windows 上 `canonicalize` 会加上 `\\?\`，
+        // 而 `project_identity_key` 把 `?` 当成路径分量，不统一就会出现
+        // 「acquire 成功、第二次 check 却认不出租约」——单 writer 形同虚设。
+        let path = dunce_canonical(path);
+        if !is_independent_worktree(parent_cwd, &path) {
+            return Err(IsolationError::NotIndependent { path });
         }
-        let key = project_identity_key(path);
+        let key = project_identity_key(&path);
         if let Some(existing) = self.leases.get(&key) {
             return Err(IsolationError::WriterConflict {
-                path: path.to_path_buf(),
+                path,
                 holder: existing.agent_id.clone(),
             });
         }
-        Ok(dunce_canonical(path))
+        Ok(path)
     }
 
     /// 取得 writer 租约。调用方须先 `check_mutating_path` 或传入已校验 path。
@@ -266,7 +266,10 @@ impl WriterIsolation {
     pub fn lease_for(&self, agent_id: &str) -> Option<&WriterLease> {
         self.leases.values().find(|lease| {
             lease.agent_id == agent_id
-                || lease.tool_call_id.as_deref().is_some_and(|id| id == agent_id)
+                || lease
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id == agent_id)
         })
     }
 }
@@ -308,9 +311,7 @@ pub fn allocate_writer_worktree(
     let info = add_worktree(parent_cwd, &branch)?;
     if !is_independent_worktree(parent_cwd, &info.path) {
         let _ = remove_worktree(parent_cwd, &info.path, true);
-        return Err(IsolationError::NotIndependent {
-            path: info.path,
-        });
+        return Err(IsolationError::NotIndependent { path: info.path });
     }
     Ok(info)
 }
@@ -471,10 +472,7 @@ mod tests {
 
     #[test]
     fn explore_and_explicit_readonly_tools_are_not_mutating() {
-        assert_eq!(
-            classify_agent("Explore", None),
-            AgentWriteClass::ReadOnly
-        );
+        assert_eq!(classify_agent("Explore", None), AgentWriteClass::ReadOnly);
         assert_eq!(
             classify_agent(
                 "scout",
@@ -526,8 +524,7 @@ mod tests {
         assert!(matches!(err, IsolationError::WriterConflict { .. }));
 
         iso.release("agent-1").unwrap();
-        iso.check_mutating_path(parent, Some(&linked.path))
-            .unwrap();
+        iso.check_mutating_path(parent, Some(&linked.path)).unwrap();
         cleanup_writer_worktree(parent, &linked.path, true).unwrap();
     }
 
@@ -611,7 +608,15 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&target, &link).unwrap();
+        match std::os::windows::fs::symlink_dir(&target, &link) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                // 未开开发人员模式 / 无 SeCreateSymbolicLink 时无法建目录链接。
+                cleanup_writer_worktree(repo.path(), &linked.path, true).unwrap();
+                return;
+            }
+            Err(error) => panic!("symlink_dir: {error}"),
+        }
 
         // Unix 上 is_reparse_or_symlink 认 symlink；Windows 认 reparse。
         // Linux CI / 本机单测都应拒绝清理。
@@ -697,16 +702,15 @@ mod manager_writer_tests {
         );
         assert!(manager.complete_writer_integration("agent-2").is_none());
         assert_eq!(
-            manager.complete_writer_integration("agent-1").unwrap().agent_id,
+            manager
+                .complete_writer_integration("agent-1")
+                .unwrap()
+                .agent_id,
             "agent-1"
         );
 
-        manager
-            .recover_writer_agent("agent-1", true)
-            .unwrap();
-        manager
-            .recover_writer_agent("agent-2", true)
-            .unwrap();
+        manager.recover_writer_agent("agent-1", true).unwrap();
+        manager.recover_writer_agent("agent-2", true).unwrap();
         assert!(!info.path.exists() || !second.path.exists() || true);
         // recover 带 cleanup 会删掉 owned worktree；至少其中一个应已不存在
         assert!(

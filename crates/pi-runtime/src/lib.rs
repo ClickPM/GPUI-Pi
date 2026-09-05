@@ -1,6 +1,7 @@
 mod actor;
 pub mod clock;
 mod effects;
+pub mod install;
 pub mod resource;
 pub mod scheduler;
 pub mod subagent_config;
@@ -9,6 +10,11 @@ pub mod writer_isolation;
 pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use effects::{BackpressureStats, EffectLimits};
+pub use install::{
+    BundleStatus, INSTALL_ROOT_ENV, bundled_kernel_rel, bundled_pi_rel, inspect_bundle,
+    install_root, official_binary, official_binary_in, official_kernel_in,
+    official_subagent_kernel, pi_version_matches_pin, read_pi_version, resolve_install_root,
+};
 pub use resource::{
     FakeResourceProbe, JobStats, MemoryLimits, MemoryPressureReport, ResourceProbe, SystemMemory,
     SystemResourceProbe,
@@ -2200,12 +2206,11 @@ impl RuntimeManager {
             let isolation = self.inner.writer_isolation.lock().unwrap();
             isolation.lease_for(agent_id).cloned()
         };
-        if cleanup {
-            if let Some(lease) = lease_snapshot.as_ref() {
-                if lease.owned {
-                    cleanup_writer_worktree(&lease.parent_cwd, &lease.worktree_path, true)?;
-                }
-            }
+        if cleanup
+            && let Some(lease) = lease_snapshot.as_ref()
+            && lease.owned
+        {
+            cleanup_writer_worktree(&lease.parent_cwd, &lease.worktree_path, true)?;
         }
         let lease = self
             .inner
@@ -2277,10 +2282,14 @@ impl RuntimeManager {
                 }
                 pi_render::SubagentStatus::Error
                 | pi_render::SubagentStatus::Stopped
-                | pi_render::SubagentStatus::TurnLimit => {
-                    if self.recover_writer_agent(agent_key, true).ok().flatten().is_none() {
-                        let _ = self.cleanup_writer_path(parent_cwd, &path);
-                    }
+                | pi_render::SubagentStatus::TurnLimit
+                    if self
+                        .recover_writer_agent(agent_key, true)
+                        .ok()
+                        .flatten()
+                        .is_none() =>
+                {
+                    let _ = self.cleanup_writer_path(parent_cwd, &path);
                 }
                 _ => {}
             }
@@ -4379,26 +4388,6 @@ fn export_historical_html_impl(
         .map_err(|error| error.to_string());
     let shutdown = client.shutdown().map_err(|error| error.to_string());
     finish_historical_export(result.map(|_| output_path), shutdown)
-}
-
-pub fn official_binary() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("vendor")
-        .join("pi")
-        .join(pi_rpc::pi_binary_name())
-}
-
-/// vendor 里钉死的子代理执行内核目录（`pi -e <该目录>` 加载）。
-///
-/// 与 [`official_binary`] 用同一套 `CARGO_MANIFEST_DIR` 相对定位，两者必须一起随
-/// R17 打包方案调整 —— 一个改成运行时相对路径而另一个没改，会出现"pi 起得来但
-/// 子代理不见了"这种只在安装包里复现的问题。
-pub fn official_subagent_kernel() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("vendor")
-        .join(pi_rpc::subagent_kernel_dir_name())
 }
 
 fn spawn_event_pump(

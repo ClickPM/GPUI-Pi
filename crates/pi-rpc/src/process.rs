@@ -1088,8 +1088,10 @@ fn estimate_event_bytes(event: &ClientEvent) -> usize {
 
 #[cfg(windows)]
 pub fn kill_process_tree(pid: u32) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
     let status = ProcessCommand::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
+        .creation_flags(platform::no_window_creation_flags())
         .status()?;
     if status.success() {
         Ok(())

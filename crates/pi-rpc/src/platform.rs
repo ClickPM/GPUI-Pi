@@ -95,7 +95,7 @@ mod imp {
     };
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, ResumeThread, THREAD_SUSPEND_RESUME,
     };
 
@@ -447,9 +447,17 @@ mod imp {
         })
     }
 
-    /// 子进程创建标志：挂起创建，等纳入 job 后再放行。
+    /// 控制台子进程不分配可见窗口。
+    ///
+    /// 父进程若是 `windows` 子系统（打包后的 `gpui-pi.exe`），不带这个标志时每个
+    /// `git` / `pi` / `taskkill` 都会各开一个空终端（Win11 默认看起来像 PowerShell）。
+    pub const fn no_window_creation_flags() -> u32 {
+        CREATE_NO_WINDOW
+    }
+
+    /// 子进程创建标志：挂起创建，等纳入 job 后再放行；同时隐藏控制台窗口。
     pub const fn suspended_creation_flags() -> u32 {
-        CREATE_SUSPENDED
+        CREATE_SUSPENDED | CREATE_NO_WINDOW
     }
 
     /// Win32 的长度字段一律是 `u32`；这些结构体尺寸都是编译期常量且远小于 4GiB。
@@ -514,12 +522,18 @@ mod imp {
         unsupported("系统内存采样")
     }
 
+    pub const fn no_window_creation_flags() -> u32 {
+        0
+    }
+
     pub const fn suspended_creation_flags() -> u32 {
         0
     }
 }
 
-pub use imp::{JobObject, resume_process, suspended_creation_flags, system_memory};
+pub use imp::{
+    JobObject, no_window_creation_flags, resume_process, suspended_creation_flags, system_memory,
+};
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +566,18 @@ mod tests {
             memory.total_bytes
         );
         assert!(memory.load_percent <= 100, "占用百分比应在 0–100");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_flags_hide_console_and_start_suspended() {
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        assert_eq!(no_window_creation_flags(), CREATE_NO_WINDOW);
+        assert_eq!(
+            suspended_creation_flags(),
+            CREATE_SUSPENDED | CREATE_NO_WINDOW
+        );
     }
 
     #[cfg(windows)]

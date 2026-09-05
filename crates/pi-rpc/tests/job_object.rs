@@ -177,9 +177,14 @@ fn active_process_limit_stops_the_extension_from_spawning() {
         lines[0]
     );
 
-    // 硬限制不该误伤宿主自己。
+    // 硬限制不该误伤宿主自己。CREATE_NO_WINDOW 时 Windows 可能再挂一个隐藏
+    // conhost，它会计入 job，但不能把宿主挤掉。
     let stats = client.process_tree_stats().unwrap();
-    assert_eq!(stats.active_processes, 1, "宿主自身必须仍在 job 内正常运行");
+    assert!(
+        (1..=2).contains(&stats.active_processes),
+        "宿主自身必须仍在 job 内正常运行，实际活跃 {}",
+        stats.active_processes
+    );
     client.shutdown().unwrap();
 }
 

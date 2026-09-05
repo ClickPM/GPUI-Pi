@@ -202,19 +202,19 @@ pub fn render_subagent_tasks(
                         )
                     })
                     .child(
-                    v_flex()
-                        .id(SharedString::from("subagent-task-list"))
-                        .debug_selector(|| "subagent-task-list".into())
-                        .min_w_0()
-                        .max_h_40()
-                        .overflow_y_scrollbar()
-                        .children(
-                            tasks
-                                .iter()
-                                .map(|task| render_task_row(task, cx))
-                                .collect::<Vec<_>>(),
-                        ),
-                )
+                        v_flex()
+                            .id(SharedString::from("subagent-task-list"))
+                            .debug_selector(|| "subagent-task-list".into())
+                            .min_w_0()
+                            .max_h_40()
+                            .overflow_y_scrollbar()
+                            .children(
+                                tasks
+                                    .iter()
+                                    .map(|task| render_task_row(task, cx))
+                                    .collect::<Vec<_>>(),
+                            ),
+                    )
             }),
     )
 }

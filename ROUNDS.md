@@ -22,7 +22,7 @@
 | **R14** | Extension UI Protocol | Windows | ✅ 已完成 | [#26](https://github.com/cking000bigdemon/GPUI-Pi/pull/26) | 2026-08-21 |
 | **R15** | 项目命令环境 bash 扩展（`.ts`） | Windows | ✅ 已完成 | [#24](https://github.com/cking000bigdemon/GPUI-Pi/pull/24) | 2026-08-20 |
 | **R16** | 模型配置面板 + 登录 | Windows | ✅ 已完成 | [#25](https://github.com/cking000bigdemon/GPUI-Pi/pull/25) | 2026-08-20 |
-| **R17** | 打包分发 | Windows | ⬜ | — | — |
+| **R17** | 打包分发（Windows 绿色免安装目录 + zip） | Windows | 🚧 进行中 | — | — |
 | **R18** | 1:1 验收 + 文档定稿 | Windows | ⬜ | — | — |
 | **R19** | Windows 应用图标（独立维护） | Windows | ✅ 已完成 | [#21](https://github.com/cking000bigdemon/GPUI-Pi/pull/21) | 2026-08-19 |
 | **R20** | Release 试用第一批问题修复（UI-001–UI-008） | Windows | ✅ 已完成 | [#28](https://github.com/cking000bigdemon/GPUI-Pi/pull/28) | 2026-08-22 |

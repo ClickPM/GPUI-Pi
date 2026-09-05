@@ -1,5 +1,10 @@
 //! GPUI-Pi 正式桌面入口。
 
+// release / 绿色包按 GUI 子系统链接，双击 exe 不再弹出控制台。
+// debug 仍保留控制台，方便看 tracing。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod about;
 mod file_explorer;
 mod live_session;
 mod main_panel;

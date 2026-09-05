@@ -11,6 +11,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use thiserror::Error;
 
+use crate::fs_util::hide_console_window;
+
 pub const AT_RESULT_LIMIT: usize = 20;
 pub const FILE_INDEX_LIMIT: usize = 5_000;
 pub const FILE_WALK_LIMIT: usize = 20_000;
@@ -250,7 +252,7 @@ pub fn build_file_index(cwd: &Path) -> FileIndex {
 }
 
 fn git_file_index(cwd: &Path) -> Option<FileIndex> {
-    let mut child = Command::new("git")
+    let mut child = hide_console_window(&mut Command::new("git"))
         .arg("-C")
         .arg(cwd)
         .args([

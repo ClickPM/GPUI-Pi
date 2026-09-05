@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
     composer::{FileIndex, build_entries_from_files},
-    fs_util::{is_link_like, write_atomic_with},
+    fs_util::{hide_console_window, is_link_like, write_atomic_with},
 };
 
 pub const TEXT_PREVIEW_MAX_BYTES: u64 = 256 * 1024;
@@ -527,7 +527,7 @@ impl ProjectFiles {
     }
 
     fn git_index(&self) -> Result<Option<FileIndex>, FileAccessError> {
-        let mut child = match Command::new("git")
+        let mut child = match hide_console_window(&mut Command::new("git"))
             .arg("-C")
             .arg(&self.root)
             .args([
@@ -1384,7 +1384,7 @@ mod tests {
         let outside = tempdir().unwrap();
         let link = root.path().join("escape");
         if symlink_dir(outside.path(), &link).is_err() {
-            let status = Command::new("cmd")
+            let status = hide_console_window(&mut Command::new("cmd"))
                 .args(["/C", "mklink", "/J"])
                 .arg(&link)
                 .arg(outside.path())

@@ -249,7 +249,7 @@ impl Workspace {
             },
         );
 
-        Self {
+        let built = Self {
             dock_area,
             sidebar,
             file_explorer,
@@ -263,7 +263,13 @@ impl Workspace {
             _worktree_subscription: worktree_subscription,
             _sessions_changed_subscription: sessions_changed_subscription,
             _focused_session_subscription: focused_session_subscription,
-        }
+        };
+
+        // 测试走 probe 构造，不弹首启对话框，避免 CI/无 vendor 时干扰既有布局用例。
+        #[cfg(not(test))]
+        crate::about::warn_if_runtime_missing(window, cx);
+
+        built
     }
 
     fn apply_browsing_root(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,6 +300,10 @@ impl Workspace {
             dock_area.toggle_dock(DockPlacement::Right, window, cx);
         });
         cx.notify();
+    }
+
+    fn open_about(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        crate::about::open_about_dialog(window, cx);
     }
 
     fn open_resources(
@@ -500,6 +510,15 @@ impl Render for Workspace {
                     .icon(IconName::Settings)
                     .tooltip("打开模型与认证设置")
                     .on_click(cx.listener(Self::open_model_config)),
+            )
+            .child(
+                Button::new("open-about")
+                    .debug_selector(|| "open-about".into())
+                    .ghost()
+                    .small()
+                    .label(format!("v{}", crate::about::app_version()))
+                    .tooltip("关于 GPUI-Pi：版本、内核自检与更新说明")
+                    .on_click(cx.listener(Self::open_about)),
             )
             .child(
                 Button::new("choose-project-directory")
@@ -854,6 +873,20 @@ mod tests {
         });
         visual.run_until_parked();
         assert!(!visual.did_prompt_for_paths());
+    }
+
+    #[gpui::test]
+    fn about_dialog_opens_from_the_toolbar_entry(cx: &mut TestAppContext) {
+        let mut visual = render_workspace(cx, size(px(1000.), px(700.)), LayoutProbe::default());
+        assert!(visual.debug_bounds("open-about").is_some());
+        visual.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            crate::about::open_about_dialog(window, cx);
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds("about-dialog-body").is_some());
+        assert!(visual.debug_bounds("about-open-releases").is_some());
     }
 
     #[test]

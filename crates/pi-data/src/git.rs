@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::{TEXT_PREVIEW_MAX_BYTES, project_identity_key};
+use crate::{TEXT_PREVIEW_MAX_BYTES, fs_util::hide_console_window, project_identity_key};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_STATUS_MAX_OUTPUT: usize = 8 * 1024 * 1024;
@@ -863,7 +863,7 @@ where
 {
     let args = args.into_iter().collect::<Vec<_>>();
     let display = format_args(&args);
-    let mut child = Command::new("git")
+    let mut child = hide_console_window(&mut Command::new("git"))
         .arg("-C")
         .arg(cwd)
         .args(&args)
@@ -913,7 +913,7 @@ where
 
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
+    let _ = hide_console_window(&mut Command::new("taskkill"))
         .args(["/T", "/F", "/PID"])
         .arg(pid.to_string())
         .stdin(Stdio::null())
@@ -986,7 +986,11 @@ mod tests {
 
     #[test]
     fn real_repository_status_diff_and_worktrees() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if hide_console_window(&mut Command::new("git"))
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1157,7 +1161,11 @@ mod tests {
 
     #[test]
     fn unborn_head_status_and_diff_use_empty_tree_semantics() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if hide_console_window(&mut Command::new("git"))
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1195,7 +1203,11 @@ mod tests {
 
     #[test]
     fn status_fallback_runs_normal_mode_and_marks_output_truncated() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if hide_console_window(&mut Command::new("git"))
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1241,7 +1253,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn worktree_with_junction_is_never_removed() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if hide_console_window(&mut Command::new("git"))
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1258,7 +1274,7 @@ mod tests {
         fs::create_dir(&external).unwrap();
         fs::write(external.join("keep.txt"), "keep").unwrap();
         let junction = linked.path.join("linked-dir");
-        let status = Command::new("cmd")
+        let status = hide_console_window(&mut Command::new("cmd"))
             .args(["/C", "mklink", "/J"])
             .arg(&junction)
             .arg(&external)
@@ -1273,7 +1289,7 @@ mod tests {
             Err(GitError::DirectoryLink(_))
         ));
         assert!(external.join("keep.txt").is_file());
-        let _ = Command::new("cmd")
+        let _ = hide_console_window(&mut Command::new("cmd"))
             .args(["/C", "rmdir"])
             .arg(&junction)
             .status();
@@ -1281,7 +1297,7 @@ mod tests {
     }
 
     fn git_ok<const N: usize>(cwd: &Path, args: [&str; N]) {
-        let output = Command::new("git")
+        let output = hide_console_window(&mut Command::new("git"))
             .arg("-C")
             .arg(cwd)
             .args(args)

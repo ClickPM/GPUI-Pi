@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -90,6 +91,17 @@ pub(crate) fn is_any_reparse_point(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 pub(crate) fn is_any_reparse_point(_: &fs::Metadata) -> bool {
     false
+}
+
+/// GUI 子系统父进程下，控制台子进程必须显式隐藏窗口，否则每个 git/cmd 都会弹空终端。
+pub(crate) fn hide_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 fn open_private_temp(path: &Path) -> io::Result<File> {

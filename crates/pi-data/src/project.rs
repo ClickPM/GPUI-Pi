@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::session::SessionSummary;
+use crate::{fs_util::hide_console_window, session::SessionSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPlatform {
@@ -114,7 +114,7 @@ fn resolve_project_with_git(cwd: &Path, git_binary: &OsStr) -> ProjectInfo {
         return fallback();
     }
 
-    let output = match Command::new(git_binary)
+    let output = match hide_console_window(&mut Command::new(git_binary))
         .arg("-C")
         .arg(cwd)
         .args([

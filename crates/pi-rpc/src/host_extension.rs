@@ -27,7 +27,11 @@ pub fn materialize_host_extension() -> io::Result<PathBuf> {
 
 /// 将 R27 writer 隔离扩展落到临时目录。
 pub fn materialize_writer_isolation_extension() -> io::Result<PathBuf> {
-    materialize_bundled_extension_in(&std::env::temp_dir(), "writer-isolation", WRITER_ISOLATION_SOURCE)
+    materialize_bundled_extension_in(
+        &std::env::temp_dir(),
+        "writer-isolation",
+        WRITER_ISOLATION_SOURCE,
+    )
 }
 
 fn materialize_bundled_extension_in(
@@ -106,11 +110,7 @@ fn existing_fallback(directory: &Path, stem: &str, source: &str) -> io::Result<O
 fn write_unique_fallback(directory: &Path, stem: &str, source: &str) -> io::Result<PathBuf> {
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let target = directory.join(format!(
-            "{stem}.{}.{}.ts",
-            std::process::id(),
-            sequence
-        ));
+        let target = directory.join(format!("{stem}.{}.{}.ts", std::process::id(), sequence));
         match write_atomic(directory, &target, source) {
             Ok(()) => return Ok(target),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -176,12 +176,18 @@ mod tests {
     #[test]
     fn materializes_embedded_source_intact_and_stably() {
         let temp = tempfile::tempdir().unwrap();
-        let first =
-            materialize_bundled_extension_in(temp.path(), "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap();
-        let second =
-            materialize_bundled_extension_in(temp.path(), "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap();
+        let first = materialize_bundled_extension_in(
+            temp.path(),
+            "project-command-environment",
+            PROJECT_COMMAND_SOURCE,
+        )
+        .unwrap();
+        let second = materialize_bundled_extension_in(
+            temp.path(),
+            "project-command-environment",
+            PROJECT_COMMAND_SOURCE,
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::read_to_string(first).unwrap(), PROJECT_COMMAND_SOURCE);
     }
@@ -189,16 +195,25 @@ mod tests {
     #[test]
     fn corrupted_content_addressed_target_uses_a_verified_unique_fallback() {
         let temp = tempfile::tempdir().unwrap();
-        let target =
-            materialize_bundled_extension_in(temp.path(), "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap();
+        let target = materialize_bundled_extension_in(
+            temp.path(),
+            "project-command-environment",
+            PROJECT_COMMAND_SOURCE,
+        )
+        .unwrap();
         fs::write(&target, "corrupt").unwrap();
-        let fallback =
-            materialize_bundled_extension_in(temp.path(), "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap();
-        let reused =
-            materialize_bundled_extension_in(temp.path(), "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap();
+        let fallback = materialize_bundled_extension_in(
+            temp.path(),
+            "project-command-environment",
+            PROJECT_COMMAND_SOURCE,
+        )
+        .unwrap();
+        let reused = materialize_bundled_extension_in(
+            temp.path(),
+            "project-command-environment",
+            PROJECT_COMMAND_SOURCE,
+        )
+        .unwrap();
         assert_ne!(fallback, target);
         assert_eq!(fallback, reused);
         assert_eq!(fs::read_to_string(&target).unwrap(), "corrupt");
@@ -217,8 +232,12 @@ mod tests {
         let valid = directory.join("project-command-environment.1.ts");
         fs::write(&valid, PROJECT_COMMAND_SOURCE).unwrap();
         assert_eq!(
-            existing_fallback(&directory, "project-command-environment", PROJECT_COMMAND_SOURCE)
-                .unwrap(),
+            existing_fallback(
+                &directory,
+                "project-command-environment",
+                PROJECT_COMMAND_SOURCE
+            )
+            .unwrap(),
             Some(valid)
         );
     }
@@ -238,10 +257,7 @@ mod tests {
             "getShellPath",
             "getShellCommandPrefix",
         ] {
-            assert!(
-                PROJECT_COMMAND_SOURCE.contains(needle),
-                "missing {needle}"
-            );
+            assert!(PROJECT_COMMAND_SOURCE.contains(needle), "missing {needle}");
         }
     }
 
@@ -267,9 +283,12 @@ mod tests {
             );
         }
         let temp = tempfile::tempdir().unwrap();
-        let path =
-            materialize_bundled_extension_in(temp.path(), "writer-isolation", WRITER_ISOLATION_SOURCE)
-                .unwrap();
+        let path = materialize_bundled_extension_in(
+            temp.path(),
+            "writer-isolation",
+            WRITER_ISOLATION_SOURCE,
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), WRITER_ISOLATION_SOURCE);
     }
 }

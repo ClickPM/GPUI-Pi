@@ -700,6 +700,15 @@ fn curl_exit_error(code: Option<i32>) -> ModelServiceError {
     }
 }
 
+fn hide_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(pi_rpc::platform::no_window_creation_flags());
+    }
+    command
+}
+
 fn curl_command(
     method: &str,
     url: &ParsedUrl,
@@ -708,6 +717,7 @@ fn curl_command(
     timeout: Duration,
 ) -> Result<(Command, String), ModelServiceError> {
     let mut command = Command::new(system_curl_path()?);
+    hide_console_window(&mut command);
     // 所有敏感 header 都通过 stdin config 传入；argv 仅包含固定开关、超时和无凭据 URL。
     command
         .args(["--disable", "--config", "-"])
@@ -802,7 +812,9 @@ fn run_cli_capture_status(
     agent_dir: &Path,
     timeout: Duration,
 ) -> Result<(ExitStatus, Vec<u8>), ModelServiceError> {
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    hide_console_window(&mut command);
+    let mut child = command
         .args(args)
         .env(pi_data::AGENT_DIR_ENV, agent_dir)
         .stdin(Stdio::null())
@@ -933,6 +945,7 @@ fn login_command(
     let cmd = system_executable("cmd.exe")?;
     let mut command = Command::new(cmd);
     // `start /wait` 创建拥有正常标准句柄的新控制台；参数逐项传入，provider 仍受白名单约束。
+    // 这里故意不挂 CREATE_NO_WINDOW：包装进程若无窗口，`start` 拉起的官方 TUI 也可能被一起藏掉。
     command
         .args(["/d", "/s", "/c", "start", "", "/wait", "/d"])
         .arg(pi_binary.parent().unwrap_or_else(|| Path::new(".")))
@@ -1452,7 +1465,7 @@ Start-Sleep -Seconds 10
         .unwrap();
 
         let spawn = || {
-            let mut child = Command::new("powershell.exe")
+            let mut child = hide_console_window(&mut Command::new("powershell.exe"))
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
