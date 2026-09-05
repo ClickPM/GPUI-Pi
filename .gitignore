@@ -21,3 +21,4 @@ Thumbs.db
 *.log
 /.claude/settings.local.json
 /.claude/worktrees/
+.sessions/
