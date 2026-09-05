@@ -4,6 +4,7 @@ mod effects;
 pub mod resource;
 pub mod scheduler;
 pub mod subagent_config;
+pub mod writer_isolation;
 
 pub use actor::{ActorLimits, live_thread_count, spawned_thread_count};
 pub use clock::{Clock, FakeClock, SystemClock};
@@ -15,6 +16,11 @@ pub use resource::{
 pub use scheduler::{
     IllegalTransition, Priority, QueueFull, SchedulerLimits, SchedulerReport, SchedulerState,
     SessionId, SlotCounts, SlotKind,
+};
+pub use writer_isolation::{
+    AgentWriteClass, IsolationError, PendingIntegration, WriterIsolation, WriterLease,
+    allocate_writer_worktree, classify_agent, cleanup_writer_worktree, is_independent_worktree,
+    pending_writer_integrations,
 };
 
 use actor::{Actor, Channel, JobKey, QueueError};
@@ -1165,6 +1171,8 @@ struct ManagerInner {
     /// Park 的第 ③ 步之后 entry 与 lease 已从 `SchedulerCore` 摘走，client 还没进
     /// warm pool —— 这一刻谁也看不见它。
     pending_handoffs: AtomicUsize,
+    /// R27：mutating writer 租约与串行集成队列（跨会话共享，同一 worktree 全局单 writer）。
+    writer_isolation: Mutex<WriterIsolation>,
 }
 
 impl Drop for ManagerInner {
@@ -2016,6 +2024,7 @@ impl RuntimeManager {
                 shutting_down: AtomicBool::new(false),
                 pending_starts: AtomicUsize::new(0),
                 pending_handoffs: AtomicUsize::new(0),
+                writer_isolation: Mutex::new(WriterIsolation::new()),
             }),
         };
         manager.spawn_reaper();
@@ -2069,6 +2078,213 @@ impl RuntimeManager {
     /// 这里**不触发**新采样：观测不该改变被观测的节流状态。
     pub fn memory_pressure(&self) -> MemoryPressureReport {
         self.inner.memory.report()
+    }
+
+    /// 为 mutating 子代理预先分配独立 writer worktree，并登记租约。
+    ///
+    /// 日常路径由 host 扩展在 `tool_call` 里自动分配；本 API 供 UI / 测试显式准备。
+    /// 租约登记失败时立刻按红线 6 清理刚创建的 worktree，避免孤儿目录。
+    pub fn prepare_writer_worktree(
+        &self,
+        parent_cwd: &Path,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<pi_data::WorktreeInfo, IsolationError> {
+        let info = allocate_writer_worktree(parent_cwd, label)?;
+        let acquire_result = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation
+                .acquire(
+                    AgentWriteClass::Mutating,
+                    parent_cwd,
+                    &info.path,
+                    agent_id,
+                    None,
+                    true,
+                )
+                .map(|_| ())
+        };
+        if let Err(err) = acquire_result {
+            let _ = cleanup_writer_worktree(parent_cwd, &info.path, true);
+            return Err(err);
+        }
+        Ok(info)
+    }
+
+    /// 追踪已存在的 writer worktree（例如 host 扩展自动分配的），登记为可清理租约。
+    ///
+    /// 已有同一 agent 租约时为幂等成功。
+    pub fn track_writer_worktree(
+        &self,
+        parent_cwd: &Path,
+        agent_id: &str,
+        worktree_path: &Path,
+        owned: bool,
+    ) -> Result<(), IsolationError> {
+        let mut isolation = self.inner.writer_isolation.lock().unwrap();
+        if isolation.lease_for(agent_id).is_some() {
+            return Ok(());
+        }
+        isolation.acquire(
+            AgentWriteClass::Mutating,
+            parent_cwd,
+            worktree_path,
+            agent_id,
+            None,
+            owned,
+        )?;
+        self.inner.watch.publish();
+        Ok(())
+    }
+
+    /// 子代理结束后入队串行集成；队头才是父会话当前应审查的一项。
+    pub fn enqueue_writer_integration(&self, item: PendingIntegration) {
+        let changed = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            let before = isolation.pending_integrations().len();
+            isolation.enqueue_integration(item);
+            isolation.pending_integrations().len() != before
+        };
+        if changed {
+            self.inner.watch.publish();
+        }
+    }
+
+    /// 父会话完成对队头的审查（接受或丢弃）。
+    pub fn complete_writer_integration(&self, agent_id: &str) -> Option<PendingIntegration> {
+        let item = self
+            .inner
+            .writer_isolation
+            .lock()
+            .unwrap()
+            .complete_integration(agent_id);
+        if item.is_some() {
+            self.inner.watch.publish();
+        }
+        item
+    }
+
+    /// 审查完成并清理对应 worktree（覆盖 host 分配与 Manager 分配）。
+    pub fn complete_writer_integration_and_cleanup(
+        &self,
+        agent_id: &str,
+        parent_cwd: &Path,
+    ) -> Result<Option<PendingIntegration>, IsolationError> {
+        let item = self.complete_writer_integration(agent_id);
+        let lease = {
+            let mut isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation.recover_agent(agent_id)
+        };
+        let path = item
+            .as_ref()
+            .map(|pending| pending.worktree_path.clone())
+            .or_else(|| lease.as_ref().map(|lease| lease.worktree_path.clone()));
+        if let Some(path) = path {
+            let cwd = lease
+                .as_ref()
+                .map(|lease| lease.parent_cwd.as_path())
+                .unwrap_or(parent_cwd);
+            cleanup_writer_worktree(cwd, &path, true)?;
+        }
+        self.inner.watch.publish();
+        Ok(item)
+    }
+
+    /// 取消 / 失败恢复：可选清理 worktree；**先清理再释放租约**，避免 cleanup 失败后目录失控。
+    pub fn recover_writer_agent(
+        &self,
+        agent_id: &str,
+        cleanup: bool,
+    ) -> Result<Option<WriterLease>, IsolationError> {
+        let lease_snapshot = {
+            let isolation = self.inner.writer_isolation.lock().unwrap();
+            isolation.lease_for(agent_id).cloned()
+        };
+        if cleanup {
+            if let Some(lease) = lease_snapshot.as_ref() {
+                if lease.owned {
+                    cleanup_writer_worktree(&lease.parent_cwd, &lease.worktree_path, true)?;
+                }
+            }
+        }
+        let lease = self
+            .inner
+            .writer_isolation
+            .lock()
+            .unwrap()
+            .recover_agent(agent_id);
+        self.inner.watch.publish();
+        Ok(lease)
+    }
+
+    /// 按路径清理 writer worktree（host 分配、无租约时的兜底入口；必经 `remove_worktree`）。
+    pub fn cleanup_writer_path(
+        &self,
+        parent_cwd: &Path,
+        worktree_path: &Path,
+    ) -> Result<(), IsolationError> {
+        cleanup_writer_worktree(parent_cwd, worktree_path, true)
+    }
+
+    /// 当前串行集成队头（供 UI）。
+    pub fn current_writer_integration(&self) -> Option<PendingIntegration> {
+        self.inner
+            .writer_isolation
+            .lock()
+            .unwrap()
+            .current_integration()
+            .cloned()
+    }
+
+    /// 把文档里已结算的 mutating + worktree 任务同步进 Manager 集成队列，并追踪/回收租约。
+    ///
+    /// UI 每帧可调用：入队幂等；失败/取消任务释放租约并清理 owned worktree。
+    pub fn sync_writer_integrations_from_tasks(
+        &self,
+        parent_cwd: &Path,
+        tasks: &[pi_render::SubagentTask],
+    ) {
+        for task in tasks {
+            let agent_key = task
+                .agent_id
+                .as_deref()
+                .or(task.tool_call_id.as_deref())
+                .unwrap_or(task.key.as_str());
+            let Some(worktree) = task.worktree_path.as_deref() else {
+                continue;
+            };
+            if classify_agent(&task.agent_type, None) != AgentWriteClass::Mutating {
+                continue;
+            }
+            let path = PathBuf::from(worktree);
+            if !task.status.is_settled() {
+                let _ = self.track_writer_worktree(parent_cwd, agent_key, &path, true);
+                continue;
+            }
+            match task.status {
+                pi_render::SubagentStatus::Completed => {
+                    let _ = self.track_writer_worktree(parent_cwd, agent_key, &path, true);
+                    self.enqueue_writer_integration(PendingIntegration {
+                        agent_id: agent_key.to_owned(),
+                        worktree_path: path,
+                        description: if task.description.is_empty() {
+                            task.agent_type.clone()
+                        } else {
+                            task.description.clone()
+                        },
+                        status: task.status.label().to_owned(),
+                    });
+                }
+                pi_render::SubagentStatus::Error
+                | pi_render::SubagentStatus::Stopped
+                | pi_render::SubagentStatus::TurnLimit => {
+                    if self.recover_writer_agent(agent_key, true).ok().flatten().is_none() {
+                        let _ = self.cleanup_writer_path(parent_cwd, &path);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// 登记一个会话，**不启动任何进程**：新会话直接是 `Parked`。
@@ -4023,22 +4239,24 @@ fn active_session_config(
         cwd,
         tool_preset,
         pi_rpc::materialize_host_extension,
+        pi_rpc::materialize_writer_isolation_extension,
         official_subagent_kernel,
     )
 }
 
 /// 组装一个用户会话的启动参数。
 ///
-/// 两个 `-e` 的来源不同，所以分成两个可注入的解析器：项目命令环境扩展是随 Rust 二进制
-/// 内嵌、每次落到临时目录（会失败，所以返回 `io::Result`）；子代理内核是 vendor 里的
-/// 钉死目录（不会"生成失败"，只会"没准备好"）。两者任一缺席都只降级并回报诊断，
-/// 不阻断会话启动 —— 少一个扩展总好过开不出会话。
+/// `-e` 来源分三类，所以拆成可注入的解析器：项目命令环境与 writer 隔离都是随 Rust
+/// 二进制内嵌、落到临时目录（会失败，返回 `io::Result`）；子代理内核是 vendor 钉死目录
+/// （不会"生成失败"，只会"没准备好"）。任一缺席都只降级并回报诊断，不阻断会话启动。
+/// writer 隔离只在成功加载子代理内核时注入 —— 没有 Agent 工具就无需强制。
 fn active_session_config_with_sources(
     binary: PathBuf,
     session_path: Option<PathBuf>,
     cwd: PathBuf,
     tool_preset: ToolPreset,
     materialize: impl FnOnce() -> std::io::Result<PathBuf>,
+    materialize_writer: impl FnOnce() -> std::io::Result<PathBuf>,
     resolve_kernel: impl FnOnce() -> PathBuf,
 ) -> (ClientConfig, Option<String>) {
     let mut config = ClientConfig::new(binary);
@@ -4058,6 +4276,16 @@ fn active_session_config_with_sources(
         let kernel = resolve_kernel();
         // pi 读的是包根的 package.json 里那份 `pi.extensions` 清单，所以以它为就绪标志。
         if kernel.join("package.json").is_file() {
+            // writer 隔离必须排在内核之前：tool_call 按扩展加载序执行，先改写
+            // worktree_path 再进内核的 Agent.execute。
+            match materialize_writer() {
+                Ok(writer_extension) => {
+                    config
+                        .args
+                        .extend(["-e".into(), writer_extension.into_os_string()]);
+                }
+                Err(error) => diagnostics.push(format!("writer 隔离扩展未加载：{error}")),
+            }
             config.args.extend(["-e".into(), kernel.into_os_string()]);
         } else {
             diagnostics.push(format!(
@@ -4774,6 +5002,7 @@ mod tests {
                 PathBuf::from("project"),
                 preset,
                 pi_rpc::materialize_host_extension,
+                || Ok(PathBuf::from("writer.ts")),
                 || PathBuf::from("kernel-not-prepared"),
             );
             assert_eq!(config.args[0], "--no-context-files");
@@ -4805,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn active_session_config_injects_prepared_subagent_kernel_as_second_extension() {
+    fn active_session_config_injects_writer_isolation_before_subagent_kernel() {
         let kernel_dir = tempfile::tempdir().unwrap();
         std::fs::write(kernel_dir.path().join("package.json"), "{}").unwrap();
         let kernel = kernel_dir.path().to_path_buf();
@@ -4815,6 +5044,7 @@ mod tests {
             PathBuf::from("project"),
             ToolPreset::Full,
             || Ok(PathBuf::from("host.ts")),
+            || Ok(PathBuf::from("writer.ts")),
             || kernel,
         );
         assert!(diagnostic.is_none());
@@ -4824,6 +5054,8 @@ mod tests {
                 std::ffi::OsString::from("--no-context-files"),
                 "-e".into(),
                 "host.ts".into(),
+                "-e".into(),
+                "writer.ts".into(),
                 "-e".into(),
                 kernel_dir.path().into(),
                 "--tools".into(),
@@ -4850,6 +5082,7 @@ mod tests {
                 PathBuf::from("project"),
                 preset,
                 || Ok(PathBuf::from("host.ts")),
+                || Ok(PathBuf::from("writer.ts")),
                 || kernel,
             );
             assert!(diagnostic.is_none(), "preset={preset:?}");
@@ -4887,11 +5120,12 @@ mod tests {
             PathBuf::from("project"),
             ToolPreset::Inherit,
             || Ok(PathBuf::from("host.ts")),
+            || Ok(PathBuf::from("writer.ts")),
             || kernel,
         );
         assert!(diagnostic.is_none());
         assert!(!config.args.iter().any(|arg| arg == "--tools"));
-        assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 2);
+        assert_eq!(config.args.iter().filter(|arg| *arg == "-e").count(), 3);
     }
 
     #[test]
@@ -4913,6 +5147,7 @@ mod tests {
                 PathBuf::from("project"),
                 preset,
                 || Ok(PathBuf::from("host.ts")),
+                || Ok(PathBuf::from("writer.ts")),
                 || PathBuf::from("kernel-not-prepared"),
             );
             let denylist = config
@@ -4938,6 +5173,7 @@ mod tests {
             PathBuf::from("project"),
             ToolPreset::Full,
             || Ok(PathBuf::from("host.ts")),
+            || Ok(PathBuf::from("writer.ts")),
             || PathBuf::from("definitely-not-prepared"),
         );
         let diagnostic = diagnostic.expect("缺内核必须回报诊断");
@@ -5016,6 +5252,7 @@ mod tests {
             PathBuf::from("project"),
             ToolPreset::Inherit,
             || Ok(PathBuf::from("host.ts")),
+            || Ok(PathBuf::from("writer.ts")),
             || kernel,
         );
         assert!(diagnostic.is_none());
@@ -5037,6 +5274,7 @@ mod tests {
                     "denied",
                 ))
             },
+            || Ok(PathBuf::from("writer-unused.ts")),
             || PathBuf::from("unused"),
         );
         assert_eq!(

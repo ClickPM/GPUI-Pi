@@ -190,7 +190,18 @@ pub fn render_subagent_tasks(
                 // 高度走 gpui 既有刻度而不是 `px(n)`：红线 4 的 px 白名单里没有这个值，
                 // 自造像素尺寸要先改规范文档走评审。滚动条走 `overflow_y_scrollbar()`
                 // （规范 S-19），裸 `overflow_y_scroll()` 没有任何「还有内容」的线索。
-                panel.child(
+                let integration_hint = serial_integration_hint(tasks);
+                panel
+                    .when_some(integration_hint, |panel, hint| {
+                        panel.child(
+                            div()
+                                .debug_selector(|| "subagent-integration-hint".into())
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(hint),
+                        )
+                    })
+                    .child(
                     v_flex()
                         .id(SharedString::from("subagent-task-list"))
                         .debug_selector(|| "subagent-task-list".into())
@@ -208,20 +219,57 @@ pub fn render_subagent_tasks(
     )
 }
 
+/// R27：串行集成提示。队头 = 第一条已结算且带 worktree 的非 Explore 任务。
+fn serial_integration_hint(tasks: &[SubagentTask]) -> Option<String> {
+    let pending: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            task.status.is_settled()
+                && task.worktree_path.is_some()
+                && !task.agent_type.eq_ignore_ascii_case("explore")
+        })
+        .collect();
+    let head = pending.first()?;
+    let rest = pending.len().saturating_sub(1);
+    let desc = if head.description.is_empty() {
+        head.agent_type.clone()
+    } else {
+        head.description.clone()
+    };
+    Some(if rest == 0 {
+        format!("待集成：{desc}")
+    } else {
+        format!("待集成：{desc}（另有 {rest} 项排队）")
+    })
+}
+
 /// 单条任务行：状态点 + 类型 + 描述 + **一项**统计 —— 三个文本片段，卡在 S-8 上限。
 fn render_task_row(task: &SubagentTask, cx: &App) -> Stateful<Div> {
     let color = crate::chat::subagent_status_color(&task.status, cx);
     let stats = crate::chat::subagent_stats_summary(&task.stats);
     let row_id = SharedString::from(format!("subagent-task-{}", task.key));
+    // tooltip：统计明细 + writer worktree（若有）。路径进 tooltip 不计入 S-8 片段。
+    let tooltip = {
+        let mut parts = Vec::new();
+        if let Some(stats) = stats.as_ref() {
+            parts.push(stats.detail.clone());
+        }
+        if let Some(path) = task.worktree_path.as_ref() {
+            parts.push(format!("worktree: {path}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    };
     h_flex()
         .id(row_id)
         .debug_selector(|| "subagent-task-row".into())
         .min_w_0()
         .gap_1p5()
         .py_0p5()
-        .when_some(stats.as_ref(), |row, stats| {
-            // 完整统计明细进 tooltip（S-8：tooltip 内容不计入片段数）。
-            let detail = stats.detail.clone();
+        .when_some(tooltip, |row, detail| {
             row.tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
         })
         .child(crate::chat::status_dot(color))
@@ -274,6 +322,27 @@ mod tests {
             stop_reason: None,
             stats: SubagentStats::default(),
         }
+    }
+
+    #[test]
+    fn serial_integration_hint_shows_queue_head_only() {
+        let mut a = task(SubagentStatus::Completed);
+        a.key = "a".into();
+        a.agent_type = "general-purpose".into();
+        a.description = "first writer".into();
+        a.worktree_path = Some("/wt/a".into());
+        let mut b = task(SubagentStatus::Completed);
+        b.key = "b".into();
+        b.agent_type = "coder".into();
+        b.description = "second".into();
+        b.worktree_path = Some("/wt/b".into());
+        let mut explore = task(SubagentStatus::Completed);
+        explore.agent_type = "Explore".into();
+        explore.worktree_path = Some("/wt/e".into());
+        let hint = serial_integration_hint(&[explore, a, b]).unwrap();
+        assert!(hint.contains("first writer"), "{hint}");
+        assert!(hint.contains("另有 1 项排队"), "{hint}");
+        assert!(!hint.contains("second"));
     }
 
     #[test]
